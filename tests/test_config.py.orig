@@ -1,0 +1,85 @@
+"""Tests for Pydantic settings and CLI precedence."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Protocol
+
+import pytest
+from typer.testing import CliRunner
+
+from pokemon_go_cleanup import cli
+from pokemon_go_cleanup.config import AppConfig
+from pokemon_go_cleanup.models import Device
+
+runner = CliRunner()
+
+
+class FakeClient:
+    """Minimal client that avoids touching ADB."""
+
+    def list_devices(self) -> list[Device]:
+        return []
+
+
+def test_cli_uses_environment_when_flags_are_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed_configs: list[AppConfig] = []
+
+    def build_client(context: object) -> FakeClient:
+        assert isinstance(context, cli.typer.Context)
+        observed_configs.append(cli._get_context(context).config)
+        return FakeClient()
+
+    monkeypatch.setattr(cli, "_build_client", build_client)
+    environment_data_dir = tmp_path / "环境数据"
+
+    result = runner.invoke(
+        cli.app,
+        ["device", "list"],
+        env={
+            "POKEMON_GO_CLEANUP_DATA_DIR": str(environment_data_dir),
+            "POKEMON_GO_CLEANUP_ADB_TIMEOUT_SECONDS": "23",
+        },
+    )
+
+    assert result.exit_code == 0
+    assert observed_configs[0].data_dir == environment_data_dir
+    assert observed_configs[0].adb_timeout_seconds == 23
+
+
+def test_explicit_cli_flags_override_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed_configs: list[AppConfig] = []
+
+    def build_client(context: object) -> FakeClient:
+        assert isinstance(context, cli.typer.Context)
+        observed_configs.append(cli._get_context(context).config)
+        return FakeClient()
+
+    monkeypatch.setattr(cli, "_build_client", build_client)
+    flag_data_dir = tmp_path / "flag-data"
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "--data-dir",
+            str(flag_data_dir),
+            "--adb-timeout",
+            "9",
+            "device",
+            "list",
+        ],
+        env={
+            "POKEMON_GO_CLEANUP_DATA_DIR": str(tmp_path / "environment-data"),
+            "POKEMON_GO_CLEANUP_ADB_TIMEOUT_SECONDS": "23",
+        },
+    )
+
+    assert result.exit_code == 0
+    assert observed_configs[0].data_dir == flag_data_dir
+    assert observed_configs[0].adb_timeout_seconds == 9
