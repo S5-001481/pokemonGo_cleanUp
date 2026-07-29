@@ -45,13 +45,20 @@ def test_root_help_includes_scan_one() -> None:
 
     assert result.exit_code == 0
     assert "scan-one" in result.stdout
+    assert "scan-auto-one" in result.stdout
+    assert "scan-batch" in result.stdout
 
 
 def test_scan_one_requires_guided_flag() -> None:
-    result = runner.invoke(cli.app, ["scan-one"])
+    result = runner.invoke(
+        cli.app,
+        ["scan-one"],
+        env={"COLUMNS": "20", "NO_COLOR": "1"},
+    )
 
     assert result.exit_code == 2
     assert "--guided" in result.output
+    assert "Error: scan-one requires --guided." in result.output
 
 
 def test_scan_one_guides_user_and_honors_options(
@@ -83,12 +90,8 @@ def test_scan_one_guides_user_and_honors_options(
     assert "攻击、防御和 HP 个体值条" in result.stdout
     assert fake_client.selected_serial == "ABC123"
     assert fake_client.capture_count == 3
-    manifest_paths = list(
-        (output_directory / "scans").glob("*/*/manifest.json")
-    )
+    manifest_paths = list((output_directory / "scans").glob("*/*/manifest.json"))
     assert len(manifest_paths) == 1
-    manifest: dict[str, Any] = json.loads(
-        manifest_paths[0].read_text(encoding="utf-8")
-    )
+    manifest: dict[str, Any] = json.loads(manifest_paths[0].read_text(encoding="utf-8"))
     assert manifest["notes"] == "社区日保留"
     assert manifest["scan_status"] == "complete"

@@ -20,4 +20,5 @@ sync. Record meaningful guide changes and verification in
 `repo-docs/change-log.md`, including `Synced through <sha>` when Git has a commit.
 
 Device selection rules, exit codes, scan IDs, manifest fields/statuses, capture
-layouts, and privacy boundaries are durable project knowledge and must remain synchronized.
+layouts, dataset classifications, ground-truth fields, overwrite rules, and
+privacy boundaries are durable project knowledge and must remain synchronized.

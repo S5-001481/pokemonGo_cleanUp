@@ -32,13 +32,16 @@ python -m pip install -e ".[dev]"
 Validation:
 
 ```bash
+python -m pip check
 pytest
 ruff check .
 mypy
 ```
 
-The tests mock ADB and include a command-level fake runner, so they do not need a
-physical device.
+The tests mock ADB, include a command-level fake runner, and generate synthetic
+PNG files at runtime. They do not need a physical device or repository
+screenshots. CI runs this check set on Windows and Ubuntu with Python 3.12 and
+3.13.
 
 ## Windows runtime validation
 
@@ -51,7 +54,9 @@ pokemon-go-cleanup device list
 pokemon-go-cleanup device info
 pokemon-go-cleanup capture
 pokemon-go-cleanup scan-one --guided --notes "manual device check"
+pokemon-go-cleanup dataset validate
+pokemon-go-cleanup dataset status
 ```
 
-Real screenshots remain local under `data/screenshots/` or `data/scans/` and must
-not be committed.
+Real screenshots, manifests, and annotations remain below `data/` and must not
+be committed.

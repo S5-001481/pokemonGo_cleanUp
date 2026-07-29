@@ -102,6 +102,46 @@ class LocalStorageError(PokemonGoCleanupError):
     exit_code = 11
 
 
+class DatasetError(PokemonGoCleanupError):
+    """Raised when a dataset root or scan cannot be read safely."""
+
+    exit_code = 12
+
+
+class AnnotationError(PokemonGoCleanupError):
+    """Raised when ground-truth input or persistence is invalid."""
+
+    exit_code = 13
+
+
+class AnnotationExistsError(AnnotationError):
+    """Raised when an annotation would be overwritten without permission."""
+
+    def __init__(self, annotation_path: Path) -> None:
+        super().__init__(
+            f"Annotation already exists at '{annotation_path}'. "
+            "Confirm replacement interactively or pass --force."
+        )
+
+
+class RecognitionError(PokemonGoCleanupError):
+    """Raised when the calibrated screenshot reader cannot continue."""
+
+    exit_code = 14
+
+
+class AutomationError(PokemonGoCleanupError):
+    """Raised when the fixed Huawei automation cannot proceed safely."""
+
+    exit_code = 15
+
+
+class BatchAutomationError(PokemonGoCleanupError):
+    """Raised when bounded batch scanning cannot continue safely."""
+
+    exit_code = 16
+
+
 class GuidedScanStepError(PokemonGoCleanupError):
     """Report the failed guided step while retaining the underlying exit code."""
 
@@ -128,6 +168,5 @@ class GuidedScanStepError(PokemonGoCleanupError):
                 f"{manifest_error}"
             )
         super().__init__(
-            f"Guided scan failed at step '{failed_step}': {cause} "
-            f"{preservation} {manifest_detail}"
+            f"Guided scan failed at step '{failed_step}': {cause} {preservation} {manifest_detail}"
         )

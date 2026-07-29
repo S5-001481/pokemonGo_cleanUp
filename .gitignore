@@ -27,4 +27,10 @@ Thumbs.db
 # Captured device data must remain local.
 data/screenshots/
 data/scans/
+data/
+**/ground_truth.json
+**/recognition.json
+**/debug/
+# Local recognition CSV exports.
+/*.csv
 

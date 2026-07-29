@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, PositiveInt
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PositiveInt,
+    field_validator,
+    model_validator,
+)
 
 ScanStep = Literal["summary", "moves", "appraisal"]
 ScanStatus = Literal["in_progress", "complete", "incomplete"]
+DatasetScanStatus = Literal["complete", "incomplete", "invalid"]
 
 
 class Device(BaseModel):
@@ -88,7 +96,7 @@ class CaptureResult(BaseModel):
 class ScanManifest(BaseModel):
     """Progress and device metadata for one guided three-screenshot scan."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     schema_version: Literal["1.0"] = "1.0"
     scan_id: str = Field(pattern=r"^[A-Za-z0-9._-]+$")
@@ -98,10 +106,10 @@ class ScanManifest(BaseModel):
     device_model: str | None = None
     screen_resolution: ScreenResolution
     screenshot_filenames: dict[ScanStep, str] = Field(default_factory=dict)
-    workflow_mode: Literal["guided"] = "guided"
+    workflow_mode: Literal["guided", "automatic"] = "guided"
     application_version: str
     scan_status: ScanStatus
-    failed_step: ScanStep | None = None
+    failed_step: str | None = None
     notes: str | None = None
 
 
@@ -113,3 +121,87 @@ class GuidedScanResult(BaseModel):
     scan_directory: Path
     manifest_path: Path
     manifest: ScanManifest
+
+
+class GroundTruth(BaseModel):
+    """Human-provided facts for one guided Pokémon scan."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    pokemon_name: str = Field(min_length=1)
+    cp: int = Field(gt=0, strict=True)
+    hp_current: int = Field(ge=0, strict=True)
+    hp_max: int = Field(gt=0, strict=True)
+    weight_kg: float = Field(gt=0, allow_inf_nan=False, strict=True)
+    height_m: float = Field(gt=0, allow_inf_nan=False, strict=True)
+    types: tuple[str, ...] = Field(min_length=1, max_length=2)
+    fast_move: str = Field(min_length=1)
+    charged_move_1: str = Field(min_length=1)
+    charged_move_2: str | None = None
+    attack_iv: int = Field(ge=0, le=15, strict=True)
+    defense_iv: int = Field(ge=0, le=15, strict=True)
+    hp_iv: int = Field(ge=0, le=15, strict=True)
+    favorite: bool = Field(strict=True)
+    shiny: bool = Field(strict=True)
+    shadow: bool = Field(strict=True)
+    purified: bool = Field(strict=True)
+    costume: bool = Field(strict=True)
+    notes: str | None = None
+
+    @field_validator(
+        "pokemon_name",
+        "fast_move",
+        "charged_move_1",
+        mode="before",
+    )
+    @classmethod
+    def _strip_required_text(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @field_validator("charged_move_2", "notes", mode="before")
+    @classmethod
+    def _normalize_optional_text(cls, value: object) -> object:
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return value
+
+    @field_validator("types")
+    @classmethod
+    def _normalize_types(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(value.strip() for value in values)
+        if any(not value for value in normalized):
+            raise ValueError("types cannot contain an empty value")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("types must not contain duplicates")
+        return normalized
+
+    @model_validator(mode="after")
+    def _validate_hp(self) -> GroundTruth:
+        if self.hp_current > self.hp_max:
+            raise ValueError("hp_current cannot be greater than hp_max")
+        return self
+
+
+class ScanValidationResult(BaseModel):
+    """Validation outcome for one recursively discovered scan directory."""
+
+    model_config = ConfigDict(frozen=True)
+
+    scan_directory: Path
+    scan_id: str
+    capture_date: date | None
+    screenshot_files_present: dict[ScanStep, bool]
+    manifest_valid: bool
+    annotation_present: bool
+    annotation_valid: bool | None = None
+    overall_status: DatasetScanStatus
+    issues: tuple[str, ...] = ()
+
+    @property
+    def screenshot_count(self) -> int:
+        """Number of required screenshots found on disk."""
+
+        return sum(self.screenshot_files_present.values())

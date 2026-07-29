@@ -134,3 +134,35 @@ def test_capture_failure_when_adb_command_fails(
 
     with pytest.raises(ScreenshotCaptureError, match="error: closed"):
         client.capture_screen("ABC123")
+
+
+def test_adb_input_wrappers_build_explicit_commands() -> None:
+    class InputRunner:
+        def __init__(self) -> None:
+            self.commands: list[list[str]] = []
+
+        def run_text(self, command: list[str], *, timeout_seconds: float) -> str:
+            assert timeout_seconds == 15
+            self.commands.append(command)
+            return ""
+
+        def run_bytes(self, command: list[str], *, timeout_seconds: float) -> bytes:
+            raise AssertionError(f"Unexpected byte command: {command}")
+
+    runner = InputRunner()
+    client = AdbClient(Path("adb.exe"), runner=runner)
+
+    client.tap("ABC123", 100, 200)
+    client.swipe("ABC123", 10, 20, 30, 40, 650)
+    client.press_back("ABC123")
+
+    assert runner.commands == [
+        ["adb.exe", "-s", "ABC123", "shell", "input", "tap", "100", "200"],
+        [
+            "adb.exe", "-s", "ABC123", "shell", "input", "swipe",
+            "10", "20", "30", "40", "650",
+        ],
+        [
+            "adb.exe", "-s", "ABC123", "shell", "input", "keyevent", "BACK"
+        ],
+    ]

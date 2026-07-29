@@ -87,11 +87,16 @@ ruff check .
 mypy
 ```
 
-A physical Huawei run remains the final integration check. The repository must
-not contain the generated PNG files; `data/scans/` is ignored by Git. For the
-original one-screenshot path, follow
+The target Huawei Mate 30 has produced eight guided scan groups that the dataset
+validator recognizes as complete: 24 decodable PNGs and eight valid manifests.
+Those private artifacts remain below ignored `data/` and are not copied into
+tests or documentation.
+
+For the original one-screenshot path, follow
 [one capture from command to local artifacts](one-real-run.md). For
-claim-level limits, use the
+validation and manual annotation, continue with
+[the dataset workflow](dataset-validation-and-annotation.md). For claim-level
+limits, use the
 [source evidence and falsifying checks](../references/source-evidence.md).
 
 Evidence status: Confirmed unless noted.

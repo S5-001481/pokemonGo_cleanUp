@@ -198,6 +198,46 @@ class AdbClient:
             )
         return png_bytes
 
+    def tap(self, serial_number: str, x: int, y: int) -> None:
+        """Send one explicit screen tap to the selected device."""
+
+        self._run_text(
+            ["-s", serial_number, "shell", "input", "tap", str(x), str(y)]
+        )
+
+    def swipe(
+        self,
+        serial_number: str,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        duration_ms: int,
+    ) -> None:
+        """Send one explicit, duration-bounded screen swipe."""
+
+        self._run_text(
+            [
+                "-s",
+                serial_number,
+                "shell",
+                "input",
+                "swipe",
+                str(x1),
+                str(y1),
+                str(x2),
+                str(y2),
+                str(duration_ms),
+            ]
+        )
+
+    def press_back(self, serial_number: str) -> None:
+        """Send Android's BACK key to exit the current overlay safely."""
+
+        self._run_text(
+            ["-s", serial_number, "shell", "input", "keyevent", "BACK"]
+        )
+
     def _command(self, arguments: list[str]) -> list[str]:
         return [str(self._adb_path), *arguments]
 
