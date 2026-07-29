@@ -22,13 +22,13 @@ from pokemon_go_cleanup.config import AppConfig
 from pokemon_go_cleanup.exceptions import AutomationError, LocalStorageError, PokemonGoCleanupError
 from pokemon_go_cleanup.models import Device, ScanManifest, ScanStep, ScreenResolution
 from pokemon_go_cleanup.recognition import (
-    CP_RECT,
     HEIGHT,
     NAME_RECT,
     WIDTH,
     OcrCandidate,
     RecognitionResult,
     RecognitionService,
+    normalize_cp_candidate,
     normalize_ocr_text,
 )
 from pokemon_go_cleanup.storage import atomic_write_bytes, atomic_write_text
@@ -46,6 +46,7 @@ PageState = Literal[
 ExpectedStates = tuple[PageState, ...]
 
 MOVE_PAGE_EVIDENCE_RECT: Final = (100, 900, 1360, 1800)
+SUMMARY_HP_RECT: Final = (500, 1520, 940, 1680)
 _MOVE_PAGE_LABELS: Final = (
     "道館",
     "團體戰",
@@ -92,11 +93,15 @@ class HuaweiMate30AutomationConfig:
     stable_difference_threshold: float = 0.008
     stable_consecutive_samples: int = 3
     step_timeout_seconds: float = 8.0
+    summary_poll_interval_seconds: float = 0.5
+    summary_wait_timeout_seconds: float = 15.0
     menu_poll_interval_seconds: float = 0.5
     menu_wait_timeout_seconds: float = 10.0
     max_menu_tap_attempts: int = 2
-    total_timeout_seconds: float = 90.0
-    max_dialogue_taps: int = 4
+    moves_poll_interval_seconds: float = 0.5
+    moves_wait_timeout_seconds: float = 15.0
+    max_moves_swipe_attempts: int = 2
+    total_timeout_seconds: float = 180.0
 
 
 HUAWEI_MATE_30_AUTOMATION: Final = HuaweiMate30AutomationConfig()
@@ -118,9 +123,7 @@ class PageDetection:
             "confidence": self.confidence,
             "matched_texts": list(self.matched_texts),
             "appraisal_target": (
-                asdict(self.appraisal_target)
-                if self.appraisal_target is not None
-                else None
+                asdict(self.appraisal_target) if self.appraisal_target is not None else None
             ),
             "details": self.details,
         }
@@ -143,7 +146,13 @@ def match_move_name_power_rows(
             and not any(label in value for label in _MOVE_PAGE_LABELS)
         ):
             names.append(candidate)
-        elif candidate.box[0] >= 1050 and re.fullmatch(r"\d{1,3}", value):
+        elif (
+            candidate.box[0] >= 1050
+            and re.fullmatch(
+                r"\d{1,3}(?:\s*\+\s*\d{1,3})?",
+                value,
+            )
+        ):
             powers.append(candidate)
 
     matches: list[tuple[OcrCandidate, OcrCandidate]] = []
@@ -155,9 +164,7 @@ def match_move_name_power_rows(
             if abs((power.box[1] + power.box[3]) // 2 - name_center_y) <= 70
         ]
         if same_row:
-            matches.append(
-                (name, max(same_row, key=lambda candidate: candidate.confidence))
-            )
+            matches.append((name, max(same_row, key=lambda candidate: candidate.confidence)))
     return tuple(matches)
 
 
@@ -171,7 +178,7 @@ class StableScreenResult:
 
 @dataclass(frozen=True, slots=True)
 class _StateWaitResult:
-    """Final screenshot, detection, and outcome from one menu-open attempt."""
+    """Final screenshot, detection, and outcome from one target-state attempt."""
 
     png_bytes: bytes
     detection: PageDetection
@@ -275,9 +282,13 @@ def planned_actions(
             "name": "advance_appraisal_dialogue",
             "kind": "tap",
             "coordinates": asdict(config.appraisal_advance),
-            "maximum_attempts": config.max_dialogue_taps,
+            "maximum_attempts": 1,
         },
-        {"name": "exit_appraisal", "kind": "press_back", "coordinates": None},
+        {
+            "name": "exit_appraisal",
+            "kind": "tap",
+            "coordinates": {"x": 720, "y": 1560},
+        },
     )
 
 
@@ -327,9 +338,7 @@ def wait_for_stable_screen(
         if stable_count >= consecutive_samples:
             return StableScreenResult(current, tuple(differences))
         previous = current
-    raise AutomationError(
-        f"Screen did not stabilize within {timeout_seconds:.1f} seconds."
-    )
+    raise AutomationError(f"Screen did not stabilize within {timeout_seconds:.1f} seconds.")
 
 
 class HuaweiMate30PageDetector:
@@ -386,17 +395,14 @@ class HuaweiMate30PageDetector:
                     for candidate in candidates
                 )
                 confidence = min(
-                    min(name.confidence, power.confidence)
-                    for name, power in move_rows
+                    min(name.confidence, power.confidence) for name, power in move_rows
                 )
                 if anchor_found:
                     confidence = min(1.0, confidence + 0.01)
                 return PageDetection(
                     state="detail_moves",
                     confidence=confidence,
-                    matched_texts=tuple(
-                        item.raw for row in move_rows for item in row
-                    ),
+                    matched_texts=tuple(item.raw for row in move_rows for item in row),
                     details={
                         "move_rows": len(move_rows),
                         "move_section_anchor": anchor_found,
@@ -404,32 +410,108 @@ class HuaweiMate30PageDetector:
                 )
 
         if "detail_summary" in expected_set:
-            cp_candidates, _ = self._reader._ocr_variants(image, CP_RECT)
+            cp_candidates, _ = self._reader._ocr_cp_variants(image)
             name_candidates, _ = self._reader._ocr_variants(image, NAME_RECT)
             cp = self._reader._best_cp(cp_candidates)
             name = self._reader._best_text(name_candidates)
-            if cp is not None and name is not None:
+            hp_candidates = self._ocr_rectangle(image, SUMMARY_HP_RECT)
+            hp = max(
+                (
+                    candidate
+                    for candidate in hp_candidates
+                    if re.search(
+                        r"\d+\s*/\s*\d+\s*HP",
+                        normalize_ocr_text(candidate.raw),
+                        re.IGNORECASE,
+                    )
+                ),
+                key=lambda candidate: candidate.confidence,
+                default=None,
+            )
+            if name is not None and (cp is not None or hp is not None):
+                details: dict[str, object] = {}
+                evidence = "name_hp"
+                matched_texts = (name.raw,)
+                confidence_candidates = [name.confidence]
+                if cp is not None:
+                    normalized_cp = normalize_cp_candidate(cp.raw)
+                    if normalized_cp is not None:
+                        details["cp"] = normalized_cp
+                    matched_texts = (cp.raw, name.raw)
+                    confidence_candidates.append(cp.confidence)
+                    evidence = "name_cp"
+                if hp is not None:
+                    details["hp"] = re.sub(r"\s+", "", normalize_ocr_text(hp.raw)).upper()
+                    confidence_candidates.append(hp.confidence)
+                    if cp is not None:
+                        evidence = "name_cp_hp"
+                details["summary_evidence"] = evidence
                 return PageDetection(
                     state="detail_summary",
-                    confidence=min(cp.confidence, name.confidence),
-                    matched_texts=(cp.raw, name.raw),
+                    confidence=min(confidence_candidates),
+                    matched_texts=matched_texts,
+                    details=details,
                 )
 
         if "appraisal_dialogue" in expected_set:
-            candidates = self._ocr_rectangle(image, self._config.appraisal_dialogue_rect)
-            matched = tuple(
-                candidate
-                for candidate in candidates
-                if any(
-                    keyword in normalize_ocr_text(candidate.raw).upper()
-                    for keyword in self._DIALOGUE_KEYWORDS
-                )
+            candidates = self._ocr_rectangle(
+                image,
+                self._config.appraisal_dialogue_rect,
             )
-            if matched:
+
+            normalized = tuple(
+                (
+                    candidate,
+                    normalize_ocr_text(candidate.raw).upper(),
+                )
+                for candidate in candidates
+            )
+
+            keyword_hits = {
+                keyword
+                for keyword in self._DIALOGUE_KEYWORDS
+                if any(
+                    keyword.upper() in text
+                    for _, text in normalized
+                )
+            }
+
+            stat_hits = {
+                keyword
+                for keyword in ("攻擊", "防禦", "HP")
+                if keyword in keyword_hits
+            }
+
+            # 正常详情页可能只有 HP；
+            # 招式页的“新攻擊招式”可能只有 攻擊。
+            # 单独一个普通关键词不能证明是评价对话。
+            dialogue_confirmed = (
+                "整體" in keyword_hits
+                or "調查" in keyword_hits
+                or len(stat_hits) >= 2
+            )
+
+            if dialogue_confirmed:
+                matched = tuple(
+                    candidate
+                    for candidate, candidate_text in normalized
+                    if any(
+                        keyword.upper() in candidate_text
+                        for keyword in keyword_hits
+                    )
+                )
+
                 return PageDetection(
                     state="appraisal_dialogue",
-                    confidence=max(item.confidence for item in matched),
-                    matched_texts=tuple(item.raw for item in matched),
+                    confidence=max(
+                        item.confidence for item in matched
+                    ),
+                    matched_texts=tuple(
+                        item.raw for item in matched
+                    ),
+                    details={
+                        "keyword_hits": sorted(keyword_hits),
+                    },
                 )
 
         return PageDetection(
@@ -604,6 +686,26 @@ class _DebugRecorder:
                 },
             )
 
+    def poll_states(
+        self,
+        label: str,
+        *,
+        target_state: PageState,
+        interval_seconds: float,
+        timeout_seconds: float,
+        samples: Sequence[dict[str, object]],
+    ) -> None:
+        if self._enabled:
+            self._write_json(
+                f"{label}_states.json",
+                {
+                    "target_state": target_state,
+                    "interval_seconds": interval_seconds,
+                    "timeout_seconds": timeout_seconds,
+                    "samples": list(samples),
+                },
+            )
+
     def _write_json(self, name: str, data: object) -> None:
         atomic_write_text(
             self._directory / name,
@@ -683,9 +785,7 @@ class AutoScanService:
         if started_at.tzinfo is None:
             started_at = started_at.astimezone()
         scan_id = f"{started_at.strftime('%Y%m%d_%H%M%S_%f')}_{self._token_factory()}"
-        scan_directory = (
-            self._config.scan_root / started_at.strftime("%Y-%m-%d") / scan_id
-        )
+        scan_directory = self._config.scan_root / started_at.strftime("%Y-%m-%d") / scan_id
         try:
             scan_directory.mkdir(parents=True, exist_ok=False)
         except OSError as error:
@@ -746,10 +846,9 @@ class AutoScanService:
         session.current_step = "verify_detail_summary"
         initial = self._adb.capture_screen(serial)
         session.recorder.screen("00_initial", initial)
-        summary_detection = self._detect(
-            session, "initial", initial, ("detail_summary",)
+        initial, summary_detection = self._verify_detail_summary(
+            session, serial, initial, deadline
         )
-        self._require_state(summary_detection, ("detail_summary",))
         session.current_step = "capture_summary"
         self._save_capture(session, "summary", initial)
 
@@ -763,22 +862,14 @@ class AutoScanService:
 
         self._check_deadline(deadline)
         session.current_step = "scroll_to_moves"
-        self._swipe(
+        moves, _ = self._scroll_to_moves(
             session,
             serial,
-            name="scroll_to_moves",
-            gesture=self._automation.scroll_to_moves,
-            before=initial,
-            before_detection=summary_detection,
-            before_expected=("detail_summary",),
-            after_expected=("detail_moves",),
+            initial,
+            summary_detection,
+            deadline,
         )
         session.current_step = "capture_moves"
-        moves = self._adb.capture_screen(serial)
-        moves_detection = self._detect(
-            session, "moves_capture", moves, ("detail_moves",)
-        )
-        self._require_state(moves_detection, ("detail_moves",))
         self._save_capture(session, "moves", moves)
 
         self._check_deadline(deadline)
@@ -789,60 +880,89 @@ class AutoScanService:
             deadline,
         )
         if menu_detection.appraisal_target is None:
-            raise AutomationError(
-                "Action menu did not provide a safe OCR target for 調查寶可夢."
-            )
+            raise AutomationError("Action menu did not provide a safe OCR target for 調查寶可夢.")
 
         self._check_deadline(deadline)
         session.current_step = "open_appraisal"
-        appraisal_screen = self._tap(
-            session,
-            serial,
+        appraisal_target = menu_detection.appraisal_target
+        self._require_state(menu_detection, ("action_menu",))
+        session.recorder.screen("before_open_appraisal", menu_screen)
+        session.recorder.action(
             name="open_appraisal",
-            point=menu_detection.appraisal_target,
-            before=menu_screen,
-            before_detection=menu_detection,
-            before_expected=("action_menu",),
-            after_expected=("appraisal_dialogue", "appraisal_bars"),
+            kind="tap",
+            coordinates=asdict(appraisal_target),
+            executed=True,
+            before_state=menu_detection.state,
         )
-        appraisal_detection = self._detect(
-            session,
-            "appraisal_entry",
-            appraisal_screen,
-            ("appraisal_dialogue", "appraisal_bars"),
-        )
-        self._require_state(
-            appraisal_detection, ("appraisal_dialogue", "appraisal_bars")
+        self._adb.tap(
+            serial,
+            appraisal_target.x,
+            appraisal_target.y,
         )
 
-        for attempt in range(1, self._automation.max_dialogue_taps + 1):
-            if appraisal_detection.state == "appraisal_bars":
-                break
+        entry_result = self._wait_for_appraisal_entry(
+            session,
+            serial,
+        )
+        appraisal_screen = entry_result.png_bytes
+        appraisal_detection = entry_result.detection
+
+        if entry_result.outcome != "reached":
+            atomic_write_bytes(
+                session.scan_directory / "appraisal_entry_timeout.png",
+                appraisal_screen,
+            )
+            session.recorder.screen("appraisal_entry_timeout", appraisal_screen)
+            raise AutomationError(
+                "Appraisal dialogue or IV bars did not appear within 30 seconds "
+                "after opening appraisal. No additional tap was sent."
+            )
+
+        if appraisal_detection.state == "appraisal_dialogue":
             self._check_deadline(deadline)
-            session.current_step = f"advance_appraisal_dialogue_{attempt}"
-            appraisal_screen = self._tap(
+            session.current_step = "advance_appraisal_dialogue_1"
+            self._require_state(appraisal_detection, ("appraisal_dialogue",))
+            session.recorder.screen(
+                "before_advance_appraisal_dialogue_1",
+                appraisal_screen,
+            )
+            session.recorder.action(
+                name="advance_appraisal_dialogue_1",
+                kind="tap",
+                coordinates=asdict(self._automation.appraisal_advance),
+                executed=True,
+                before_state=appraisal_detection.state,
+            )
+            self._adb.tap(
+                serial,
+                self._automation.appraisal_advance.x,
+                self._automation.appraisal_advance.y,
+            )
+            session.current_step = "wait_for_appraisal_bars"
+            wait_result = self._wait_for_appraisal_bars(
                 session,
                 serial,
-                name=f"advance_appraisal_dialogue_{attempt}",
-                point=self._automation.appraisal_advance,
-                before=appraisal_screen,
-                before_detection=appraisal_detection,
-                before_expected=("appraisal_dialogue",),
-                after_expected=("appraisal_dialogue", "appraisal_bars"),
+                deadline,
             )
-            appraisal_detection = self._detect(
-                session,
-                f"appraisal_after_{attempt}",
-                appraisal_screen,
-                ("appraisal_dialogue", "appraisal_bars"),
-            )
-            self._require_state(
-                appraisal_detection, ("appraisal_dialogue", "appraisal_bars")
-            )
+            appraisal_screen = wait_result.png_bytes
+            appraisal_detection = wait_result.detection
+            if wait_result.outcome == "unexpected":
+                raise AutomationError(
+                    "Unexpected page state while waiting for appraisal_bars: "
+                    f"{appraisal_detection.state}. No additional tap was sent."
+                )
+            if wait_result.outcome != "reached":
+                atomic_write_bytes(
+                    session.scan_directory / "appraisal_wait_timeout.png",
+                    appraisal_screen,
+                )
+                session.recorder.screen("appraisal_wait_timeout", appraisal_screen)
+                raise AutomationError(
+                    "IV bars did not appear within 30 seconds after the single "
+                    "appraisal dialogue tap. No additional tap was sent."
+                )
         if appraisal_detection.state != "appraisal_bars":
-            raise AutomationError(
-                "IV bars did not appear reliably before the dialogue limit."
-            )
+            raise AutomationError("IV bars were not detected. No additional tap was sent.")
 
         session.current_step = "capture_appraisal"
         appraisal = self._adb.capture_screen(serial)
@@ -854,7 +974,7 @@ class AutoScanService:
 
         self._check_deadline(deadline)
         session.current_step = "exit_appraisal"
-        self._press_back(
+        self._exit_appraisal(
             session,
             serial,
             before=appraisal,
@@ -876,6 +996,225 @@ class AutoScanService:
             },
         )
         return self._result(session, recognition, False, actions)
+
+    def _verify_detail_summary(
+        self,
+        session: _Session,
+        serial: str,
+        initial: bytes,
+        deadline: float,
+    ) -> tuple[bytes, PageDetection]:
+        """Wait for name plus CP, retaining name plus HP as the safe fallback."""
+
+        interval = self._automation.summary_poll_interval_seconds
+        timeout = self._automation.summary_wait_timeout_seconds
+        started = self._monotonic()
+        maximum_samples = math.ceil(timeout / interval)
+        last_valid: tuple[bytes, PageDetection] | None = None
+        screen = initial
+
+        for sample_index in range(maximum_samples + 1):
+            self._check_deadline(deadline)
+            if sample_index > 0:
+                elapsed = self._monotonic() - started
+                if elapsed >= timeout:
+                    break
+                self._sleeper(min(interval, timeout - elapsed))
+                screen = self._adb.capture_screen(serial)
+                session.recorder.screen(
+                    f"verify_detail_summary_poll_{sample_index:02d}",
+                    screen,
+                )
+
+            detection = self._detect(
+                session,
+                f"verify_detail_summary_poll_{sample_index:02d}",
+                screen,
+                ("detail_summary",),
+            )
+            evidence = detection.details.get("summary_evidence")
+            if detection.state == "detail_summary" and evidence in (
+                "name_cp",
+                "name_cp_hp",
+            ):
+                return screen, detection
+            if detection.state == "detail_summary" and evidence == "name_hp":
+                last_valid = (screen, detection)
+
+            if self._monotonic() - started >= timeout:
+                break
+
+        if last_valid is not None:
+            return last_valid
+        raise AutomationError(
+            "detail_summary was not confirmed within 15 seconds using name plus "
+            "CP or name plus HP. No input was sent."
+        )
+
+    def _scroll_to_moves(
+        self,
+        session: _Session,
+        serial: str,
+        initial: bytes,
+        initial_detection: PageDetection,
+        deadline: float,
+    ) -> tuple[bytes, PageDetection]:
+        before = initial
+        before_detection = initial_detection
+        for attempt in range(1, self._automation.max_moves_swipe_attempts + 1):
+            self._check_deadline(deadline)
+            self._require_state(before_detection, ("detail_summary",))
+            label = f"scroll_to_moves_attempt_{attempt}"
+            session.recorder.screen(f"before_{label}", before)
+            session.recorder.action(
+                name=label,
+                kind="swipe",
+                coordinates=asdict(self._automation.scroll_to_moves),
+                executed=True,
+                before_state=before_detection.state,
+            )
+            gesture = self._automation.scroll_to_moves
+            self._adb.swipe(
+                serial,
+                gesture.start.x,
+                gesture.start.y,
+                gesture.end.x,
+                gesture.end.y,
+                gesture.duration_ms,
+            )
+            result = self._wait_for_detail_moves(
+                session,
+                serial,
+                label,
+                deadline,
+            )
+            if result.outcome == "reached":
+                return result.png_bytes, result.detection
+            if result.outcome == "unexpected":
+                raise AutomationError(
+                    "Unexpected page state while waiting for detail_moves: "
+                    f"{result.detection.state}. Automation stopped immediately."
+                )
+            if result.detection.state == "unknown":
+                raise AutomationError(
+                    "detail_moves was not detected within 15 seconds and the final "
+                    "state was unknown. No second swipe was sent."
+                )
+            if result.detection.state != "detail_summary":
+                raise AutomationError(
+                    f"detail_moves wait ended in an unsupported state: {result.detection.state}."
+                )
+            before = result.png_bytes
+            before_detection = result.detection
+
+        raise AutomationError(
+            "detail_moves was not detected within 15 seconds after either of the "
+            "two allowed scroll swipes."
+        )
+
+    def _wait_for_detail_moves(
+        self,
+        session: _Session,
+        serial: str,
+        label: str,
+        deadline: float,
+    ) -> _StateWaitResult:
+        interval = self._automation.moves_poll_interval_seconds
+        timeout = self._automation.moves_wait_timeout_seconds
+        started = self._monotonic()
+        maximum_samples = math.ceil(timeout / interval)
+        samples: list[dict[str, object]] = []
+        last_screen: bytes | None = None
+        last_detection: PageDetection | None = None
+
+        for sample_index in range(1, maximum_samples + 1):
+            self._check_deadline(deadline)
+            actual_elapsed = self._monotonic() - started
+            if actual_elapsed >= timeout:
+                break
+            self._sleeper(min(interval, timeout - actual_elapsed))
+            screen = self._adb.capture_screen(serial)
+            detection = self._detect_scroll_screen(
+                session,
+                f"{label}_poll_{sample_index:02d}",
+                screen,
+            )
+            session.recorder.screen(
+                f"{label}_poll_{sample_index:02d}",
+                screen,
+            )
+            measured_elapsed = self._monotonic() - started
+            elapsed = max(measured_elapsed, sample_index * interval)
+            samples.append(
+                {
+                    "sample": sample_index,
+                    "elapsed_seconds": elapsed,
+                    "state": detection.state,
+                    "confidence": detection.confidence,
+                    "matched_texts": list(detection.matched_texts),
+                }
+            )
+            session.recorder.poll_states(
+                label,
+                target_state="detail_moves",
+                interval_seconds=interval,
+                timeout_seconds=timeout,
+                samples=samples,
+            )
+            last_screen = screen
+            last_detection = detection
+            if detection.state == "detail_moves":
+                return _StateWaitResult(screen, detection, "reached", elapsed)
+            if detection.state not in ("detail_summary", "unknown"):
+                return _StateWaitResult(screen, detection, "unexpected", elapsed)
+            if measured_elapsed >= timeout:
+                break
+
+        if last_screen is None or last_detection is None:
+            last_screen = self._adb.capture_screen(serial)
+            last_detection = self._detect_scroll_screen(
+                session,
+                f"{label}_poll_final",
+                last_screen,
+            )
+            session.recorder.screen(f"{label}_poll_final", last_screen)
+            samples.append(
+                {
+                    "sample": 0,
+                    "elapsed_seconds": timeout,
+                    "state": last_detection.state,
+                    "confidence": last_detection.confidence,
+                    "matched_texts": list(last_detection.matched_texts),
+                }
+            )
+            session.recorder.poll_states(
+                label,
+                target_state="detail_moves",
+                interval_seconds=interval,
+                timeout_seconds=timeout,
+                samples=samples,
+            )
+        return _StateWaitResult(last_screen, last_detection, "timeout", timeout)
+
+    def _detect_scroll_screen(
+        self,
+        session: _Session,
+        label: str,
+        screen: bytes,
+    ) -> PageDetection:
+        moves = self._detect(session, f"{label}_moves", screen, ("detail_moves",))
+        if moves.state == "detail_moves":
+            return moves
+        summary = self._detect(session, f"{label}_summary", screen, ("detail_summary",))
+        if summary.state == "detail_summary":
+            return summary
+        abnormal = self._detect(
+            session,
+            f"{label}_abnormal",
+            screen,
+            ("action_menu", "appraisal_dialogue", "appraisal_bars"),
+        )
+        return abnormal if abnormal.state != "unknown" else moves
 
     def _open_action_menu(
         self,
@@ -904,9 +1243,7 @@ class AutoScanService:
             self._check_deadline(deadline)
             if attempt > 1:
                 before = self._adb.capture_screen(serial)
-                session.recorder.screen(
-                    f"before_open_action_menu_attempt_{attempt}", before
-                )
+                session.recorder.screen(f"before_open_action_menu_attempt_{attempt}", before)
                 before_detection = self._detect(
                     session,
                     f"before_open_action_menu_attempt_{attempt}",
@@ -1035,40 +1372,209 @@ class AutoScanService:
             )
         return _StateWaitResult(last_screen, last_detection, "timeout", timeout)
 
-    def _swipe(
+    def _wait_for_appraisal_entry(
         self,
         session: _Session,
         serial: str,
-        *,
-        name: str,
-        gesture: Swipe,
-        before: bytes,
-        before_detection: PageDetection,
-        before_expected: ExpectedStates,
-        after_expected: ExpectedStates,
-    ) -> bytes:
-        self._require_state(before_detection, before_expected)
-        session.recorder.screen(f"before_{name}", before)
-        session.recorder.action(
-            name=name,
-            kind="swipe",
-            coordinates=asdict(gesture),
-            executed=True,
-            before_state=before_detection.state,
+    ) -> _StateWaitResult:
+        expected: ExpectedStates = (
+            "appraisal_bars",
+            "appraisal_dialogue",
+            "action_menu",
         )
-        self._adb.swipe(
-            serial,
-            gesture.start.x,
-            gesture.start.y,
-            gesture.end.x,
-            gesture.end.y,
-            gesture.duration_ms,
+        interval = 0.5
+        timeout = 30.0
+        started = self._monotonic()
+        maximum_samples = math.ceil(timeout / interval)
+        last_screen: bytes | None = None
+        last_detection: PageDetection | None = None
+        unknown_after_menu_count = 0
+
+        for sample_index in range(1, maximum_samples + 1):
+            elapsed = self._monotonic() - started
+            if elapsed >= timeout:
+                break
+
+            self._sleeper(min(interval, timeout - elapsed))
+            screen = self._adb.capture_screen(serial)
+            detection = self._detect(
+                session,
+                f"appraisal_entry_wait_{sample_index:02d}",
+                screen,
+                expected,
+            )
+            session.recorder.screen(
+                f"appraisal_entry_wait_{sample_index:02d}",
+                screen,
+            )
+
+            measured_elapsed = self._monotonic() - started
+            last_screen = screen
+            last_detection = detection
+
+            if detection.state in (
+                "appraisal_bars",
+                "appraisal_dialogue",
+            ):
+                return _StateWaitResult(
+                    screen,
+                    detection,
+                    "reached",
+                    measured_elapsed,
+                )
+
+            if detection.state == "action_menu":
+                # 调查宝可梦菜单仍然存在，不发送额外点击。
+                unknown_after_menu_count = 0
+                continue
+
+            if detection.state == "unknown":
+                # 菜单已经消失，但严格 OCR 可能读不到评价对话。
+                # 连续四帧、约两秒后，只在这个特定阶段推断为评价对话。
+                unknown_after_menu_count += 1
+
+                if unknown_after_menu_count >= 4:
+                    inferred = PageDetection(
+                        state="appraisal_dialogue",
+                        confidence=0.0,
+                        details={
+                            "inferred_from": (
+                                "action_menu_disappeared_for_four_samples"
+                            ),
+                        },
+                    )
+                    session.recorder.detection(
+                        "appraisal_entry_inferred_dialogue",
+                        inferred,
+                    )
+                    return _StateWaitResult(
+                        screen,
+                        inferred,
+                        "reached",
+                        measured_elapsed,
+                    )
+
+                continue
+
+            return _StateWaitResult(
+                screen,
+                detection,
+                "unexpected",
+                measured_elapsed,
+            )
+
+        if last_screen is None or last_detection is None:
+            last_screen = self._adb.capture_screen(serial)
+            last_detection = self._detect(
+                session,
+                "appraisal_entry_wait_final",
+                last_screen,
+                expected,
+            )
+            session.recorder.screen(
+                "appraisal_entry_wait_final",
+                last_screen,
+            )
+
+        if last_detection.state in (
+            "appraisal_bars",
+            "appraisal_dialogue",
+        ):
+            return _StateWaitResult(
+                last_screen,
+                last_detection,
+                "reached",
+                timeout,
+            )
+
+        return _StateWaitResult(
+            last_screen,
+            last_detection,
+            "timeout",
+            timeout,
         )
-        stable = self._wait(session, serial, name)
-        session.recorder.screen(f"after_{name}", stable)
-        after_detection = self._detect(session, f"after_{name}", stable, after_expected)
-        self._require_state(after_detection, after_expected)
-        return stable
+
+    def _wait_for_appraisal_bars(
+        self,
+        session: _Session,
+        serial: str,
+        deadline: float,
+    ) -> _StateWaitResult:
+        expected: ExpectedStates = (
+            "appraisal_bars",
+            "appraisal_dialogue",
+        )
+        interval = 0.5
+        timeout = 30.0
+        started = self._monotonic()
+        maximum_samples = math.ceil(timeout / interval)
+        last_screen: bytes | None = None
+        last_detection: PageDetection | None = None
+
+        for sample_index in range(1, maximum_samples + 1):
+            now = self._monotonic()
+            elapsed = now - started
+            if elapsed >= timeout:
+                break
+            self._sleeper(min(interval, timeout - elapsed))
+            screen = self._adb.capture_screen(serial)
+            detection = self._detect(
+                session,
+                f"appraisal_bars_wait_{sample_index:02d}",
+                screen,
+                expected,
+            )
+            session.recorder.screen(
+                f"appraisal_bars_wait_{sample_index:02d}",
+                screen,
+            )
+            measured_elapsed = self._monotonic() - started
+            last_screen = screen
+            last_detection = detection
+            if detection.state == "appraisal_bars":
+                return _StateWaitResult(
+                    screen,
+                    detection,
+                    "reached",
+                    measured_elapsed,
+                )
+            if detection.state not in ("appraisal_dialogue", "unknown"):
+                return _StateWaitResult(
+                    screen,
+                    detection,
+                    "unexpected",
+                    measured_elapsed,
+                )
+
+        if last_screen is None or last_detection is None:
+            last_screen = self._adb.capture_screen(serial)
+            last_detection = self._detect(
+                session,
+                "appraisal_bars_wait_final",
+                last_screen,
+                expected,
+            )
+            session.recorder.screen("appraisal_bars_wait_final", last_screen)
+        if last_detection.state == "appraisal_bars":
+            return _StateWaitResult(
+                last_screen,
+                last_detection,
+                "reached",
+                timeout,
+            )
+        if last_detection.state not in ("appraisal_dialogue", "unknown"):
+            return _StateWaitResult(
+                last_screen,
+                last_detection,
+                "unexpected",
+                timeout,
+            )
+        return _StateWaitResult(
+            last_screen,
+            last_detection,
+            "timeout",
+            timeout,
+        )
 
     def _tap(
         self,
@@ -1098,7 +1604,7 @@ class AutoScanService:
         self._require_state(after_detection, after_expected)
         return stable
 
-    def _press_back(
+    def _exit_appraisal(
         self,
         session: _Session,
         serial: str,
@@ -1110,21 +1616,61 @@ class AutoScanService:
         session.recorder.screen("before_exit_appraisal", before)
         session.recorder.action(
             name="exit_appraisal",
-            kind="press_back",
-            coordinates=None,
+            kind="tap",
+            coordinates={"x": 720, "y": 1560},
             executed=True,
             before_state=before_detection.state,
         )
-        self._adb.press_back(serial)
-        stable = self._wait(session, serial, "exit_appraisal")
-        session.recorder.screen("after_exit_appraisal", stable)
-        detection = self._detect(
-            session,
-            "after_exit_appraisal",
-            stable,
-            ("detail_summary", "detail_moves"),
+
+        # Send exactly one tap. Pokémon animation must not be used
+        # as a screen-stability condition.
+        self._adb.tap(serial, 720, 1560)
+
+        interval = 0.5
+        timeout = 15.0
+        started = self._monotonic()
+        sample_index = 0
+        last_screen: bytes | None = None
+
+        while self._monotonic() - started < timeout:
+            self._sleeper(interval)
+            sample_index += 1
+
+            screen = self._adb.capture_screen(serial)
+            last_screen = screen
+            label = f"exit_appraisal_wait_{sample_index:02d}"
+
+            session.recorder.screen(label, screen)
+            detection = self._detect(
+                session,
+                label,
+                screen,
+                ("detail_summary", "detail_moves"),
+            )
+
+            if detection.state in ("detail_summary", "detail_moves"):
+                session.recorder.screen("after_exit_appraisal", screen)
+                return
+
+            if detection.state != "unknown":
+                raise AutomationError(
+                    "Unexpected page state while exiting appraisal: "
+                    f"{detection.state}. No additional input was sent."
+                )
+
+        if last_screen is None:
+            last_screen = self._adb.capture_screen(serial)
+
+        atomic_write_bytes(
+            session.scan_directory / "exit_appraisal_timeout.png",
+            last_screen,
         )
-        self._require_state(detection, ("detail_summary", "detail_moves"))
+        session.recorder.screen("exit_appraisal_timeout", last_screen)
+
+        raise AutomationError(
+            "detail_summary or detail_moves was not detected within "
+            "15 seconds after exiting appraisal. No additional input was sent."
+        )
 
     def _wait(self, session: _Session, serial: str, label: str) -> bytes:
         result = self._stable_waiter(lambda: self._adb.capture_screen(serial))

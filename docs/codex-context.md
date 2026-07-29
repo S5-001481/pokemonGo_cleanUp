@@ -81,15 +81,19 @@ Expected user failures have stable exit codes. Captures are excluded by
 - Screenshots and manifests use same-directory temporary files plus atomic replace.
 - A failed guided step preserves earlier screenshots and marks the manifest incomplete.
 - Automatic input is allowed only after the immediately preceding screenshot
-  matches the expected state; after moves, either detail state may open the fixed
-  menu without a reverse swipe, and `調查寶可夢` has no guessed fallback coordinate.
+  matches the expected state. Move scrolling polls `detail_moves` instead of whole-
+  screen stability and retries only after a final `detail_summary`; after moves,
+  either detail state may open the fixed menu without a reverse swipe, and
+  `調查寶可夢` has no guessed fallback coordinate.
 - Menu opening polls OCR every 500 ms for up to 10 seconds and permits one retry
   only after a fresh screenshot still confirms `detail_moves` or `detail_summary`.
 - `--dry-run` captures/detects the initial summary and records the plan without
   calling tap, swipe, or BACK.
 - Automatic scans become complete only after safe appraisal exit and recognition.
 - Batch CSV is rewritten atomically after every complete scan; an existing CSV
-  requires `--resume` and every referenced manifest must still be complete.
+  requires `--resume` and every referenced manifest must still be complete. Resume
+  compares the current static HP-to-details ROI only with the last row, pre-switches
+  when still on that Pokémon, and repeats the adjacent guard before append.
 - Horizontal switching is allowed only from a freshly confirmed `detail_summary`;
   the next name or CP must differ, with at most two fixed swipes.
 - Missing required artifacts or a non-complete manifest classify a scan as
@@ -111,12 +115,17 @@ required, and no OCR result is used to estimate IVs. A connected-device live run
 confirmed the no-scroll menu path and OCR `action_menu` detection at 0.99948 on the
 first poll. A later connected-device run completed the entire one-Pokémon flow,
 including appraisal dialogue, IV capture, safe exit, recognition, and a complete
-manifest. Physical batch testing confirmed a durable first CSV row and the fixed
-right swipe from 搗蛋小妖 CP318 to 睡睡菇 CP431. The batch summary-first fix prevents
-the IV detector from misclassifying that new summary. The old move gate stopped when the section heading fell above its crop even
+manifest. The current device-confirmed next-item direction is left only: the first
+gesture is `(1180,1500)` to `(260,1500)` over 600 ms and the sole retry is
+`(1300,1500)` to `(140,1500)` over 850 ms. No right-swipe fallback is allowed. The
+batch summary-first fix prevents IV misclassification. The old move gate stopped when the section heading fell above its crop even
 though move rows were visible. The authorized minimal fix keeps the anchored path and
 adds a fixed-layout fallback requiring a move name and same-row damage number; saved
 real move and appraisal screenshots verify both sides. A resumed live batch run then
 kept 搗蛋小妖 CP318 as row 1, completed 睡睡菇 CP431 as row 2, and stopped at the
-two-row limit with distinct scan IDs and identities. Device/language/version
-generalization remains deferred.
+two-row limit with distinct scan IDs and identities. A later bounded resume found
+the phone already on 熔蟻獸 CP1591, measured static-ROI distance 60 from the last
+睡睡菇 row (threshold 8), skipped the preliminary horizontal swipe, and reached moves
+on its first state poll without whole-screen stability. The unchanged appraisal
+dialogue limit then stopped safely and left the CSV at two rows.
+Device/language/version generalization remains deferred.

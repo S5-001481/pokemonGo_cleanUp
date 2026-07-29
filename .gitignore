@@ -34,3 +34,9 @@ data/
 # Local recognition CSV exports.
 /*.csv
 
+
+# Local batch scan logs
+scan-batch-*.log
+
+# Local source backups
+*.bak.*

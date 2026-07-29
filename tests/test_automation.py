@@ -96,6 +96,37 @@ class QueueDetector:
         return self._detections.popleft()
 
 
+class MovesAwareQueueDetector(QueueDetector):
+    def __init__(self, detections: list[PageDetection]) -> None:
+        super().__init__(detections)
+        self.moves_seen = False
+
+    def detect(
+        self,
+        png_bytes: bytes,
+        *,
+        expected: tuple[str, ...],
+    ) -> PageDetection:
+        detection = super().detect(png_bytes, expected=expected)
+        if detection.state == "detail_moves":
+            self.moves_seen = True
+        return detection
+
+
+class RejectStabilityBeforeMoves:
+    def __init__(self, detector: MovesAwareQueueDetector) -> None:
+        self.detector = detector
+        self.calls = 0
+
+    def __call__(self, capture: object) -> StableScreenResult:
+        assert callable(capture)
+        assert self.detector.moves_seen, (
+            "full-screen stability was requested before detail_moves appeared"
+        )
+        self.calls += 1
+        return StableScreenResult(capture(), (1.0,))
+
+
 class InterruptingDetector:
     def detect(
         self,
@@ -119,9 +150,7 @@ class FakeReader:
             pokemon_name=RecognizedText(value="妙蛙花", raw="妙蛙花", confidence=0.99),
             cp=RecognizedInteger(value=1761, raw="CP1761", confidence=0.99),
             fast_move=RecognizedText(value="藤鞭", raw="藤鞭", confidence=0.99),
-            charged_move_1=RecognizedText(
-                value="污泥攻擊", raw="污泥攻擊", confidence=0.99
-            ),
+            charged_move_1=RecognizedText(value="污泥攻擊", raw="污泥攻擊", confidence=0.99),
             charged_move_2=RecognizedText(value=None, raw=None, confidence=None),
             attack_iv=15,
             defense_iv=13,
@@ -307,10 +336,9 @@ def test_live_flow_sends_only_gated_single_scan_actions(tmp_path: Path) -> None:
         matched_texts=("調查寶可夢", "傳送"),
         appraisal_target=Point(700, 2400),
     )
-    detector = QueueDetector(
+    detector = MovesAwareQueueDetector(
         [
             PageDetection("detail_summary", 0.99),
-            PageDetection("detail_moves", 0.99),
             PageDetection("detail_moves", 0.99),
             PageDetection("detail_moves", 0.99),
             menu,
@@ -324,14 +352,17 @@ def test_live_flow_sends_only_gated_single_scan_actions(tmp_path: Path) -> None:
     )
     adb = FakeAutomationAdb()
     reader = FakeReader()
+    stability = RejectStabilityBeforeMoves(detector)
+    app_config = AppConfig(data_dir=tmp_path)
+    assert not hasattr(app_config, "appraisal_exit")
     service = AutoScanService(
-        AppConfig(data_dir=tmp_path),
+        app_config,
         adb,
         detector,
         reader,
         clock=Clock(),
         token_factory=lambda: "live",
-        stable_waiter=_stable,
+        stable_waiter=stability,
         monotonic=lambda: 0.0,
         sleeper=lambda _: None,
     )
@@ -340,21 +371,33 @@ def test_live_flow_sends_only_gated_single_scan_actions(tmp_path: Path) -> None:
 
     assert result.manifest.scan_status == "complete"
     assert result.recognition is not None
+    assert stability.calls == 3
     assert [action[0] for action in adb.inputs] == [
         "swipe",
         "tap",
         "tap",
         "tap",
-        "back",
+        "tap",
     ]
     assert adb.inputs[1] == ("tap", 1244, 2772)
     assert adb.inputs[2] == ("tap", 700, 2400)
-    assert all((result.scan_directory / name).is_file() for name in (
-        "summary.png", "moves.png", "appraisal.png", "recognition.json"
-    ))
+    assert adb.inputs[-1] == ("tap", 720, 1560)
+    assert ("back",) not in adb.inputs
+    assert all(
+        (result.scan_directory / name).is_file()
+        for name in ("summary.png", "moves.png", "appraisal.png", "recognition.json")
+    )
     actions_path = result.scan_directory / "debug" / "automation" / "actions.json"
     actions = json.loads(actions_path.read_text(encoding="utf-8"))["actions"]
     assert len(actions) == 5
+    exit_action = next(action for action in actions if action["name"] == "exit_appraisal")
+    assert exit_action == {
+        "name": "exit_appraisal",
+        "kind": "tap",
+        "coordinates": {"x": 720, "y": 1560},
+        "executed": True,
+        "before_state": "appraisal_bars",
+    }
     assert not any("scroll_to_menu" in str(action) for action in actions)
     assert not any("傳送" in str(action) for action in actions)
     debug_directory = result.scan_directory / "debug" / "automation"
@@ -362,6 +405,10 @@ def test_live_flow_sends_only_gated_single_scan_actions(tmp_path: Path) -> None:
     assert (debug_directory / "after_open_action_menu_attempt_1.png").is_file()
     assert (debug_directory / "open_action_menu_attempt_1_state.json").is_file()
     assert (debug_directory / "open_action_menu_attempt_1_wait.json").is_file()
+    assert (debug_directory / "before_scroll_to_moves_attempt_1.png").is_file()
+    assert (debug_directory / "scroll_to_moves_attempt_1_poll_01.png").is_file()
+    assert (debug_directory / "scroll_to_moves_attempt_1_states.json").is_file()
+    assert not (debug_directory / "stability_scroll_to_moves.json").exists()
 
 
 def test_menu_open_retries_once_only_after_detail_state_timeout(
@@ -376,7 +423,6 @@ def test_menu_open_retries_once_only_after_detail_state_timeout(
     detector = QueueDetector(
         [
             PageDetection("detail_summary", 0.99),
-            PageDetection("detail_moves", 0.99),
             PageDetection("detail_moves", 0.99),
             PageDetection("detail_moves", 0.99),
             PageDetection("detail_moves", 0.99),
@@ -413,3 +459,84 @@ def test_menu_open_retries_once_only_after_detail_state_timeout(
     assert (debug_directory / "after_open_action_menu_attempt_2.png").is_file()
     assert (debug_directory / "open_action_menu_attempt_2_state.json").is_file()
     assert (debug_directory / "open_action_menu_attempt_2_wait.json").is_file()
+
+
+def test_scroll_to_moves_retries_only_after_summary_timeout(tmp_path: Path) -> None:
+    menu = PageDetection(
+        "action_menu",
+        0.99,
+        matched_texts=("調查寶可夢",),
+        appraisal_target=Point(700, 2400),
+    )
+    detector = QueueDetector(
+        [
+            PageDetection("detail_summary", 0.99),
+            PageDetection("unknown", 0.0),
+            PageDetection("detail_summary", 0.99),
+            PageDetection("detail_moves", 0.99),
+            PageDetection("detail_moves", 0.99),
+            menu,
+            PageDetection("appraisal_bars", 1.0),
+            PageDetection("appraisal_bars", 1.0),
+            PageDetection("appraisal_bars", 1.0),
+            PageDetection("detail_summary", 0.99),
+        ]
+    )
+    adb = FakeAutomationAdb()
+    service = AutoScanService(
+        AppConfig(data_dir=tmp_path),
+        adb,
+        detector,
+        FakeReader(),
+        automation=HuaweiMate30AutomationConfig(moves_wait_timeout_seconds=0.5),
+        clock=Clock(),
+        token_factory=lambda: "moves-retry",
+        stable_waiter=_stable,
+        monotonic=lambda: 0.0,
+        sleeper=lambda _: None,
+    )
+
+    result = service.scan_one(debug=True)
+
+    scrolls = [item for item in adb.inputs if item[0] == "swipe"]
+    assert len(scrolls) == 2
+    debug_directory = result.scan_directory / "debug" / "automation"
+    assert (debug_directory / "before_scroll_to_moves_attempt_2.png").is_file()
+    assert (debug_directory / "scroll_to_moves_attempt_2_states.json").is_file()
+
+
+def test_scroll_to_moves_unknown_timeout_never_blindly_retries(
+    tmp_path: Path,
+) -> None:
+    detector = QueueDetector(
+        [
+            PageDetection("detail_summary", 0.99),
+            PageDetection("unknown", 0.0),
+            PageDetection("unknown", 0.0),
+            PageDetection("unknown", 0.0),
+        ]
+    )
+    adb = FakeAutomationAdb()
+    service = AutoScanService(
+        AppConfig(data_dir=tmp_path),
+        adb,
+        detector,
+        FakeReader(),
+        automation=HuaweiMate30AutomationConfig(moves_wait_timeout_seconds=0.5),
+        clock=Clock(),
+        token_factory=lambda: "moves-unknown",
+        stable_waiter=_stable,
+        monotonic=lambda: 0.0,
+        sleeper=lambda _: None,
+    )
+
+    with pytest.raises(AutomationError, match="No second swipe was sent"):
+        service.scan_one(debug=True)
+
+    assert [item[0] for item in adb.inputs] == ["swipe"]
+    manifest_path = next((tmp_path / "scans").glob("*/*/manifest.json"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["failed_step"] == "scroll_to_moves"
+    debug_directory = manifest_path.parent / "debug" / "automation"
+    assert (debug_directory / "scroll_to_moves_attempt_1_poll_01.png").is_file()
+    assert (debug_directory / "scroll_to_moves_attempt_1_states.json").is_file()

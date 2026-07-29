@@ -293,11 +293,13 @@ pokemon-go-cleanup scan-batch --limit 2 --csv batch-test.csv --debug --delay 2
 The batch command reuses the proven `scan-auto-one` service without changing its
 menu or appraisal flow. After each complete recognized scan it atomically updates
 the CSV, confirms that appraisal exited to `detail_summary`, waits the configured
-delay, and sends the fixed right swipe `(260, 1500)` to `(1180, 1500)` for
-600 ms. It polls every 500 ms for up to 15 seconds and accepts the next page only
-when OCR reports `detail_summary` and either the name or CP differs. A still
-unchanged page permits one final swipe; abnormal states or two unchanged attempts
-stop the batch.
+delay, and sends a left swipe from `(1180, 1500)` to `(260, 1500)` over 600 ms.
+It polls every 500 ms for up to 15 seconds and accepts the next page only when
+`detail_summary` is detected and the name, CP, or static page fingerprint changes.
+If the first swipe leaves the same Pokémon visible, one final stronger left swipe
+from `(1300, 1500)` to `(140, 1500)` over 850 ms is allowed after another summary
+check. No right-swipe fallback exists; abnormal states or two unchanged attempts
+stop the batch safely.
 
 The default limit is 20. `--resume` validates an existing CSV and its referenced
 complete manifests before appending; without `--resume`, an existing destination

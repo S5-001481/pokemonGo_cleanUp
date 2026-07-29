@@ -57,13 +57,16 @@ class HuaweiMate30BatchConfig:
     """Fixed switching gesture and timing for the proven 1440x3120 layout."""
 
     next_pokemon: Swipe = field(
-        default_factory=lambda: Swipe(Point(260, 1500), Point(1180, 1500), 600)
+        default_factory=lambda: Swipe(Point(1180, 1500), Point(260, 1500), 600)
+    )
+    retry_next_pokemon: Swipe = field(
+        default_factory=lambda: Swipe(Point(1300, 1500), Point(140, 1500), 850)
     )
     poll_interval_seconds: float = 0.5
     switch_timeout_seconds: float = 15.0
-    max_switch_attempts: int = 2
-    fingerprint_crop: tuple[int, int, int, int] = (150, 180, 1290, 1650)
+    fingerprint_crop: tuple[int, int, int, int] = (100, 1550, 1340, 2300)
     fingerprint_size: int = 16
+    duplicate_distance_threshold: int = 8
 
 
 HUAWEI_MATE_30_BATCH: Final = HuaweiMate30BatchConfig()
@@ -110,11 +113,12 @@ class BatchCsvRow(BaseModel):
 
 @dataclass(frozen=True, slots=True)
 class SummaryIdentity:
-    """OCR identity and perceptual fingerprint for one detail summary."""
+    """OCR identity and static-region fingerprint for one detail summary."""
 
     pokemon_name: str
     cp: int
     page_fingerprint: str
+    hp_text: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,12 +180,10 @@ class BatchPageDetector(Protocol):
     ) -> PageDetection: ...
 
 
-def page_fingerprint(
+def _static_summary_image(
     png_bytes: bytes,
-    config: HuaweiMate30BatchConfig = HUAWEI_MATE_30_BATCH,
-) -> str:
-    """Return a 256-bit difference hash for the fixed summary display region."""
-
+    config: HuaweiMate30BatchConfig,
+) -> Image.Image:
     try:
         with Image.open(io.BytesIO(png_bytes)) as image:
             if image.size != (1440, 3120):
@@ -189,15 +191,7 @@ def page_fingerprint(
                     f"Batch fingerprint requires 1440x3120; got {image.width}x{image.height}."
                 )
             left, top, right, bottom = config.fingerprint_crop
-            prepared = (
-                image.convert("L")
-                .crop((left, top, right, bottom))
-                .resize(
-                    (config.fingerprint_size + 1, config.fingerprint_size),
-                    Image.Resampling.BILINEAR,
-                )
-            )
-            pixels = cast(list[int], list(prepared.get_flattened_data()))
+            return image.convert("RGB").crop((left, top, right, bottom))
     except BatchAutomationError:
         raise
     except (OSError, ValueError) as error:
@@ -205,6 +199,33 @@ def page_fingerprint(
             f"Could not decode screenshot for batch fingerprint: {error}"
         ) from error
 
+
+def static_summary_crop(
+    png_bytes: bytes,
+    config: HuaweiMate30BatchConfig = HUAWEI_MATE_30_BATCH,
+) -> bytes:
+    """Return the fixed HP-through-details ROI as a PNG for debug evidence."""
+
+    output = io.BytesIO()
+    _static_summary_image(png_bytes, config).save(output, format="PNG")
+    return output.getvalue()
+
+
+def page_fingerprint(
+    png_bytes: bytes,
+    config: HuaweiMate30BatchConfig = HUAWEI_MATE_30_BATCH,
+) -> str:
+    """Return a 256-bit hash for the static HP-through-details summary ROI."""
+
+    prepared = (
+        _static_summary_image(png_bytes, config)
+        .convert("L")
+        .resize(
+            (config.fingerprint_size + 1, config.fingerprint_size),
+            Image.Resampling.BILINEAR,
+        )
+    )
+    pixels = cast(list[int], list(prepared.get_flattened_data()))
     value = 0
     width = config.fingerprint_size + 1
     for y in range(config.fingerprint_size):
@@ -212,6 +233,33 @@ def page_fingerprint(
         for x in range(config.fingerprint_size):
             value = (value << 1) | int(pixels[row_start + x] > pixels[row_start + x + 1])
     return f"{value:064x}"
+
+
+def fingerprint_distance(first: str, second: str) -> int:
+    """Return the Hamming distance between two 256-bit hexadecimal hashes."""
+
+    return (int(first, 16) ^ int(second, 16)).bit_count()
+
+
+def same_static_summary(
+    current: SummaryIdentity,
+    previous: SummaryIdentity,
+    config: HuaweiMate30BatchConfig = HUAWEI_MATE_30_BATCH,
+) -> bool:
+    """Reject only an adjacent repeat supported by static ROI and OCR evidence."""
+
+    if not _same_name_and_cp(current, previous):
+        return False
+    if (
+        current.hp_text is not None
+        and previous.hp_text is not None
+        and current.hp_text != previous.hp_text
+    ):
+        return False
+    return (
+        fingerprint_distance(current.page_fingerprint, previous.page_fingerprint)
+        <= config.duplicate_distance_threshold
+    )
 
 
 def summary_identity(
@@ -237,7 +285,14 @@ def summary_identity(
         raise BatchAutomationError(
             "detail_summary did not provide both a reliable Pokémon name and CP."
         )
-    return SummaryIdentity(name, cp, page_fingerprint(png_bytes, config))
+    hp_value = detection.details.get("hp")
+    hp_text = hp_value if isinstance(hp_value, str) else None
+    return SummaryIdentity(
+        name,
+        cp,
+        page_fingerprint(png_bytes, config),
+        hp_text,
+    )
 
 
 def _recognition_identity(
@@ -256,6 +311,17 @@ def _recognition_identity(
 
 def _same_name_and_cp(first: SummaryIdentity, second: SummaryIdentity) -> bool:
     return first.pokemon_name == second.pokemon_name and first.cp == second.cp
+
+
+def _same_switch_identity(
+    first: SummaryIdentity,
+    second: SummaryIdentity,
+    config: HuaweiMate30BatchConfig,
+) -> bool:
+    return _same_name_and_cp(first, second) and (
+        fingerprint_distance(first.page_fingerprint, second.page_fingerprint)
+        <= config.duplicate_distance_threshold
+    )
 
 
 def _optional_integer(value: str) -> int | None:
@@ -381,6 +447,10 @@ class _BatchDebugRecorder:
                 json.dumps(data, ensure_ascii=False, indent=2) + "\n",
             )
 
+    def text(self, name: str, value: str) -> None:
+        if self.enabled:
+            atomic_write_text(self.directory / name, value.rstrip() + "\n")
+
 
 class BatchScanService:
     """Scan, persist, and safely advance through a bounded number of Pokémon."""
@@ -430,6 +500,12 @@ class BatchScanService:
         device = self._adb.resolve_device(serial_number)
         first_identity = self._identity_from_row(store.rows[0]) if store.rows else None
         new_rows: list[BatchCsvRow] = []
+        if resume and store.rows:
+            self._prepare_resume_position(
+                device.serial_number,
+                store.rows[-1],
+                debug=debug,
+            )
 
         while len(store.rows) < limit:
             scan = self._scanner.scan_one(
@@ -447,15 +523,44 @@ class BatchScanService:
                 raise BatchAutomationError(
                     f"Could not read completed summary screenshot '{summary_path}': {error}"
                 ) from error
-            current_identity = _recognition_identity(
+            summary_detection = self._detector.detect(
+                summary_png,
+                expected=("detail_summary",),
+            )
+            current_identity = summary_identity(
+                summary_detection,
+                summary_png,
+                self._config,
+            )
+            recognition_identity = _recognition_identity(
                 scan.recognition,
                 summary_png,
                 self._config,
             )
+            if recognition_identity is None or not _same_name_and_cp(
+                current_identity, recognition_identity
+            ):
+                raise BatchAutomationError(
+                    "Saved summary OCR does not match the completed recognition result."
+                )
+            if store.rows:
+                recorder = _BatchDebugRecorder(scan.scan_directory, debug)
+                _, same_as_last = self._compare_with_row(
+                    summary_png,
+                    current_identity,
+                    store.rows[-1],
+                    recorder,
+                    prefix="append_guard",
+                )
+                if same_as_last:
+                    raise BatchAutomationError(
+                        "The completed summary is an adjacent duplicate of the last "
+                        "CSV row. The new row was not appended."
+                    )
             row = self._row(
                 len(store.rows) + 1,
                 scan,
-                page_fingerprint(summary_png, self._config),
+                current_identity.page_fingerprint,
             )
             if store.append(row):
                 new_rows.append(row)
@@ -480,10 +585,6 @@ class BatchScanService:
                     new_rows=tuple(new_rows),
                     stop_reason="limit_reached",
                 )
-            if current_identity is None:
-                raise BatchAutomationError(
-                    "The completed scan has no reliable name/CP, so switching would be unsafe."
-                )
             if first_identity is None:
                 first_identity = current_identity
 
@@ -495,7 +596,7 @@ class BatchScanService:
                 scan.scan_directory,
                 debug=debug,
             )
-            if _same_name_and_cp(next_identity, first_identity):
+            if _same_switch_identity(next_identity, first_identity, self._config):
                 return BatchScanResult(
                     csv_path=store.path,
                     rows=tuple(store.rows),
@@ -504,6 +605,148 @@ class BatchScanService:
                 )
 
         raise AssertionError("Batch loop terminated without a stop reason.")
+
+    def _prepare_resume_position(
+        self,
+        serial: str,
+        last_row: BatchCsvRow,
+        *,
+        debug: bool,
+    ) -> None:
+        recorder = _BatchDebugRecorder(last_row.scan_directory, debug)
+        current_png = self._adb.capture_screen(serial)
+        recorder.screen("resume_current", current_png)
+        current_detection = self._detector.detect(
+            current_png,
+            expected=("detail_summary",),
+        )
+        if current_detection.state != "detail_summary":
+            recorder.json(
+                "resume_state.json",
+                {
+                    "state": current_detection.to_json_data(),
+                    "same_as_last": None,
+                    "resume_pre_switch_executed": False,
+                },
+            )
+            raise BatchAutomationError(
+                "Resume requires the current phone page to be detail_summary; "
+                f"detected {current_detection.state}. No swipe was sent."
+            )
+        current_identity = summary_identity(
+            current_detection,
+            current_png,
+            self._config,
+        )
+        previous_identity, same_as_last = self._compare_with_row(
+            current_png,
+            current_identity,
+            last_row,
+            recorder,
+            prefix="resume",
+        )
+        state_data = self._comparison_data(
+            current_identity,
+            previous_identity,
+            same_as_last,
+        )
+        state_data["resume_pre_switch_executed"] = same_as_last
+        recorder.json("resume_state.json", state_data)
+        if same_as_last:
+            next_identity = self._switch_to_next(
+                serial,
+                previous_identity,
+                last_row.scan_directory,
+                debug=debug,
+            )
+            state_data["next_identity"] = asdict(next_identity)
+            recorder.json("resume_state.json", state_data)
+
+    def _compare_with_row(
+        self,
+        current_png: bytes,
+        current_identity: SummaryIdentity,
+        previous_row: BatchCsvRow,
+        recorder: _BatchDebugRecorder,
+        *,
+        prefix: str,
+    ) -> tuple[SummaryIdentity, bool]:
+        previous_path = previous_row.scan_directory / "summary.png"
+        try:
+            previous_png = previous_path.read_bytes()
+        except OSError as error:
+            raise BatchAutomationError(
+                f"Could not read previous summary screenshot '{previous_path}': {error}"
+            ) from error
+        previous_detection = self._detector.detect(
+            previous_png,
+            expected=("detail_summary",),
+        )
+        previous_identity = summary_identity(
+            previous_detection,
+            previous_png,
+            self._config,
+        )
+        row_identity = self._identity_from_row(previous_row)
+        if row_identity is None or not _same_name_and_cp(previous_identity, row_identity):
+            raise BatchAutomationError(
+                "The last CSV row does not match its referenced summary.png."
+            )
+        same_as_last = same_static_summary(
+            current_identity,
+            previous_identity,
+            self._config,
+        )
+        recorder.text(
+            f"{prefix}_last_summary_path.txt",
+            str(previous_path.resolve()),
+        )
+        recorder.screen(
+            f"{prefix}_current_static_roi",
+            static_summary_crop(current_png, self._config),
+        )
+        recorder.screen(
+            f"{prefix}_last_static_roi",
+            static_summary_crop(previous_png, self._config),
+        )
+        if prefix != "resume":
+            recorder.screen(f"{prefix}_current", current_png)
+        recorder.json(
+            f"{prefix}_state.json",
+            self._comparison_data(
+                current_identity,
+                previous_identity,
+                same_as_last,
+            ),
+        )
+        return previous_identity, same_as_last
+
+    def _comparison_data(
+        self,
+        current: SummaryIdentity,
+        previous: SummaryIdentity,
+        same_as_last: bool,
+    ) -> dict[str, object]:
+        return {
+            "static_roi": list(self._config.fingerprint_crop),
+            "current_fingerprint": current.page_fingerprint,
+            "last_fingerprint": previous.page_fingerprint,
+            "fingerprint_distance": fingerprint_distance(
+                current.page_fingerprint, previous.page_fingerprint
+            ),
+            "duplicate_distance_threshold": self._config.duplicate_distance_threshold,
+            "current_ocr": {
+                "pokemon_name": current.pokemon_name,
+                "cp": current.cp,
+                "hp": current.hp_text,
+            },
+            "last_ocr": {
+                "pokemon_name": previous.pokemon_name,
+                "cp": previous.cp,
+                "hp": previous.hp_text,
+            },
+            "same_as_last": same_as_last,
+        }
 
     def _switch_to_next(
         self,
@@ -522,13 +765,16 @@ class BatchScanService:
         )
         recorder.json("before_switch_state.json", before_detection.to_json_data())
         current = summary_identity(before_detection, before, self._config)
-        if not _same_name_and_cp(current, previous):
+        if not _same_switch_identity(current, previous, self._config):
             raise BatchAutomationError(
                 "The detail page changed after the one-Pokémon scan; no swipe was sent."
             )
 
-        for attempt in range(1, self._config.max_switch_attempts + 1):
-            gesture = self._config.next_pokemon
+        gestures = (
+            self._config.next_pokemon,
+            self._config.retry_next_pokemon,
+        )
+        for attempt, gesture in enumerate(gestures, start=1):
             recorder.json(
                 f"switch_attempt_{attempt}_action.json",
                 {
@@ -571,7 +817,7 @@ class BatchScanService:
                     "Unexpected page state while switching Pokémon: "
                     f"{result.detection.state}. Batch stopped."
                 )
-            if attempt < self._config.max_switch_attempts:
+            if attempt < len(gestures):
                 confirmation = self._adb.capture_screen(serial)
                 recorder.screen(
                     f"before_switch_attempt_{attempt + 1}",
@@ -586,12 +832,13 @@ class BatchScanService:
                     confirmation,
                     self._config,
                 )
-                if not _same_name_and_cp(current, previous):
+                if not _same_switch_identity(current, previous, self._config):
                     return current
 
         raise BatchAutomationError(
-            "Two horizontal swipes did not reach a different name/CP within "
-            "15 seconds each. Batch stopped to avoid rescanning the same Pokémon."
+            "Two left swipes did not reach a different Pokémon within 15 seconds "
+            "each. The list may be at its end or the gesture did not take effect. "
+            "Batch stopped safely."
         )
 
     def _wait_for_next_summary(
@@ -655,7 +902,11 @@ class BatchScanService:
             last_screen = screenshot
             last_detection = detection
             last_identity = identity
-            if identity is not None and not _same_name_and_cp(identity, previous):
+            if identity is not None and not _same_switch_identity(
+                identity,
+                previous,
+                self._config,
+            ):
                 return _SwitchWaitResult(
                     screenshot,
                     detection,

@@ -70,6 +70,7 @@ _MOVE_LABELS: Final = (
     "LOCKED",
     "等級",
 )
+_CP_CANDIDATE_PATTERN: Final = re.compile(r"CP\s*(\d{1,5})", re.IGNORECASE)
 
 
 class RecognizedText(BaseModel):
@@ -154,6 +155,16 @@ def parse_cp_raw(raw: str) -> int | None:
     return int(digits) if digits else None
 
 
+def normalize_cp_candidate(raw: str) -> str | None:
+    """Return a canonical CP value only when OCR retained the CP prefix."""
+
+    normalized = normalize_ocr_text(raw)
+    match = _CP_CANDIDATE_PATTERN.fullmatch(normalized)
+    if match is None:
+        return None
+    return f"CP{int(match.group(1))}"
+
+
 def quantize_iv_endpoint(endpoint: int) -> int:
     """Map an orange/red endpoint to the nearest integer IV."""
 
@@ -216,7 +227,7 @@ class RecognitionService:
             self._best_text(name_candidates),
             warnings,
         )
-        cp_candidates, cp_debug = self._ocr_variants(summary, CP_RECT)
+        cp_candidates, cp_debug = self._ocr_cp_variants(summary)
         cp = self._cp(self._best_cp(cp_candidates), warnings)
 
         move_candidates, move_debug, move_fallback = self._moves(moves, warnings)
@@ -326,6 +337,51 @@ class RecognitionService:
             candidates.extend(self._run_ocr(prepared, rectangle, scale))
             if scale == 3.0:
                 debug_image = prepared
+        return tuple(candidates), debug_image
+
+    def _ocr_cp_variants(self, image: Any) -> tuple[tuple[OcrCandidate, ...], Any]:
+        """Run the existing CP OCR plus threshold variants for bright backgrounds."""
+
+        existing, debug_image = self._ocr_variants(image, CP_RECT)
+        crop = self._crop(image, CP_RECT)
+        gray = self._cv2.cvtColor(crop, self._cv2.COLOR_BGR2GRAY)
+        clahe = self._cv2.createCLAHE(
+            clipLimit=2.0,
+            tileGridSize=(8, 8),
+        ).apply(gray)
+        _, otsu = self._cv2.threshold(
+            gray,
+            0,
+            255,
+            self._cv2.THRESH_BINARY + self._cv2.THRESH_OTSU,
+        )
+        adaptive = self._cv2.adaptiveThreshold(
+            gray,
+            255,
+            self._cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            self._cv2.THRESH_BINARY,
+            31,
+            11,
+        )
+        variants = (
+            gray,
+            clahe,
+            otsu,
+            self._cv2.bitwise_not(otsu),
+            adaptive,
+            self._cv2.bitwise_not(adaptive),
+        )
+        candidates = list(existing)
+        for source in variants:
+            scale = 4.0
+            prepared = self._cv2.resize(
+                source,
+                None,
+                fx=scale,
+                fy=scale,
+                interpolation=self._cv2.INTER_CUBIC,
+            )
+            candidates.extend(self._run_ocr(prepared, CP_RECT, scale))
         return tuple(candidates), debug_image
 
     def _run_ocr(
@@ -516,15 +572,10 @@ class RecognitionService:
 
     @staticmethod
     def _best_cp(candidates: Sequence[OcrCandidate]) -> OcrCandidate | None:
-        usable = [item for item in candidates if parse_cp_raw(item.raw) is not None]
-        return max(
-            usable,
-            key=lambda item: (
-                "CP" in normalize_ocr_text(item.raw).upper(),
-                item.confidence,
-            ),
-            default=None,
-        )
+        usable = [
+            item for item in candidates if normalize_cp_candidate(item.raw) is not None
+        ]
+        return max(usable, key=lambda item: item.confidence, default=None)
 
     @staticmethod
     def _text(
@@ -554,12 +605,18 @@ class RecognitionService:
         if candidate is None:
             warnings.append("cp OCR returned no value.")
             return RecognizedInteger(value=None, raw=None, confidence=None)
-        if "CP" not in normalize_ocr_text(candidate.raw).upper():
-            warnings.append("cp used the calibrated glyph fallback because OCR lost 'CP'.")
+        normalized = normalize_cp_candidate(candidate.raw)
+        if normalized is None:
+            warnings.append("cp OCR returned no value with a reliable CP prefix.")
+            return RecognizedInteger(
+                value=None,
+                raw=candidate.raw,
+                confidence=candidate.confidence,
+            )
         if candidate.confidence < LOW_CONFIDENCE:
             warnings.append(f"cp OCR confidence is low ({candidate.confidence:.3f}).")
         return RecognizedInteger(
-            value=parse_cp_raw(candidate.raw),
+            value=int(normalized[2:]),
             raw=candidate.raw,
             confidence=candidate.confidence,
         )

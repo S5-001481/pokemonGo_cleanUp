@@ -22,8 +22,8 @@ but does not make separate PNG and JSON writes one transaction.
 ## Batch scan
 
 A bounded sequence that reuses the complete one-Pokémon automatic service, writes
-each recognition row atomically, and advances only after a fixed horizontal swipe
-produces a different OCR name or CP. See the [batch walkthrough](walkthroughs/batch-scan.md).
+each recognition row atomically, and advances only after a fixed left swipe produces
+a different name, CP, or static page fingerprint. See the [batch walkthrough](walkthroughs/batch-scan.md).
 
 ## Ground truth
 
