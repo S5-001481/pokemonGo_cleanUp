@@ -1,9 +1,10 @@
 # pokemonGo_cleanUp
 
-````md
+md
 [English](README.md) | 简体中文
 
-目标：用ADB截取安卓设备上的Pokémon GO每只宝可梦的详情页面与IV条，帮助整理现有宝可梦的CP，HP，技能，IV等。
+##目标：
+用ADB截取安卓设备上的Pokémon GO每只宝可梦的详情页面与IV条，帮助整理现有宝可梦的CP，HP，技能，IV等。
 
 ## 快速开始
 
@@ -17,6 +18,7 @@ cd pokemonGo_cleanUp
 bash scripts/setup-wsl.sh
 ```
 
+
 安装成功后，终端会显示：
 
 ```text
@@ -24,15 +26,15 @@ bash scripts/setup-wsl.sh
 
 Windows 桌面已经创建：
 Pokémon GO Cleanup.bat
-
-以后双击这个图标即可启动。
 ```
-
-此后可以直接双击 Windows 桌面上的 `Pokémon GO Cleanup.bat` 启动图形界面。
+此后直接双击 Windows 桌面上的 `Pokémon GO Cleanup.bat` 启动图形界面。
 
 ## 界面示例
-<img width="1378" height="1142" alt="image" src="https://github.com/user-attachments/assets/44c9fb24-6dec-4de5-a618-96fb26fbc148" />
-
+<img
+  src="示例图片.png"
+  width="900"
+  alt="Pokémon GO Cleanup 图形界面示例"
+/>
 
 
 
