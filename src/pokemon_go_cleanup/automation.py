@@ -482,7 +482,7 @@ class HuaweiMate30PageDetector:
                 if keyword in keyword_hits
             }
 
-            # 正常详情页可能只有 HP；
+            # 正常详情页可能只有 HP。
             # 招式页的“新攻擊招式”可能只有 攻擊。
             # 单独一个普通关键词不能证明是评价对话。
             dialogue_confirmed = (
@@ -1424,13 +1424,13 @@ class AutoScanService:
                 )
 
             if detection.state == "action_menu":
-                # 调查宝可梦菜单仍然存在，不发送额外点击。
+                # 调查宝可梦菜单仍然存在。不发送额外点击。
                 unknown_after_menu_count = 0
                 continue
 
             if detection.state == "unknown":
-                # 菜单已经消失，但严格 OCR 可能读不到评价对话。
-                # 连续四帧、约两秒后，只在这个特定阶段推断为评价对话。
+                # 菜单已经消失。严格 OCR 可能读不到评价对话。
+                # 连续四帧、约两秒后再处理。只在这个特定阶段推断为评价对话。
                 unknown_after_menu_count += 1
 
                 if unknown_after_menu_count >= 4:
