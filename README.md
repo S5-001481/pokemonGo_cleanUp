@@ -1,525 +1,382 @@
 # pokemonGo_cleanUp
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+English | [简体中文](README.zh-CN.md)
 
-`pokemonGo_cleanUp` is a local-first Windows CLI that captures the current screen
-of an Android or HarmonyOS device through ADB. Each PNG is stored locally with a
-UTF-8 JSON sidecar containing the device serial number, resolution, capture time,
-file path, file size, and SHA-256 digest.
-A guided scan can also group summary, moves, and appraisal screenshots from the
-same device under one scan ID and one progressive manifest.
-Dataset commands decode and validate those local artifacts, while manual
-annotation writes typed ground truth without OCR.
+## Goal
 
-The Python package is `pokemon_go_cleanup`; the installed command is
-`pokemon-go-cleanup`.
+Capture the detail page and IV bars for each Pokémon in Pokémon GO on an Android device via ADB, helping you organize information such as CP, HP, moves, and IVs for your existing Pokémon.
 
-## Scope and privacy
+## Quick Start
 
-This initial release:
+This project is currently recommended for use in a WSL Ubuntu environment on Windows.
 
-- detects ADB and lists attached device states;
-- supports a Huawei Mate 30 running an ADB-compatible HarmonyOS version;
-- reads the current device resolution;
-- captures only the current display via `adb exec-out screencap -p`;
-- keeps `scan-one --guided` fully manual with no device input;
-- reads the fixed 1440x3120 Traditional Chinese layout with local OCR and IV bar
-  geometry;
-- offers one safety-gated `scan-auto-one` flow for that exact layout;
-- recursively validates scan screenshots and typed manifests;
-- records user-entered ground truth in local UTF-8 JSON;
-- stores screenshots and metadata on the local computer.
+Open an Ubuntu terminal and run the following commands in order:
 
-It does **not** switch to another Pokémon, batch scan, transfer, power up,
-evolve, rename, unlock moves, or battle. It never accesses Pokémon GO accounts,
-private APIs, network traffic, or credentials. Automatic input is limited to the
-documented single-scan state machine; a state mismatch stops before the next
-input. Captured screens and annotations may contain personal information. The
-entire `data/` tree and generated recognition/debug files are excluded from Git.
-Review every local artifact before sharing it.
+```bash
+git clone https://github.com/S5-001481/pokemonGo_cleanUp.git
+cd pokemonGo_cleanUp
+bash scripts/setup-wsl.sh
+```
 
-This repository contains no Pokémon artwork, icons, or screenshots. Pokémon is a
-trademark of its respective owners; this independent project is not affiliated
-with or endorsed by them.
+After a successful installation, the terminal will display:
 
-## Requirements
+```text
+Installation complete.
 
-- Windows 10 or 11
-- Python 3.12 or newer
-- Android SDK Platform-Tools (`adb`)
-- A data-capable USB cable
-- USB debugging enabled on the phone
+Created on the Windows desktop:
+Pokémon GO Cleanup.bat
+```
 
-## Windows installation
+After that, double-click `Pokémon GO Cleanup.bat` on the Windows desktop to launch the graphical interface.
 
-The following commands are for **Windows PowerShell**.
+## Interface Example
 
-1. Install Python 3.12 or newer from
-   [python.org](https://www.python.org/downloads/windows/). During installation,
-   enable the option that makes Python available from the command line.
-2. Download or clone this repository, then open PowerShell in its root directory.
-3. Create an isolated environment and install the project:
+<img
+  src="示例图片.png"
+  width="900"
+  alt="Pokémon GO Cleanup graphical interface example"
+/>
+
+> [!IMPORTANT]
+> OCR and automatic scanning are not general-purpose features. They have currently been calibrated only for the following environment:
+> **Huawei Mate 30, 1440 × 3120 resolution, Traditional Chinese Pokémon GO interface,
+> WSL Ubuntu, Python 3.12, and a Windows `adb.exe` that can be called from WSL**.
+
+## Compatibility
+
+| Feature | Currently Supported Environment |
+| --- | --- |
+| Device inspection and screenshots | Windows 10/11, Python 3.12+, and an ADB-compatible Android or HarmonyOS device |
+| Guided manual scanning | Same as above |
+| OCR and IV recognition | Huawei Mate 30, 1440 × 3120, Traditional Chinese interface, WSL Ubuntu, Python 3.12 |
+| Automatic single and batch scanning | Same as above, with Windows `adb.exe` callable from WSL |
+
+Required hardware and software:
+
+- Python 3.12 or later;
+- Android SDK Platform-Tools (including `adb`);
+- a USB cable that supports data transfer;
+- USB debugging enabled on the phone.
+
+## Quick Start in WSL Ubuntu
+
+The following commands assume that the repository is located at
+`/home/zhang/projects/pokemonGo_cleanUp`.
+
+```bash
+cd /home/zhang/projects/pokemonGo_cleanUp
+
+python3 -m venv .venv
+source .venv/bin/activate
+
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev,ocr]"
+
+pokemon-go-cleanup --help
+```
+
+If Windows Platform-Tools cannot be found in the WSL `PATH`, pass the WSL path to
+`adb.exe` before the subcommand:
+
+```bash
+pokemon-go-cleanup \
+  --adb-path /mnt/c/Android/platform-tools/adb.exe \
+  device list
+```
+
+Recognition and automatic scanning commands use the same global option:
+
+```bash
+pokemon-go-cleanup \
+  --adb-path /mnt/c/Android/platform-tools/adb.exe \
+  scan-auto-one --dry-run --debug
+```
+
+## Installation in Windows PowerShell
+
+Install Python 3.12 or later, then run the following commands from the repository root:
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
+
 python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
+
 pokemon-go-cleanup --help
 ```
 
-If PowerShell blocks activation scripts, you can run the environment's executables
-directly without changing policy:
+If PowerShell blocks the virtual-environment activation script, you can call the programs inside the virtual environment directly:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 .\.venv\Scripts\pokemon-go-cleanup.exe --help
 ```
 
-## Install Android Platform-Tools on Windows
-
-1. Download the current **SDK Platform-Tools for Windows** from the
-   [official Android developer page](https://developer.android.com/tools/releases/platform-tools).
-2. Extract the archive to a stable local folder such as
-   `C:\Tools\platform-tools`.
-3. Add that folder to your user `Path`, then close and reopen PowerShell.
-4. Verify the installation:
+Download the latest stable **SDK Platform-Tools for Windows** from the
+[official Android developer page](https://developer.android.com/tools/releases/platform-tools),
+extract it to a fixed directory such as `C:\Android\platform-tools`, and then verify the installation:
 
 ```powershell
 adb version
 adb devices
 ```
 
-You can avoid changing `Path` by passing the executable explicitly:
+You can also specify the executable explicitly:
 
 ```powershell
-pokemon-go-cleanup --adb-path "C:\Tools\platform-tools\adb.exe" device list
+pokemon-go-cleanup `
+  --adb-path "C:\Android\platform-tools\adb.exe" `
+  device list
 ```
 
-Use the latest stable Platform-Tools: Google documents that current ADB versions
-are backward compatible with older Android devices.
+## Prepare the Phone
 
-## Prepare a Huawei Mate 30 / HarmonyOS device
-
-Menu wording can vary by HarmonyOS or EMUI version. Huawei's documented route is:
+Menu names may vary slightly between devices and system versions. A common path on Huawei devices is:
 
 1. Open **Settings > About phone**.
-2. Tap **Build number** repeatedly until developer mode is enabled. Enter the
-   lock-screen PIN if requested.
+2. Tap **Build number** repeatedly until developer mode is enabled.
 3. Open **Settings > System & updates > Developer options**.
 4. Enable **USB debugging**.
-5. Connect the unlocked phone with a data-capable USB cable. If prompted for a USB
-   mode, choose **File transfer** rather than charge-only mode.
-6. In Windows PowerShell, run:
+5. Connect the unlocked phone with a USB cable that supports data transfer and choose
+   **File transfer** when prompted.
+6. Run `adb devices`.
+7. Verify the RSA fingerprint on the phone and authorize the trusted computer.
+8. Run `adb devices` again. The device status should be `device`.
 
-```powershell
-adb devices
-```
+If the status is `unauthorized`, unlock the phone, revoke the old USB debugging authorizations, reconnect it, and accept the new authorization prompt.
 
-7. On the phone, review the computer's RSA fingerprint, enable the remember option
-   only if this is your own trusted computer, and tap **Allow**.
-8. Run `adb devices` again. The state should be `device`, not `unauthorized`.
+## Command Overview
 
-Huawei also documents the developer-mode and USB-debugging route in its
-[official device development guide](https://developer.huawei.com/consumer/en/codelab/theme/index.html).
-If the menu is missing, use Settings search for “USB debugging” and check the
-device's region-specific Huawei support documentation.
+### Inspect Devices
 
-To revoke an old computer authorization, use **Revoke USB debugging
-authorizations** in Developer options, reconnect the cable, and accept the new
-fingerprint prompt.
-
-## Commands
-
-List every device, including `unauthorized` and `offline` states:
-
-```powershell
+```bash
 pokemon-go-cleanup device list
-```
-
-Show identity fields and current resolution for the only ready device:
-
-```powershell
 pokemon-go-cleanup device info
-```
-
-Capture the current screen:
-
-```powershell
-pokemon-go-cleanup capture
-```
-
-Run a guided three-screenshot scan for one Pokémon. The command waits for Enter
-before each capture:
-
-```powershell
-pokemon-go-cleanup scan-one --guided
-```
-
-It asks for the top detail page (`summary.png`), all visible moves (`moves.png`),
-and the appraisal view with Attack, Defense, and HP IV bars (`appraisal.png`).
-The program does not scroll, tap, or open appraisal for you.
-
-The command-specific options can be combined:
-
-```powershell
-pokemon-go-cleanup scan-one --guided --serial ABC123 --notes "Community Day" --output "D:\Local Captures\宝可梦整理"
-```
-
-`--output` is the data-directory base for this scan; files go below `OUTPUT/scans/`.
-
-When multiple devices are ready, select one by its ADB serial:
-
-```powershell
 pokemon-go-cleanup device info --serial ABC123
+```
+
+`device list` displays available, unauthorized, and offline devices. If multiple available devices are connected, use `--serial` to select the target device.
+
+### Capture One Screen
+
+```bash
+pokemon-go-cleanup capture
 pokemon-go-cleanup capture --serial ABC123
 ```
 
-Choose another local data directory (global options go before the command):
+Each capture produces a PNG and a UTF-8 JSON sidecar containing the capture time, device serial number, resolution, file path, file size, and SHA-256 digest.
 
-```powershell
-pokemon-go-cleanup --data-dir "D:\Local Captures\宝可梦整理" capture
+To use a different local data directory, place the global option before the subcommand:
+
+```bash
+pokemon-go-cleanup --data-dir "/path/to/local-data" capture
 ```
 
-Enable informational structured JSON logs:
+### Perform a Guided Three-Page Scan
 
-```powershell
-pokemon-go-cleanup --log-level INFO --log-format json capture
+```bash
+pokemon-go-cleanup scan-one --guided
 ```
 
-Configuration may also be supplied with environment variables:
+Before each screenshot, the command waits for the user to press Enter. Manually prepare the following pages:
 
-- `POKEMON_GO_CLEANUP_DATA_DIR`
-- `POKEMON_GO_CLEANUP_ADB_PATH`
-- `POKEMON_GO_CLEANUP_ADB_TIMEOUT_SECONDS`
+1. `summary.png`: the top of the Pokémon detail page;
+2. `moves.png`: the detail page with all moves visible;
+3. `appraisal.png`: the appraisal page with the Attack, Defense, and HP bars visible.
 
-## Read the calibrated Huawei scans (OCR MVP)
+Manual mode does not send tap, swipe, or BACK input.
 
-This iteration intentionally supports only the existing Huawei Mate 30 scans:
-1440x3120 pixels, Traditional Chinese Pokémon GO, WSL Ubuntu, and Python 3.12.
-Install the local OCR extras inside the project virtual environment:
+Optional arguments:
+
+```bash
+pokemon-go-cleanup scan-one --guided \
+  --serial ABC123 \
+  --notes "Community Day" \
+  --output "/path/to/local-data"
+```
+
+`--output` specifies the data-directory base for this scan. The final files are stored under
+`OUTPUT/scans/`.
+
+### Read a Calibrated Scan
+
+First install the optional OCR dependencies:
 
 ```bash
 python -m pip install -e ".[ocr]"
 ```
 
-Read one scan and save `recognition.json`:
+Then read a complete three-page scan:
 
 ```bash
-pokemon-go-cleanup read-scan "data/scans/2026-07-28/<scan_id>"
-pokemon-go-cleanup read-scan "data/scans/2026-07-28/<scan_id>" --debug
+pokemon-go-cleanup read-scan "data/scans/YYYY-MM-DD/<scan_id>"
+pokemon-go-cleanup read-scan "data/scans/YYYY-MM-DD/<scan_id>" --debug
 ```
 
-`--debug` saves the five OCR crops plus raw and annotated appraisal bars below
-the scan's ignored `debug/` directory. Read every complete local scan and write
-the requested CSV columns:
+RapidOCR is used for the name, CP, and moves. IVs are determined through OpenCV color and bar-geometry analysis rather than OCR. Unrecognized or low-confidence values are retained with a warning.
+
+`--debug` saves OCR crops and IV-detection overlays in the Git-ignored
+`debug/` directory under the scan directory.
+
+### Generate a CSV from Complete Scans
 
 ```bash
 pokemon-go-cleanup read-dataset --csv inventory.csv
 ```
 
-The reader uses RapidOCR only for name, CP, and moves. IV values come from
-OpenCV color and bar geometry; OCR is not used for IV estimation. Missing or
-low-confidence values are retained with warnings. No `ground_truth.json` is
-required.
+The command recursively finds complete scans under the current `data/scans/` root, writes one row for each scan, and saves the corresponding `recognition.json`.
 
-## Automatically scan one fixed Huawei Mate 30 page
+### Automatically Scan One Pokémon
 
-This command is intentionally limited to Huawei Mate 30, 1440x3120, the current
-Traditional Chinese UI, WSL Ubuntu, Python 3.12, and Windows `adb.exe` callable
-from WSL. Manually open one Pokémon's detail page at the top first.
+First, manually open the top of a Pokémon detail page that matches the calibrated environment.
 
-Start with the non-mutating check:
+Always begin with a dry run that sends no device input:
 
 ```bash
 pokemon-go-cleanup scan-auto-one --dry-run --debug
 ```
 
-Dry-run captures and validates the current summary page, prints every planned
-coordinate, writes an incomplete local scan for inspection, and never calls ADB
-tap, swipe, or BACK. Review `debug/automation/plan.json`, the initial PNG, and
-the state JSON before allowing live input.
+The dry run captures and identifies the current page, prints the planned operations, and creates an incomplete scan for inspection. It does not send tap, swipe, or BACK input.
 
-Run exactly one live scan only after that review:
+Before allowing live input, inspect:
+
+```text
+data/scans/YYYY-MM-DD/<scan_id>/
+├── manifest.json
+└── debug/
+    └── automation/
+        └── plan.json
+```
+
+After confirming that the dry run matches the actual page, run:
 
 ```bash
 pokemon-go-cleanup scan-auto-one --debug
 ```
 
-When Windows Platform-Tools is not on the WSL PATH, pass the WSL view of
-`adb.exe` as a global option before the command:
+The live state machine checks the page before every input. On success, it saves all three screenshots, safely exits the appraisal screen, generates `recognition.json`, and marks the manifest as complete. If it encounters an unexpected page, timeout, failure, or Ctrl+C, it stops, preserves the existing evidence, and marks the manifest as incomplete.
+
+### Scan a Limited Number of Consecutive Pokémon
+
+First, open the top of the detail page for the first Pokémon. When using the feature for the first time, perform a small physical-device calibration:
 
 ```bash
-pokemon-go-cleanup --adb-path /mnt/c/Android/platform-tools/adb.exe scan-auto-one --dry-run --debug
+pokemon-go-cleanup scan-batch \
+  --limit 2 \
+  --csv batch-test.csv \
+  --debug \
+  --delay 2
 ```
 
-The live state machine checks the expected page before every input and stops on
-any mismatch. After `moves.png`, it accepts either `detail_moves` or
-`detail_summary` and taps the always-visible menu button at `(1244, 2772)` without
-scrolling back. It polls every 500 ms for up to 10 seconds until OCR reliably
-classifies `action_menu`, then retries the same menu coordinate at most once if
-the screen remains a detail state. It clicks the appraisal row only at the
-high-confidence OCR box for `調查寶可夢`; there is no fallback coordinate for
-that row, and targets near `傳送` are rejected. The appraisal screenshot is
-accepted only after the existing three-IV-bar detector succeeds.
+After each scan, the command safely exits the appraisal screen, atomically updates the CSV, confirms that it has returned to the detail page, and then swipes left to the next Pokémon. It proceeds only when both the page state and the local fingerprint indicate that the Pokémon has changed.
 
-With `--debug`, operation screenshots, detections, target-state wait timing,
-stability differences, and actual coordinates are saved under:
-
-```text
-data/scans/YYYY-MM-DD/<scan_id>/debug/automation/
-```
-
-On success, the command safely exits appraisal, runs the existing reader, writes
-`recognition.json`, and prints name, CP, moves, and IV. On failure, existing
-screenshots remain and `manifest.json` is marked `incomplete` with the failed
-step. Ctrl+C exits with code 130 after the same recovery attempt.
-
-The fixed coordinate sequence has focused tests and the summary/moves/IV state
-detectors were checked against existing local scans. A 2026-07-29 physical run
-completed the full automatic workflow: all three screenshots, OCR menu targeting,
-appraisal dialogue, IV detection, safe exit, recognition, and a complete manifest.
-Run dry-run first before each live input session.
-
-## Batch scan the fixed Huawei Mate 30 inventory
-
-Manually open the first Pokémon detail page at the top, then run a small physical
-calibration before raising the limit:
+The default limit is 20. An existing CSV is never silently overwritten; it is continued only when `--resume` is explicitly supplied:
 
 ```bash
-pokemon-go-cleanup scan-batch --limit 2 --csv batch-test.csv --debug --delay 2
+pokemon-go-cleanup scan-batch \
+  --limit 20 \
+  --csv inventory.csv \
+  --resume \
+  --debug
 ```
 
-The batch command reuses the proven `scan-auto-one` service without changing its
-menu or appraisal flow. After each complete recognized scan it atomically updates
-the CSV, confirms that appraisal exited to `detail_summary`, waits the configured
-delay, and sends a left swipe from `(1180, 1500)` to `(260, 1500)` over 600 ms.
-It polls every 500 ms for up to 15 seconds and accepts the next page only when
-`detail_summary` is detected and the name, CP, or static page fingerprint changes.
-If the first swipe leaves the same Pokémon visible, one final stronger left swipe
-from `(1300, 1500)` to `(140, 1500)` over 850 ms is allowed after another summary
-check. No right-swipe fallback exists; abnormal states or two unchanged attempts
-stop the batch safely.
+If Ctrl+C is pressed or a later scan fails, all previously completed CSV rows and scan files are preserved.
 
-The default limit is 20. `--resume` validates an existing CSV and its referenced
-complete manifests before appending; without `--resume`, an existing destination
-is never overwritten. Every row includes the recognition fields, absolute scan
-directory, and a local page fingerprint. Ctrl+C or a failed single scan preserves
-all previously written rows. `--debug` keeps both each single-scan trace and the
-switch evidence below that scan's ignored `debug/` directory.
+### Validate Local Data
 
-Batch scanning still performs no transfer, power-up, evolution, rename, move
-unlock, battle, account, or network action. It stops at the limit or when it
-safely detects a return to the first name/CP.
-
-## Validate and annotate local scans
-
-Validate every recursively discovered scan below the default `data/scans/` root:
-
-```powershell
-pokemon-go-cleanup dataset validate
+```bash
 pokemon-go-cleanup dataset status
+pokemon-go-cleanup dataset validate
 ```
 
-`validate` fully decodes all three PNGs, checks equal dimensions, and validates
-`manifest.json` and any existing `ground_truth.json` with Pydantic. It exits
-non-zero when at least one scan is invalid. `status` displays scan ID, capture
-date, screenshot completeness, manifest validity, annotation presence, and
-overall status without failing merely because a scan is invalid.
+Use `--output` when the scan root is not in the default location:
 
-Use `--output` when the dataset root is elsewhere. This option points directly
-to the directory that contains dated scan folders, not to the scan-one data base:
-
-```powershell
-pokemon-go-cleanup dataset validate --output "D:\Local Captures\宝可梦整理\scans"
+```bash
+pokemon-go-cleanup dataset validate \
+  --output "/path/to/local-data/scans"
 ```
 
-Results use these states:
+Scan statuses:
 
-- `complete`: all required files exist, all PNGs decode with identical
-  dimensions, the manifest is valid and marked `complete`, and any annotation is
-  valid;
-- `incomplete`: a required file is missing or the manifest is not marked
-  `complete`;
-- `invalid`: JSON validation, PNG decoding, dimensions, or an existing
-  annotation fails validation.
+- `complete`: all required files are present and valid;
+- `incomplete`: required files are missing, or the manifest has not yet been marked complete;
+- `invalid`: PNG decoding, image dimensions, JSON, manifest, or annotation validation failed.
 
-Create a manual annotation for one scan directory:
+`dataset validate` returns a non-zero exit code if at least one invalid scan exists.
 
-```powershell
-pokemon-go-cleanup annotate "data\scans\2026-07-28\<scan_id>"
+### Add Manual Ground Truth
+
+```bash
+pokemon-go-cleanup annotate "data/scans/YYYY-MM-DD/<scan_id>"
 ```
 
-The command first prints the full paths of `summary.png`, `moves.png`, and
-`appraisal.png`, then prompts for every field. When a valid
-`ground_truth.json` already exists, Enter keeps each displayed value. Replacing
-the file requires interactive confirmation; `--force` explicitly skips that
-confirmation.
+The interactive command displays the full paths of all three screenshots and prompts for typed annotation values one by one. Press Enter to retain an existing valid value.
 
-For future non-interactive tooling, pass a UTF-8 JSON file:
+For non-interactive input:
 
-```powershell
-pokemon-go-cleanup annotate "data\scans\2026-07-28\<scan_id>" --input-json ".\annotation-input.json"
+```bash
+pokemon-go-cleanup annotate \
+  "data/scans/YYYY-MM-DD/<scan_id>" \
+  --input-json annotation-input.json
 ```
 
-Example input:
+Use `--force` only when you explicitly need to overwrite an existing `ground_truth.json` without confirmation.
 
-```json
-{
-  "pokemon_name": "Example",
-  "cp": 1000,
-  "hp_current": 100,
-  "hp_max": 100,
-  "weight_kg": 10.5,
-  "height_m": 1.2,
-  "types": ["Type A", "Type B"],
-  "fast_move": "Fast move",
-  "charged_move_1": "Charged move",
-  "charged_move_2": null,
-  "attack_iv": 15,
-  "defense_iv": 14,
-  "hp_iv": 13,
-  "favorite": false,
-  "shiny": false,
-  "shadow": false,
-  "purified": false,
-  "costume": false,
-  "notes": null
-}
+## Configuration
+
+Global options must appear before the subcommand:
+
+```bash
+pokemon-go-cleanup \
+  --data-dir "/path/to/local-data" \
+  --adb-path "/path/to/adb.exe" \
+  --adb-timeout 30 \
+  --log-level INFO \
+  --log-format text \
+  device list
 ```
 
-CP, HP, weight, and height must be valid positive/non-negative values as
-appropriate; each IV must be an integer from 0 through 15. The saved JSON keeps
-Chinese and other Unicode text readable.
+Environment variables:
 
-## Local data layout
+| Variable | Purpose |
+| --- | --- |
+| `POKEMON_GO_CLEANUP_DATA_DIR` | Local screenshot and scan data directory |
+| `POKEMON_GO_CLEANUP_ADB_PATH` | Explicit path to `adb` or `adb.exe` |
+| `POKEMON_GO_CLEANUP_ADB_TIMEOUT_SECONDS` | ADB command timeout in seconds |
 
-A guided scan stores one fixed set of files below a unique scan ID. The manifest
-is rewritten after each successful screenshot:
+## Local Data Directory
+
+A complete manual or automatic scan has the following structure:
 
 ```text
 data/
 └── scans/
-    └── 2026-07-28/
-        └── 20260728_143015_123456_a1b2c3d4e5f60718293a4b5c6d7e8f90/
+    └── YYYY-MM-DD/
+        └── <scan_id>/
             ├── summary.png
             ├── moves.png
             ├── appraisal.png
             ├── manifest.json
-            └── ground_truth.json  # optional, created by annotate
+            ├── recognition.json   # Created by a recognition command
+            ├── ground_truth.json  # Optional; created by annotate
+            └── debug/             # Optional; ignored by Git
 ```
 
-`manifest.json` records the scan ID, capture timestamps, device serial, device
-model when available, screen resolution, screenshot filenames, guided workflow
-mode, application version, optional notes, scan status, and a failed step when
-applicable.
-
-`ground_truth.json` is independent of capture metadata. It contains only
-validated values entered by the user or supplied through `--input-json`.
-
-On a midway failure, earlier screenshots are preserved and the manifest becomes
-`incomplete`. Successful runs end with `complete`; temporary files are cleaned.
-
-A standalone capture continues to create a PNG and JSON sidecar with the same
-generated stem:
+A standalone screenshot's PNG and matching JSON sidecar are stored under:
 
 ```text
-data/
-└── screenshots/
-    └── 2026-07-28/
-        ├── 20260728_143015_123456_ABC123_a1b2c3d4.png
-        └── 20260728_143015_123456_ABC123_a1b2c3d4.json
+data/screenshots/YYYY-MM-DD/
 ```
 
-Example metadata:
+`manifest.json` records scan progress and device metadata;
+`recognition.json` stores machine-recognized values and warnings;
+`ground_truth.json` separately stores validated manual input values.
 
-```json
-{
-  "schema_version": "1.0",
-  "captured_at": "2026-07-28T14:30:15.123456+09:00",
-  "serial_number": "ABC123",
-  "resolution": {
-    "width": 1080,
-    "height": 2400
-  },
-  "screenshot_path": "C:\\path\\to\\data\\screenshots\\2026-07-28\\capture.png",
-  "metadata_path": "C:\\path\\to\\data\\screenshots\\2026-07-28\\capture.json",
-  "file_size_bytes": 123456,
-  "sha256": "64-lowercase-hex-characters"
-}
-```
+## Safety, Privacy, and Feature Boundaries
 
-Windows paths and Unicode directory names are supported. Device serial numbers
-are sanitized before being included in filenames; the original serial remains in
-metadata.
+This repository contains no Pokémon images, icons, or screenshots. Pokémon is a trademark of its respective owners. This is an independent project and is neither affiliated with nor endorsed by the rights holders.
 
-## Error reporting
+## License
 
-Expected failures are printed clearly and use stable process exit codes:
-
-| Exit code | Meaning |
-| ---: | --- |
-| 2 | ADB is not installed or cannot be found |
-| 3 | No connected, ready device |
-| 4 | Device is unauthorized |
-| 5 | Multiple ready devices; use `--serial` |
-| 6 | Screenshot command failed or did not return a PNG |
-| 7 | Another ADB command failed |
-| 8 | Requested serial was not found |
-| 9 | Requested device is offline or otherwise unavailable |
-| 10 | ADB returned an unrecognized response |
-| 11 | Local screenshot or metadata storage failed |
-| 12 | Dataset root or scan traversal failed |
-| 13 | Annotation input, validation, or overwrite protection failed |
-| 14 | Calibrated screenshot recognition could not continue |
-| 15 | Automatic scan stopped at a safety or timeout boundary |
-
-Guided scan failures retain the underlying exit code and name the failed step.
-Successful earlier screenshots remain in place and `manifest.json` is marked
-`incomplete` whenever that recovery write succeeds.
-
-Useful checks in **Windows PowerShell**:
-
-```powershell
-Get-Command adb
-adb kill-server
-adb start-server
-adb devices -l
-pokemon-go-cleanup device list
-```
-
-If the phone remains absent, try another data-capable cable or USB port and check
-Windows Device Manager for a device-driver problem. If it is `unauthorized`,
-unlock the phone, revoke USB debugging authorizations, reconnect, and accept the
-new prompt.
-
-## Development
-
-The repository uses a `src` layout, Python 3.12+, full type hints, Typer,
-Pydantic, pytest, Ruff, and mypy.
-
-Commands below are for **Ubuntu / WSL**, from the canonical project path:
-
-```bash
-cd /home/zhang/projects/pokemonGo_cleanUp
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e ".[dev]"
-python -m pip check
-pytest
-ruff check .
-mypy
-```
-
-No physical phone is required for the tests. ADB behavior includes a
-command-level fake runner, and dataset tests generate small synthetic PNGs at
-runtime. CI runs the dependency check, pytest, Ruff, and mypy on Windows and
-Ubuntu with Python 3.12 and 3.13.
-
-## Contributing and license
-
-Contributions that preserve the local-first, account-free scope are welcome. See
-[CONTRIBUTING.md](CONTRIBUTING.md).
-
-Licensed under the [Apache License 2.0](LICENSE).
+This project is licensed under the [Apache License 2.0](LICENSE).
