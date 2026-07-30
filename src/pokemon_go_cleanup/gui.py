@@ -457,7 +457,10 @@ class PokemonGoCleanupGui(tk.Tk):
         self._status_var.set("正在停止")
         self._append_log("正在发送 Ctrl+C，请等待当前程序安全收尾……")
         try:
-            os.killpg(process.pid, signal.SIGINT)
+            if sys.platform == "win32":
+                process.terminate()
+            else:
+                os.killpg(process.pid, signal.SIGINT)
         except ProcessLookupError:
             return
         except OSError as error:
