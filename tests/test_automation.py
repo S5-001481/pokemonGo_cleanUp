@@ -44,6 +44,18 @@ def _png(color: tuple[int, int, int]) -> bytes:
 PNG = _png((255, 255, 255))
 
 
+def _summary_detection(
+    evidence: str = "name_cp",
+) -> PageDetection:
+    """Return a confirmed summary fixture using the current evidence contract."""
+
+    return PageDetection(
+        "detail_summary",
+        0.99,
+        details={"summary_evidence": evidence},
+    )
+
+
 class FakeAutomationAdb:
     def __init__(self) -> None:
         self.inputs: list[tuple[object, ...]] = []
@@ -261,7 +273,7 @@ def test_dry_run_captures_summary_but_sends_no_input(tmp_path: Path) -> None:
     service = AutoScanService(
         AppConfig(data_dir=tmp_path),
         adb,
-        QueueDetector([PageDetection("detail_summary", 0.99)]),
+        QueueDetector([_summary_detection()]),
         reader,
         clock=Clock(),
         token_factory=lambda: "dryrun",
@@ -288,8 +300,16 @@ def test_unknown_initial_page_stops_before_any_input(tmp_path: Path) -> None:
     service = AutoScanService(
         AppConfig(data_dir=tmp_path),
         adb,
-        QueueDetector([PageDetection("unknown", 0.0)]),
+        QueueDetector(
+            [
+                PageDetection("unknown", 0.0),
+                PageDetection("unknown", 0.0),
+            ]
+        ),
         FakeReader(),
+        automation=HuaweiMate30AutomationConfig(
+            summary_wait_timeout_seconds=0.5,
+        ),
         clock=Clock(),
         token_factory=lambda: "unknown",
         stable_waiter=_stable,
@@ -338,7 +358,7 @@ def test_live_flow_sends_only_gated_single_scan_actions(tmp_path: Path) -> None:
     )
     detector = MovesAwareQueueDetector(
         [
-            PageDetection("detail_summary", 0.99),
+            _summary_detection(),
             PageDetection("detail_moves", 0.99),
             PageDetection("detail_moves", 0.99),
             menu,
@@ -346,8 +366,7 @@ def test_live_flow_sends_only_gated_single_scan_actions(tmp_path: Path) -> None:
             PageDetection("appraisal_dialogue", 0.95),
             PageDetection("appraisal_bars", 1.0),
             PageDetection("appraisal_bars", 1.0),
-            PageDetection("appraisal_bars", 1.0),
-            PageDetection("detail_summary", 0.99),
+            _summary_detection(),
         ]
     )
     adb = FakeAutomationAdb()
@@ -371,7 +390,7 @@ def test_live_flow_sends_only_gated_single_scan_actions(tmp_path: Path) -> None:
 
     assert result.manifest.scan_status == "complete"
     assert result.recognition is not None
-    assert stability.calls == 3
+    assert stability.calls == 0
     assert [action[0] for action in adb.inputs] == [
         "swipe",
         "tap",
@@ -422,14 +441,13 @@ def test_menu_open_retries_once_only_after_detail_state_timeout(
     )
     detector = QueueDetector(
         [
-            PageDetection("detail_summary", 0.99),
+            _summary_detection(),
             PageDetection("detail_moves", 0.99),
             PageDetection("detail_moves", 0.99),
             PageDetection("detail_moves", 0.99),
             PageDetection("detail_moves", 0.99),
             PageDetection("detail_moves", 0.99),
             menu,
-            PageDetection("appraisal_bars", 1.0),
             PageDetection("appraisal_bars", 1.0),
             PageDetection("appraisal_bars", 1.0),
             PageDetection("detail_moves", 0.99),
@@ -470,16 +488,15 @@ def test_scroll_to_moves_retries_only_after_summary_timeout(tmp_path: Path) -> N
     )
     detector = QueueDetector(
         [
-            PageDetection("detail_summary", 0.99),
+            _summary_detection(),
             PageDetection("unknown", 0.0),
-            PageDetection("detail_summary", 0.99),
+            _summary_detection(),
             PageDetection("detail_moves", 0.99),
             PageDetection("detail_moves", 0.99),
             menu,
             PageDetection("appraisal_bars", 1.0),
             PageDetection("appraisal_bars", 1.0),
-            PageDetection("appraisal_bars", 1.0),
-            PageDetection("detail_summary", 0.99),
+            _summary_detection(),
         ]
     )
     adb = FakeAutomationAdb()
@@ -510,7 +527,7 @@ def test_scroll_to_moves_unknown_timeout_never_blindly_retries(
 ) -> None:
     detector = QueueDetector(
         [
-            PageDetection("detail_summary", 0.99),
+            _summary_detection(),
             PageDetection("unknown", 0.0),
             PageDetection("unknown", 0.0),
             PageDetection("unknown", 0.0),
