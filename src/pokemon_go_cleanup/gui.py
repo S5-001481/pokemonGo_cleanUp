@@ -412,7 +412,12 @@ class PokemonGoCleanupGui(tk.Tk):
                 if kind == "line":
                     self._append_log(str(payload))
                 elif kind == "done":
-                    self._handle_process_done(int(payload))
+                    if not isinstance(payload, int):
+                        self._handle_worker_error(
+                            f"无效的进程退出码: {payload!r}"
+                        )
+                        continue
+                    self._handle_process_done(payload)
                 elif kind == "worker-error":
                     self._handle_worker_error(str(payload))
         except queue.Empty:

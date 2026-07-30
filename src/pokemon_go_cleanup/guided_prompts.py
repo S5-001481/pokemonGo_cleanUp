@@ -1,4 +1,3 @@
-# ruff: noqa: RUF001
 """Bilingual terminal prompts for the manual scan workflow."""
 
 from __future__ import annotations
