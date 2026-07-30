@@ -431,7 +431,7 @@ class HuaweiMate30PageDetector:
             if name is not None and (cp is not None or hp is not None):
                 details: dict[str, object] = {}
                 evidence = "name_hp"
-                matched_texts = (name.raw,)
+                matched_texts: tuple[str, ...] = (name.raw,)
                 confidence_candidates = [name.confidence]
                 if cp is not None:
                     normalized_cp = normalize_cp_candidate(cp.raw)
