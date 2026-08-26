@@ -54,6 +54,7 @@ class PokemonGoCleanupGui(tk.Tk):
         self._csv_var = tk.StringVar(value=str(DEFAULT_CSV))
         self._debug_var = tk.BooleanVar(value=True)
         self._resume_var = tk.BooleanVar(value=False)
+        self._rename_with_iv_var = tk.BooleanVar(value=False)
         self._status_var = tk.StringVar(value="就绪")
         self._device_var = tk.StringVar(value="尚未检查手机")
 
@@ -158,6 +159,11 @@ class PokemonGoCleanupGui(tk.Tk):
             options,
             text="续接已有 CSV",
             variable=self._resume_var,
+        ).pack(side=tk.LEFT, padx=(18, 0))
+        ttk.Checkbutton(
+            options,
+            text="重置中文名后追加 IV（例如 呆火鱷15/15/15）",
+            variable=self._rename_with_iv_var,
         ).pack(side=tk.LEFT, padx=(18, 0))
 
         actions = ttk.LabelFrame(
@@ -273,6 +279,8 @@ class PokemonGoCleanupGui(tk.Tk):
         ]
         if self._debug_var.get():
             command.append("--debug")
+        if self._rename_with_iv_var.get():
+            command.append("--rename-with-iv")
         self._start_command(command, task="dry-run", heading="检查当前详情页")
 
     def _scan_one(self) -> None:
@@ -284,6 +292,8 @@ class PokemonGoCleanupGui(tk.Tk):
         ]
         if self._debug_var.get():
             command.append("--debug")
+        if self._rename_with_iv_var.get():
+            command.append("--rename-with-iv")
         self._start_command(command, task="scan-one", heading="自动扫描一只宝可梦")
 
     def _scan_batch(self) -> None:
@@ -341,9 +351,10 @@ class PokemonGoCleanupGui(tk.Tk):
         ]
         if self._debug_var.get():
             command.append("--debug")
+        if self._rename_with_iv_var.get():
+            command.append("--rename-with-iv")
         if resume:
             command.append("--resume")
-
         self._start_command(command, task="scan-batch", heading="开始批量扫描")
 
     def _start_command(

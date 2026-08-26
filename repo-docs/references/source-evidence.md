@@ -68,13 +68,16 @@ a complete manifest.
 
 ## Bounded batch extension
 
-`scan-batch` delegates each item to that unchanged one-scan service. Its only new
-input is a centralized pair of fixed left swipes, each permitted only after a
-fresh `detail_summary` matches the completed recognition. The next summary must
-change name, CP, or static fingerprint; polling lasts 15 seconds per attempt and
-allows one normal left swipe plus one stronger left retry, never a right swipe.
-Each complete result atomically rewrites the CSV before switching. Resume accepts
-only rows whose referenced manifests remain complete.
+`scan-batch` delegates each item to the same one-scan service. Its normal mode
+adds only a centralized pair of fixed left swipes, each permitted after a fresh
+`detail_summary` matches the completed identity. With `--rename-with-iv`, a
+separate transition validator permits only the exact planned nickname while CP,
+optional HP, and the static fingerprint remain; the general name/CP/fingerprint
+comparators and threshold are unchanged. The next summary must change name, CP,
+or static fingerprint; polling lasts 15 seconds per attempt and allows one normal
+left swipe plus one stronger left retry, never a right swipe. Each complete result
+atomically rewrites the CSV before switching. Resume accepts only rows whose
+referenced manifests and any verified nickname evidence remain complete.
 
 ## Evidence Traversal Log
 
@@ -83,9 +86,9 @@ only rows whose referenced manifests remain complete.
 | Pass 1 | Map the main path | [`pyproject.toml`](../../pyproject.toml), [`cli.py`](../../src/pokemon_go_cleanup/cli.py), [`adb.py`](../../src/pokemon_go_cleanup/adb.py), [`capture.py`](../../src/pokemon_go_cleanup/capture.py), [`models.py`](../../src/pokemon_go_cleanup/models.py) | Confirmed the command-to-device-to-PNG-to-JSON handoffs and the dated output location. |
 | Pass 2 | Challenge the happy path | [`exceptions.py`](../../src/pokemon_go_cleanup/exceptions.py), [`config.py`](../../src/pokemon_go_cleanup/config.py), [`logging_config.py`](../../src/pokemon_go_cleanup/logging_config.py), [`test_adb.py`](../../tests/test_adb.py), [`test_capture.py`](../../tests/test_capture.py), [`test_cli.py`](../../tests/test_cli.py) | Added the state-selection failures, PNG trust check, Unicode path coverage, structured error logging, exact exit codes, and the non-atomic pair caveat. |
 | Pass 3 | Trace the guided lifecycle | [`adb_runner.py`](../../src/pokemon_go_cleanup/adb_runner.py), [`scan.py`](../../src/pokemon_go_cleanup/scan.py), [`guided_prompts.py`](../../src/pokemon_go_cleanup/guided_prompts.py), [`test_scan.py`](../../tests/test_scan.py), [`test_scan_cli.py`](../../tests/test_scan_cli.py) | Added the three user handoffs, atomic step files, progressive manifest, incomplete recovery, option coverage, and no-tap/swipe command evidence. |
-| Pass 5 | Trace the fixed automatic safety boundary | [`automation.py`](../../src/pokemon_go_cleanup/automation.py), input wrappers in [`adb.py`](../../src/pokemon_go_cleanup/adb.py), [`recognition.py`](../../src/pokemon_go_cleanup/recognition.py), [`test_automation.py`](../../tests/test_automation.py), and [`test_adb.py`](../../tests/test_adb.py) | Added six page states, centralized coordinates, dry-run zero-input evidence, one moves scroll, no-scroll menu opening with OCR target-state polling and one gated retry, transfer clearance, one appraisal-dialogue tap followed by 500 ms/30-second IV-bar polling with no retry, IV confirmation, a center tap to exit appraisal, timeouts, and incomplete recovery. |
+| Pass 5 | Trace the fixed automatic safety boundary | [`automation.py`](../../src/pokemon_go_cleanup/automation.py), input wrappers in [`adb.py`](../../src/pokemon_go_cleanup/adb.py), [`recognition.py`](../../src/pokemon_go_cleanup/recognition.py), [`test_automation.py`](../../tests/test_automation.py), and [`test_adb.py`](../../tests/test_adb.py) | Added eight page states, centralized coordinates, dry-run zero-input evidence, one moves scroll, no-scroll menu opening with OCR target-state polling and one gated retry, transfer clearance, one appraisal-dialogue tap followed by 500 ms/30-second IV-bar polling with no retry, IV confirmation, a center tap to exit appraisal, optional OCR-gated nickname reset, one complete ASCII-suffix `input text` request, width-sensitive pre-confirmation editor verification, timeouts, and incomplete recovery. |
 | Pass 4 | Trace dataset trust and annotation replacement | [`dataset.py`](../../src/pokemon_go_cleanup/dataset.py), [`annotation.py`](../../src/pokemon_go_cleanup/annotation.py), [`storage.py`](../../src/pokemon_go_cleanup/storage.py), [`test_dataset.py`](../../tests/test_dataset.py), [`test_dataset_cli.py`](../../tests/test_dataset_cli.py), [`test_annotation.py`](../../tests/test_annotation.py) | Added recursive discovery, full image decoding, complete/incomplete/invalid classification, typed ground truth, UTF-8 persistence, overwrite protection, and runtime-only synthetic image evidence. |
-| Pass 6 | Trace bounded batch durability and switching | [`batch.py`](../../src/pokemon_go_cleanup/batch.py), unchanged [`automation.py`](../../src/pokemon_go_cleanup/automation.py), CLI wiring in [`cli.py`](../../src/pokemon_go_cleanup/cli.py), atomic persistence in [`storage.py`](../../src/pokemon_go_cleanup/storage.py), and [`test_batch.py`](../../tests/test_batch.py) | Added a fixed Huawei horizontal gesture, post-exit summary gate, name/CP change and wrap checks, two-attempt ceiling, per-row atomic CSV, complete-manifest resume checks, and switch debug evidence. |
+| Pass 6 | Trace bounded batch durability and switching | [`batch.py`](../../src/pokemon_go_cleanup/batch.py), reused [`automation.py`](../../src/pokemon_go_cleanup/automation.py), CLI wiring in [`cli.py`](../../src/pokemon_go_cleanup/cli.py), atomic persistence in [`storage.py`](../../src/pokemon_go_cleanup/storage.py), and [`test_batch.py`](../../tests/test_batch.py) | Added a fixed Huawei horizontal gesture, post-exit summary gate, strict name/CP change and wrap checks, two-attempt ceiling, per-row atomic CSV, complete-manifest resume checks, switch debug evidence, and a separate expected-nickname transition/resume path that does not change the general identity comparators. |
 
 ## Claim ledger
 
@@ -116,7 +119,8 @@ only rows whose referenced manifests remain complete.
 | Move scrolling is target-state-driven rather than whole-screen-stability-driven. | [`AutoScanService._scroll_to_moves()`](../../src/pokemon_go_cleanup/automation.py) polls every 500 ms for `detail_moves`, permits transient summary/unknown, stops on menu/appraisal states, and retries only once after a summary timeout; [`test_automation.py`](../../tests/test_automation.py) fails if stability is requested before moves and covers summary-only retry plus unknown no-retry. | Confirmed | Later menu/appraisal inputs retain their existing stability waits. A live 熔蟻獸 run reached moves on poll 1 at 0.99701 with no scroll stability file. | Automatic walkthrough |
 | Resume and append reject only an adjacent static-summary repeat. | [`BatchScanService`](../../src/pokemon_go_cleanup/batch.py) compares `(100,1550,1340,2300)` hashes plus name/CP/optional HP against only the final CSV row, pre-switches when resume is still on that row, and repeats the guard before atomic append; focused batch tests cover same-current, already-next, animated upper screen, and refused append. | Confirmed | This does not globally deduplicate the history; different adjacent individuals may proceed when their static details differ. A live already-next resume measured distance 60, sent no preliminary switch, and preserved the two-row CSV after a later appraisal failure. | Batch walkthrough |
 | Batch CSV is durable before switching, and switching is bounded by identity checks. | [`BatchScanService`](../../src/pokemon_go_cleanup/batch.py) appends through `atomic_write_text` immediately after a complete one-scan result, then requires a matching post-exit summary before exactly two configured left gestures: `(1180,1500)` to `(260,1500)` over 600 ms, then `(1300,1500)` to `(140,1500)` over 850 ms; [`test_batch.py`](../../tests/test_batch.py) asserts both gestures have `start.x > end.x` for normal and resume switching. | Confirmed | The direction is operator-confirmed for the fixed Mate 30 profile; no right-swipe fallback is implemented. | Batch walkthrough |
-| Transfer, gameplay mutations, account access, private APIs, traffic inspection, and credentials are outside the implementation. | Batch adds only one fixed horizontal swipe between complete single scans; the existing bounded menu/appraisal inputs remain unchanged. Root [`README.md`](../../README.md) states the boundary. | Confirmed | Any future input expansion requires a new safety and privacy review. | Guide README |
+| Nickname mutation is opt-in and batch-safe through dedicated transitions. | `--rename-with-iv` in [`cli.py`](../../src/pokemon_go_cleanup/cli.py) enables [`AutoScanService`](../../src/pokemon_go_cleanup/automation.py) only after IV recognition. Both editor openings require `detail_summary`, tap the fixed nickname-row center `(720,1460)`, and then require `rename_keyboard` or `rename_dialog` before delete/text input. The separate `(150,1300,1290,1550)` reader remains only for final nickname and renamed-wrap evidence. Exact width-sensitive editor/final text, CP, optional HP, and unchanged distance-8 fingerprint gate persistence. [`BatchScanService`](../../src/pokemon_go_cleanup/batch.py) additionally wraps a verified rename batch only when the switched screenshot's wide nickname equals the first row's saved nickname and its CP/HP/fingerprint match; `_same_switch_identity` remains unchanged. Tests cover the fixed dry-run/action coordinate, failure to open the editor, generic-fragment mismatch with exact renamed wrap, nickname/CP negatives, durable rows, and renamed resume. | Source- and synthetic-test-confirmed; earlier editor, action-log, and partial live-batch evidence used pencil-relative targets | Real row 1/6 replay keeps general wrap false for generic `"2"` versus `"5"`, but the dedicated check returns true for wide `飄飄球1225` versus expected `飄飄球12/2/5` with identical CP/fingerprint. The fixed center removes the post-reset wide-row OCR dependency exposed by `古月鳥`; a physical fixed-center retry remains pending. | Automatic and batch walkthroughs |
+| Transfer, other gameplay mutations, account access, private APIs, traffic inspection, and credentials are outside the implementation. | Batch adds only one fixed horizontal swipe between complete single scans; the existing bounded menu/appraisal inputs remain unchanged. Root [`README.md`](../../README.md) states the boundary. | Confirmed | Any future input expansion requires a new safety and privacy review. | Guide README |
 
 ## Coverage and exclusions
 
@@ -127,10 +131,12 @@ and manual annotation.
 configuration precedence, and CI were checked where they constrain these paths.
 No real device media is stored in the repository.
 
-The guide does not cover transfer or other gameplay mutations, network inspection,
-account access, or credentials. One-Pokémon automation, batch row durability, and right switching are physically
-confirmed. The fixed detail-moves fallback is real-image-confirmed, and the
-resumed two-complete-row device run finished with two distinct identities.
+The guide does not cover transfer or other gameplay mutations beyond the
+documented opt-in automatic nickname reset/suffix, network inspection, account
+access, or credentials. One-Pokémon automation, batch row durability, and right
+switching are physically confirmed. The fixed detail-moves fallback is
+real-image-confirmed, and the resumed two-complete-row device run finished with
+two distinct identities.
 
 ## Falsifying checks
 

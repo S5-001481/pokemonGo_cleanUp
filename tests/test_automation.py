@@ -14,11 +14,14 @@ from PIL import Image
 from pokemon_go_cleanup.automation import (
     AutoScanService,
     HuaweiMate30AutomationConfig,
+    HuaweiMate30PageDetector,
     PageDetection,
     Point,
     StableScreenResult,
     appraisal_target_is_safe,
+    compact_editor_nickname_text,
     match_move_name_power_rows,
+    planned_actions,
     wait_for_stable_screen,
 )
 from pokemon_go_cleanup.config import AppConfig
@@ -92,10 +95,22 @@ class FakeAutomationAdb:
     def press_back(self, serial_number: str) -> None:
         self.inputs.append(("back",))
 
+    def press_key(self, serial_number: str, keycode: int) -> None:
+        self.inputs.append(("keyevent", keycode))
+
+    def input_text(self, serial_number: str, value: str) -> None:
+        self.inputs.append(("text", value))
+
 
 class QueueDetector:
-    def __init__(self, detections: list[PageDetection]) -> None:
+    def __init__(
+        self,
+        detections: list[PageDetection],
+        *,
+        summary_nickname: str = "妙蛙花15/13/11",
+    ) -> None:
         self._detections = deque(detections)
+        self.summary_nickname = summary_nickname
 
     def detect(
         self,
@@ -107,6 +122,9 @@ class QueueDetector:
         assert expected
         return self._detections.popleft()
 
+    def read_summary_nickname(self, png_bytes: bytes) -> str:
+        assert png_bytes == PNG
+        return self.summary_nickname
 
 class MovesAwareQueueDetector(QueueDetector):
     def __init__(self, detections: list[PageDetection]) -> None:
@@ -150,6 +168,8 @@ class InterruptingDetector:
         assert expected
         raise KeyboardInterrupt
 
+    def read_summary_nickname(self, png_bytes: bytes) -> str:
+        raise KeyboardInterrupt
 
 class FakeReader:
     def __init__(self) -> None:
@@ -265,6 +285,46 @@ def test_detail_moves_does_not_treat_appraisal_labels_as_move_rows() -> None:
     )
 
     assert match_move_name_power_rows(candidates) == ()
+
+
+def test_summary_nickname_reader_uses_tight_row_and_combines_split_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the real long-name crop that retains a slash-separated middle IV."""
+
+    detector = object.__new__(HuaweiMate30PageDetector)
+    detector._config = HuaweiMate30AutomationConfig()
+    observed_rectangles: list[tuple[int, int, int, int]] = []
+    candidates = (
+        OcrCandidate("飄飄球12", 0.999, (339, 1379, 803, 1531)),
+        OcrCandidate("2", 0.999, (855, 1403, 928, 1503)),
+        OcrCandidate("5", 0.999, (1001, 1400, 1076, 1502)),
+        OcrCandidate("✎", 0.9, (1110, 1510, 1180, 1580)),
+    )
+
+    monkeypatch.setattr(detector, "_decode", lambda _png: object())
+
+    def ocr_rectangle(
+        _image: object,
+        rectangle: tuple[int, int, int, int],
+    ) -> tuple[OcrCandidate, ...]:
+        observed_rectangles.append(rectangle)
+        return candidates
+
+    monkeypatch.setattr(detector, "_ocr_rectangle", ocr_rectangle)
+
+    assert detector.read_summary_nickname(PNG) == "飄飄球1225"
+    assert observed_rectangles == [(150, 1300, 1290, 1550)]
+
+
+def test_rename_plan_uses_fixed_name_row_center() -> None:
+    actions = planned_actions(rename_with_iv=True)
+    rename_actions = actions[-2:]
+
+    for action in rename_actions:
+        coordinates = action["coordinates"]
+        assert isinstance(coordinates, dict)
+        assert coordinates["edit"] == {"x": 720, "y": 1460}
 
 
 def test_dry_run_captures_summary_but_sends_no_input(tmp_path: Path) -> None:
@@ -428,6 +488,231 @@ def test_live_flow_sends_only_gated_single_scan_actions(tmp_path: Path) -> None:
     assert (debug_directory / "scroll_to_moves_attempt_1_poll_01.png").is_file()
     assert (debug_directory / "scroll_to_moves_attempt_1_states.json").is_file()
     assert not (debug_directory / "stability_scroll_to_moves.json").exists()
+
+
+def test_rename_with_iv_resets_default_name_then_appends_suffix(tmp_path: Path) -> None:
+    rename_dialog = PageDetection(
+        "rename_dialog",
+        0.99,
+        matched_texts=("取消", "確定"),
+        rename_confirm_target=Point(1120, 1860),
+    )
+    rename_keyboard = PageDetection(
+        "rename_keyboard",
+        0.99,
+        matched_texts=("設定暱稱", "确定", "GIF", "1", "2", "3", "4"),
+        rename_keyboard_target=Point(1248, 1712),
+        details={"nickname_text_candidates": ["妙蛙花15/13/11"]},
+    )
+    detector = QueueDetector(
+        [
+            _summary_detection(),
+            PageDetection("detail_moves", 0.99),
+            PageDetection("detail_moves", 0.99),
+            PageDetection(
+                "action_menu",
+                0.99,
+                matched_texts=("調查寶可夢",),
+                appraisal_target=Point(700, 2400),
+            ),
+            PageDetection("appraisal_bars", 1.0),
+            PageDetection("appraisal_bars", 1.0),
+            PageDetection(
+                "detail_summary",
+                0.99,
+                matched_texts=("CP1761", "妙蛙花"),
+                details={"summary_evidence": "name_cp"},
+            ),
+            _summary_detection(),
+            rename_dialog,
+            rename_keyboard,
+            rename_dialog,
+            PageDetection(
+                "detail_summary",
+                0.99,
+                matched_texts=("CP1761", "妙蛙花"),
+                details={"summary_evidence": "name_cp"},
+            ),
+            _summary_detection(),
+            rename_dialog,
+            rename_keyboard,
+            rename_dialog,
+            _summary_detection(),
+        ]
+    )
+    adb = FakeAutomationAdb()
+    service = AutoScanService(
+        AppConfig(data_dir=tmp_path),
+        adb,
+        detector,
+        FakeReader(),
+        automation=HuaweiMate30AutomationConfig(nickname_maximum_characters=2),
+        clock=Clock(),
+        token_factory=lambda: "rename",
+        stable_waiter=_stable,
+        monotonic=lambda: 0.0,
+        sleeper=lambda _: None,
+    )
+
+    result = service.scan_one(rename_with_iv=True, debug=True)
+
+    assert result.manifest.scan_status == "complete"
+    assert result.nickname_change is not None
+    assert result.nickname_change.expected_nickname == "妙蛙花15/13/11"
+    assert (result.scan_directory / "renamed_summary.png").is_file()
+    assert (result.scan_directory / "nickname_change.json").is_file()
+    assert adb.inputs[-11:] == [
+        ("tap", 720, 1460),
+        ("keyevent", 123),
+        ("keyevent", 67),
+        ("keyevent", 67),
+        ("tap", 1248, 1712),
+        ("tap", 1120, 1860),
+        ("tap", 720, 1460),
+        ("keyevent", 123),
+        ("text", "15/13/11"),
+        ("tap", 1248, 1712),
+        ("tap", 1120, 1860),
+    ]
+    actions = json.loads(
+        (result.scan_directory / "debug" / "automation" / "actions.json").read_text(
+            encoding="utf-8"
+        )
+    )["actions"]
+    assert [action["name"] for action in actions[-8:]] == [
+        "open_nickname_editor_reset",
+        "clear_nickname_for_default",
+        "confirm_default_nickname_hide_keyboard",
+        "confirm_default_nickname",
+        "open_nickname_editor_append_iv",
+        "append_iv_suffix",
+        "confirm_iv_nickname_hide_keyboard",
+        "confirm_iv_nickname",
+    ]
+    append_action = next(
+        action for action in actions if action["name"] == "append_iv_suffix"
+    )
+    assert append_action["kind"] == "text"
+    assert append_action["coordinates"] == {
+        "end": 123,
+        "ascii_text": "15/13/11",
+    }
+
+
+def test_editor_nickname_compaction_preserves_character_width() -> None:
+    assert compact_editor_nickname_text("妙蛙花 15/13/11") == "妙蛙花15/13/11"
+    full_width = "妙蛙花\uff11\uff15\uff0f\uff11\uff13\uff0f\uff11\uff11"
+    assert compact_editor_nickname_text(full_width) != "妙蛙花15/13/11"
+
+
+def test_fixed_nickname_row_tap_stops_before_text_when_editor_does_not_open(
+    tmp_path: Path,
+) -> None:
+    detector = QueueDetector(
+        [
+            _summary_detection(),
+            PageDetection("detail_moves", 0.99),
+            PageDetection("detail_moves", 0.99),
+            PageDetection(
+                "action_menu",
+                0.99,
+                matched_texts=("調查寶可夢",),
+                appraisal_target=Point(700, 2400),
+            ),
+            PageDetection("appraisal_bars", 1.0),
+            PageDetection("appraisal_bars", 1.0),
+            _summary_detection(),
+            _summary_detection(),
+            _summary_detection(),
+            _summary_detection(),
+            _summary_detection(),
+        ]
+    )
+    adb = FakeAutomationAdb()
+    service = AutoScanService(
+        AppConfig(data_dir=tmp_path),
+        adb,
+        detector,
+        FakeReader(),
+        automation=HuaweiMate30AutomationConfig(rename_wait_timeout_seconds=0.5),
+        clock=Clock(),
+        token_factory=lambda: "rename-fixed-center-no-editor",
+        stable_waiter=_stable,
+        monotonic=lambda: 0.0,
+        sleeper=lambda _: None,
+    )
+
+    with pytest.raises(AutomationError, match="did not expose an OCR-confirmed"):
+        service.scan_one(rename_with_iv=True, debug=True)
+
+    assert adb.inputs[-1] == ("tap", 720, 1460)
+    assert not any(action[0] in ("keyevent", "text") for action in adb.inputs)
+
+
+def test_rename_with_iv_rejects_wrong_editor_text_before_final_confirmation(
+    tmp_path: Path,
+) -> None:
+    rename_dialog = PageDetection(
+        "rename_dialog",
+        0.99,
+        matched_texts=("取消", "確定"),
+        rename_confirm_target=Point(1120, 1860),
+    )
+    wrong_keyboard = PageDetection(
+        "rename_keyboard",
+        0.99,
+        matched_texts=("設定暱稱", "妙蛙花15/13/10", "确定"),
+        rename_keyboard_target=Point(1248, 1712),
+        details={"nickname_text_candidates": ["妙蛙花15/13/10"]},
+    )
+    detector = QueueDetector(
+        [
+            _summary_detection(),
+            PageDetection("detail_moves", 0.99),
+            PageDetection("detail_moves", 0.99),
+            PageDetection(
+                "action_menu",
+                0.99,
+                matched_texts=("調查寶可夢",),
+                appraisal_target=Point(700, 2400),
+            ),
+            PageDetection("appraisal_bars", 1.0),
+            PageDetection("appraisal_bars", 1.0),
+            _summary_detection(),
+            _summary_detection(),
+            rename_dialog,
+            wrong_keyboard,
+            rename_dialog,
+            PageDetection(
+                "detail_summary",
+                0.99,
+                matched_texts=("CP1761", "妙蛙花"),
+                details={"summary_evidence": "name_cp"},
+            ),
+            _summary_detection(),
+            rename_dialog,
+            wrong_keyboard,
+        ]
+    )
+    adb = FakeAutomationAdb()
+    service = AutoScanService(
+        AppConfig(data_dir=tmp_path),
+        adb,
+        detector,
+        FakeReader(),
+        automation=HuaweiMate30AutomationConfig(nickname_maximum_characters=1),
+        clock=Clock(),
+        token_factory=lambda: "rename-mismatch",
+        stable_waiter=_stable,
+        monotonic=lambda: 0.0,
+        sleeper=lambda _: None,
+    )
+
+    with pytest.raises(AutomationError, match="did not exactly match"):
+        service.scan_one(rename_with_iv=True, debug=True)
+
+    assert adb.inputs.count(("tap", 1248, 1712)) == 1
+    assert adb.inputs.count(("tap", 1120, 1860)) == 1
 
 
 def test_menu_open_retries_once_only_after_detail_state_timeout(

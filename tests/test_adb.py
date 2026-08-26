@@ -155,6 +155,8 @@ def test_adb_input_wrappers_build_explicit_commands() -> None:
     client.tap("ABC123", 100, 200)
     client.swipe("ABC123", 10, 20, 30, 40, 650)
     client.press_back("ABC123")
+    client.press_key("ABC123", 123)
+    client.input_text("ABC123", "15/15/15")
 
     assert runner.commands == [
         ["adb.exe", "-s", "ABC123", "shell", "input", "tap", "100", "200"],
@@ -165,4 +167,6 @@ def test_adb_input_wrappers_build_explicit_commands() -> None:
         [
             "adb.exe", "-s", "ABC123", "shell", "input", "keyevent", "BACK"
         ],
+        ["adb.exe", "-s", "ABC123", "shell", "input", "keyevent", "123"],
+        ["adb.exe", "-s", "ABC123", "shell", "input", "text", "15/15/15"],
     ]

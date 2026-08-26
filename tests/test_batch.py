@@ -6,19 +6,29 @@ import csv
 import io
 import json
 from collections import deque
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from PIL import Image, ImageDraw
 
-from pokemon_go_cleanup.automation import AutoScanResult, PageDetection
+from pokemon_go_cleanup.automation import (
+    AutoScanResult,
+    NicknameRenameResult,
+    PageDetection,
+)
 from pokemon_go_cleanup.batch import (
+    BATCH_CSV_COLUMNS,
+    LEGACY_BATCH_CSV_COLUMNS,
     BatchScanService,
+    ExpectedNicknameTransition,
     HuaweiMate30BatchConfig,
     SummaryIdentity,
     _same_switch_identity,
     fingerprint_distance,
+    matches_expected_nickname_transition,
+    matches_verified_renamed_identity,
     page_fingerprint,
 )
 from pokemon_go_cleanup.exceptions import BatchAutomationError
@@ -76,8 +86,16 @@ class FakeBatchAdb:
 
 
 class QueueDetector:
-    def __init__(self, detections: list[PageDetection]) -> None:
+    def __init__(
+        self,
+        detections: list[PageDetection],
+        *,
+        summary_nickname: str = "",
+        summary_nicknames: list[str] | None = None,
+    ) -> None:
         self.detections = deque(detections)
+        self.summary_nickname = summary_nickname
+        self.summary_nicknames = deque(summary_nicknames or [])
 
     def detect(
         self,
@@ -88,18 +106,24 @@ class QueueDetector:
         assert expected
         return self.detections.popleft()
 
+    def read_summary_nickname(self, png_bytes: bytes) -> str:
+        if self.summary_nicknames:
+            return self.summary_nicknames.popleft()
+        return self.summary_nickname
+
 
 class FakeScanner:
     def __init__(self, root: Path, results: list[RecognitionResult]) -> None:
         self.root = root
         self.results = deque(results)
-        self.calls: list[tuple[bool, str | None]] = []
+        self.calls: list[tuple[bool, str | None, bool]] = []
 
     def scan_one(
         self,
         *,
         debug: bool = False,
         dry_run: bool = False,
+        rename_with_iv: bool = False,
         serial_number: str | None = None,
         notes: str | None = None,
     ) -> AutoScanResult:
@@ -125,7 +149,45 @@ class FakeScanner:
             directory / "manifest.json",
             manifest.model_dump_json(indent=2) + "\n",
         )
-        self.calls.append((debug, serial_number))
+        nickname_change: NicknameRenameResult | None = None
+        if rename_with_iv:
+            values = (recognition.attack_iv, recognition.defense_iv, recognition.hp_iv)
+            assert all(value is not None for value in values)
+            suffix = "/".join(str(value) for value in values)
+            default_name = recognition.pokemon_name.value or ""
+            expected = f"{default_name}{suffix}"
+            renamed_png = PNG_A if recognition.cp.value == 100 else PNG_B
+            renamed_detection = PageDetection(
+                "detail_summary",
+                0.99,
+                (f"CP{recognition.cp.value}", expected),
+            )
+            nickname_change = NicknameRenameResult(
+                nickname_before=default_name,
+                default_nickname=default_name,
+                expected_nickname=expected,
+                editor_observed_nickname=expected,
+                summary_observed_nickname=expected,
+                summary_png=renamed_png,
+                summary_detection=renamed_detection,
+            )
+            atomic_write_bytes(directory / "renamed_summary.png", renamed_png)
+            atomic_write_text(
+                directory / "nickname_change.json",
+                json.dumps(
+                    {
+                        "nickname_before": default_name,
+                        "default_nickname": default_name,
+                        "nickname_after": expected,
+                        "editor_observed_nickname": expected,
+                        "summary_observed_nickname": expected,
+                        "summary_filename": "renamed_summary.png",
+                        "status": "verified",
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        self.calls.append((debug, serial_number, rename_with_iv))
         return AutoScanResult(
             scan_directory=directory,
             manifest_path=directory / "manifest.json",
@@ -133,6 +195,38 @@ class FakeScanner:
             recognition=recognition,
             dry_run=False,
             planned_actions=(),
+            nickname_change=nickname_change,
+        )
+
+
+class BadTransitionScanner(FakeScanner):
+    def scan_one(
+        self,
+        *,
+        debug: bool = False,
+        dry_run: bool = False,
+        rename_with_iv: bool = False,
+        serial_number: str | None = None,
+        notes: str | None = None,
+    ) -> AutoScanResult:
+        result = super().scan_one(
+            debug=debug,
+            dry_run=dry_run,
+            rename_with_iv=rename_with_iv,
+            serial_number=serial_number,
+            notes=notes,
+        )
+        assert result.nickname_change is not None
+        bad_detection = replace(
+            result.nickname_change.summary_detection,
+            matched_texts=("CP999", result.nickname_change.expected_nickname),
+        )
+        return replace(
+            result,
+            nickname_change=replace(
+                result.nickname_change,
+                summary_detection=bad_detection,
+            ),
         )
 
 
@@ -189,12 +283,131 @@ def test_batch_scans_two_distinct_pokemon_and_persists_each_row(
     assert len(result.new_rows) == 2
     assert adb.swipes == [(1180, 1500, 260, 1500, 600)]
     assert all(x1 > x2 for x1, _, x2, _, _ in adb.swipes)
-    assert scanner.calls == [(True, "ABC"), (True, "ABC")]
+    assert scanner.calls == [(True, "ABC", False), (True, "ABC", False)]
     with destination.open(encoding="utf-8", newline="") as source:
         rows = list(csv.DictReader(source))
     assert [row["pokemon_name"] for row in rows] == ["甲", "乙"]
     assert [row["cp"] for row in rows] == ["100", "200"]
     assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_batch_rename_verifies_transition_and_switches_from_post_identity(
+    tmp_path: Path,
+) -> None:
+    scanner = FakeScanner(
+        tmp_path / "scans",
+        [_recognition("scan-a", "甲", 100), _recognition("scan-b", "乙", 200)],
+    )
+    adb = FakeBatchAdb([PNG_A, PNG_B])
+    detector = QueueDetector(
+        [
+            PageDetection("detail_summary", 0.99, ("CP100", "甲")),
+            PageDetection("detail_summary", 0.99, ("CP100", "甲15/14/13")),
+            PageDetection("detail_summary", 0.99, ("CP200", "乙")),
+            PageDetection("detail_summary", 0.99, ("CP200", "乙")),
+            PageDetection("detail_summary", 0.99, ("CP100", "甲")),
+        ]
+    )
+    destination = tmp_path / "renamed.csv"
+
+    result = BatchScanService(adb, scanner, detector).scan(
+        limit=2,
+        csv_path=destination,
+        debug=True,
+        resume=False,
+        delay_seconds=0,
+        rename_with_iv=True,
+    )
+
+    assert result.stop_reason == "limit_reached"
+    assert scanner.calls == [(True, "ABC", True), (True, "ABC", True)]
+    assert adb.swipes == [(1180, 1500, 260, 1500, 600)]
+    with destination.open(encoding="utf-8", newline="") as source:
+        rows = list(csv.DictReader(source))
+    assert [row["nickname_after"] for row in rows] == [
+        "甲15/14/13",
+        "乙15/14/13",
+    ]
+    assert [row["rename_status"] for row in rows] == ["verified", "verified"]
+
+
+def test_renamed_batch_wraps_on_exact_wide_nickname_and_immutable_identity(
+    tmp_path: Path,
+) -> None:
+    scanner = FakeScanner(
+        tmp_path / "scans",
+        [_recognition("scan-a", "甲", 100), _recognition("scan-b", "乙", 200)],
+    )
+    adb = FakeBatchAdb([PNG_A, PNG_B, PNG_B, PNG_A])
+    expected_first = "甲15/14/13"
+    detector = QueueDetector(
+        [
+            PageDetection("detail_summary", 0.99, ("CP100", "甲")),
+            PageDetection("detail_summary", 0.99, ("CP100", expected_first)),
+            PageDetection("detail_summary", 0.99, ("CP200", "乙")),
+            PageDetection("detail_summary", 0.99, ("CP200", "乙")),
+            PageDetection("detail_summary", 0.99, ("CP100", "甲")),
+            PageDetection("detail_summary", 0.99, ("CP200", "乙15/14/13")),
+            PageDetection("detail_summary", 0.99, ("CP100", "不同OCR碎片")),
+        ],
+        summary_nicknames=["乙", expected_first],
+    )
+
+    result = BatchScanService(adb, scanner, detector).scan(
+        limit=3,
+        csv_path=tmp_path / "renamed-wrap.csv",
+        debug=True,
+        resume=False,
+        delay_seconds=0,
+        rename_with_iv=True,
+    )
+
+    assert result.stop_reason == "wrapped_to_first"
+    assert len(result.rows) == 2
+    assert scanner.calls == [(True, "ABC", True), (True, "ABC", True)]
+    assert adb.swipes == [
+        (1180, 1500, 260, 1500, 600),
+        (1180, 1500, 260, 1500, 600),
+    ]
+    wrap_state = json.loads(
+        (
+            tmp_path
+            / "scans"
+            / "scan-b"
+            / "debug"
+            / "batch"
+            / "wrap_comparison_state.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert wrap_state["observed_nickname"] == expected_first
+    assert wrap_state["wrapped_to_first"] is True
+
+
+def test_failed_expected_rename_transition_appends_nothing_and_sends_no_swipe(
+    tmp_path: Path,
+) -> None:
+    scanner = BadTransitionScanner(
+        tmp_path / "scans",
+        [_recognition("scan-a", "甲", 100)],
+    )
+    adb = FakeBatchAdb([])
+    detector = QueueDetector(
+        [PageDetection("detail_summary", 0.99, ("CP100", "甲"))]
+    )
+    destination = tmp_path / "rejected.csv"
+
+    with pytest.raises(BatchAutomationError, match="Expected nickname transition failed"):
+        BatchScanService(adb, scanner, detector).scan(
+            limit=1,
+            csv_path=destination,
+            debug=True,
+            resume=False,
+            delay_seconds=0,
+            rename_with_iv=True,
+        )
+
+    assert not destination.exists()
+    assert adb.swipes == []
 
 
 def test_switch_retries_once_when_name_and_cp_stay_the_same(tmp_path: Path) -> None:
@@ -260,6 +473,9 @@ class SummaryFirstDetector:
             return PageDetection("detail_summary", 0.95, ("CP431", "睡睡菇"))
         return PageDetection("appraisal_bars", 1.0)
 
+    def read_summary_nickname(self, png_bytes: bytes) -> str:
+        return "睡睡菇"
+
 
 def test_switch_detection_prioritizes_summary_over_iv_false_positive(
     tmp_path: Path,
@@ -295,6 +511,71 @@ def test_switch_identity_accepts_static_fingerprint_change() -> None:
 
     assert _same_switch_identity(unchanged, previous, config)
     assert not _same_switch_identity(changed, previous, config)
+    assert not _same_switch_identity(
+        SummaryIdentity("expected-new-name", 100, "0" * 64),
+        previous,
+        config,
+    )
+
+
+def test_expected_nickname_transition_is_separate_and_keeps_identity_strict() -> None:
+    before = SummaryIdentity("original", 100, "0" * 64, "50/50HP")
+    after = SummaryIdentity("14", 100, "0" * 64, "50/50HP")
+    transition = ExpectedNicknameTransition(
+        before=before,
+        after=after,
+        expected_nickname="測試15/14/13",
+        editor_observed_nickname="測試15/14/13",
+        summary_observed_nickname="測試151413",
+    )
+
+    assert matches_expected_nickname_transition(transition)
+    assert not matches_expected_nickname_transition(
+        replace(transition, editor_observed_nickname="測試15/14/12")
+    )
+    assert not matches_expected_nickname_transition(
+        replace(
+            transition,
+            editor_observed_nickname="測試\uff11\uff15\uff0f\uff11\uff14\uff0f\uff11\uff13",
+        )
+    )
+    assert not matches_expected_nickname_transition(
+        replace(transition, summary_observed_nickname="測試15113")
+    )
+    assert not matches_expected_nickname_transition(
+        replace(transition, after=replace(after, cp=101))
+    )
+    assert not matches_expected_nickname_transition(
+        replace(transition, after=replace(after, hp_text="49/50HP"))
+    )
+    assert not matches_expected_nickname_transition(
+        replace(transition, after=replace(after, page_fingerprint="f" * 64))
+    )
+
+
+def test_verified_renamed_identity_ignores_only_unstable_generic_name_ocr() -> None:
+    baseline = SummaryIdentity("2", 175, "0" * 64, "68/68HP")
+    current = SummaryIdentity("5", 175, "0" * 64, "68/68HP")
+
+    assert not _same_switch_identity(current, baseline, HuaweiMate30BatchConfig())
+    assert matches_verified_renamed_identity(
+        current,
+        baseline,
+        expected_nickname="飄飄球12/2/5",
+        observed_nickname="飄飄球1225",
+    )
+    assert not matches_verified_renamed_identity(
+        current,
+        baseline,
+        expected_nickname="飄飄球12/2/5",
+        observed_nickname="飄飄球125",
+    )
+    assert not matches_verified_renamed_identity(
+        replace(current, cp=176),
+        baseline,
+        expected_nickname="飄飄球12/2/5",
+        observed_nickname="飄飄球1225",
+    )
 
 
 def _seed_resume_csv(tmp_path: Path, destination: Path) -> None:
@@ -313,6 +594,72 @@ def _seed_resume_csv(tmp_path: Path, destination: Path) -> None:
         resume=False,
         delay_seconds=0,
     )
+
+
+def _seed_renamed_resume_csv(tmp_path: Path, destination: Path) -> None:
+    service = BatchScanService(
+        FakeBatchAdb([]),
+        FakeScanner(
+            tmp_path / "renamed-scans",
+            [_recognition("scan-renamed-last", "睡睡菇", 431)],
+        ),
+        QueueDetector([PageDetection("detail_summary", 0.99, ("CP431", "睡睡菇"))]),
+    )
+    service.scan(
+        limit=1,
+        csv_path=destination,
+        debug=False,
+        resume=False,
+        delay_seconds=0,
+        rename_with_iv=True,
+    )
+
+
+def test_legacy_batch_header_remains_resumable_without_rename(tmp_path: Path) -> None:
+    destination = tmp_path / "legacy-batch.csv"
+    _seed_resume_csv(tmp_path, destination)
+    with destination.open(encoding="utf-8", newline="") as source:
+        current_row = next(csv.DictReader(source))
+    with destination.open("w", encoding="utf-8", newline="") as target:
+        writer = csv.DictWriter(target, fieldnames=LEGACY_BATCH_CSV_COLUMNS)
+        writer.writeheader()
+        writer.writerow(
+            {column: current_row[column] for column in LEGACY_BATCH_CSV_COLUMNS}
+        )
+
+    result = BatchScanService(
+        FakeBatchAdb([]),
+        FakeScanner(tmp_path / "scans", []),
+        QueueDetector([]),
+    ).scan(
+        limit=1,
+        csv_path=destination,
+        debug=False,
+        resume=True,
+        delay_seconds=0,
+    )
+
+    assert result.stop_reason == "limit_reached"
+    assert tuple(current_row) == BATCH_CSV_COLUMNS
+
+
+def test_resume_rejects_changing_batch_rename_mode(tmp_path: Path) -> None:
+    destination = tmp_path / "rename-mode.csv"
+    _seed_renamed_resume_csv(tmp_path, destination)
+
+    with pytest.raises(BatchAutomationError, match="same --rename-with-iv setting"):
+        BatchScanService(
+            FakeBatchAdb([]),
+            FakeScanner(tmp_path / "renamed-scans", []),
+            QueueDetector([]),
+        ).scan(
+            limit=1,
+            csv_path=destination,
+            debug=False,
+            resume=True,
+            delay_seconds=0,
+            rename_with_iv=False,
+        )
 
 
 def test_resume_switches_before_scanning_when_current_is_last_row(
@@ -346,7 +693,7 @@ def test_resume_switches_before_scanning_when_current_is_last_row(
     )
 
     assert result.stop_reason == "limit_reached"
-    assert scanner.calls == [(True, "ABC")]
+    assert scanner.calls == [(True, "ABC", False)]
     assert adb.swipes == [(1180, 1500, 260, 1500, 600)]
     assert all(x1 > x2 for x1, _, x2, _, _ in adb.swipes)
     with destination.open(encoding="utf-8", newline="") as source:
@@ -395,11 +742,84 @@ def test_resume_does_not_switch_when_current_is_already_next(
 
     assert result.stop_reason == "limit_reached"
     assert adb.swipes == []
-    assert scanner.calls == [(True, "ABC")]
+    assert scanner.calls == [(True, "ABC", False)]
     state_path = tmp_path / "scans" / "scan-last" / "debug" / "batch" / "resume_state.json"
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["same_as_last"] is False
     assert state["resume_pre_switch_executed"] is False
+
+
+def test_renamed_resume_switches_only_after_expected_nickname_matches(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "resume-renamed.csv"
+    _seed_renamed_resume_csv(tmp_path, destination)
+    adb = FakeBatchAdb([PNG_B, PNG_B, PNG_A])
+    scanner = FakeScanner(
+        tmp_path / "renamed-scans",
+        [_recognition("scan-next", "下一隻", 100)],
+    )
+    expected = "睡睡菇15/14/13"
+    detector = QueueDetector(
+        [
+            PageDetection("detail_summary", 0.99, ("CP431", "睡睡菇")),
+            PageDetection("detail_summary", 0.99, ("CP431", expected)),
+            PageDetection("detail_summary", 0.99, ("CP431", expected)),
+            PageDetection("detail_summary", 0.99, ("CP431", "睡睡菇")),
+            PageDetection("detail_summary", 0.99, ("CP431", expected)),
+            PageDetection("detail_summary", 0.99, ("CP431", expected)),
+            PageDetection("detail_summary", 0.99, ("CP100", "下一隻")),
+            PageDetection("detail_summary", 0.99, ("CP100", "下一隻")),
+            PageDetection("detail_summary", 0.99, ("CP431", "睡睡菇")),
+        ],
+        summary_nickname=expected,
+    )
+
+    result = BatchScanService(adb, scanner, detector).scan(
+        limit=2,
+        csv_path=destination,
+        debug=True,
+        resume=True,
+        delay_seconds=0,
+        rename_with_iv=True,
+    )
+
+    assert result.stop_reason == "limit_reached"
+    assert adb.swipes == [(1180, 1500, 260, 1500, 600)]
+    assert scanner.calls == [(True, "ABC", True)]
+
+
+def test_renamed_resume_ambiguous_nickname_stops_without_input(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "resume-renamed-ambiguous.csv"
+    _seed_renamed_resume_csv(tmp_path, destination)
+    adb = FakeBatchAdb([PNG_B])
+    scanner = FakeScanner(tmp_path / "renamed-scans", [])
+    expected = "睡睡菇15/14/13"
+    detector = QueueDetector(
+        [
+            PageDetection("detail_summary", 0.99, ("CP431", "睡睡菇")),
+            PageDetection("detail_summary", 0.99, ("CP431", expected)),
+            PageDetection("detail_summary", 0.99, ("CP431", "意外暱稱")),
+            PageDetection("detail_summary", 0.99, ("CP431", "睡睡菇")),
+            PageDetection("detail_summary", 0.99, ("CP431", expected)),
+        ],
+        summary_nicknames=[expected, expected, "意外暱稱"],
+    )
+
+    with pytest.raises(BatchAutomationError, match="state is ambiguous"):
+        BatchScanService(adb, scanner, detector).scan(
+            limit=2,
+            csv_path=destination,
+            debug=True,
+            resume=True,
+            delay_seconds=0,
+            rename_with_iv=True,
+        )
+
+    assert adb.swipes == []
+    assert scanner.calls == []
 
 
 def test_adjacent_duplicate_guard_refuses_csv_append(tmp_path: Path) -> None:

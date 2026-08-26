@@ -287,6 +287,13 @@ def scan_auto_one(
             help="Detect the initial page and print the plan without ADB input.",
         ),
     ] = False,
+    rename_with_iv: Annotated[
+        bool,
+        typer.Option(
+            "--rename-with-iv",
+            help="Reset the nickname to the default Chinese name, then append recognized IVs.",
+        ),
+    ] = False,
     serial_number: Annotated[
         str | None,
         typer.Option("--serial", "-s", help="ADB serial number to select."),
@@ -317,7 +324,7 @@ def scan_auto_one(
     if dry_run:
         typer.echo("DRY RUN: no ADB tap, swipe, or BACK command will be sent.")
         typer.echo("Planned Huawei Mate 30 coordinates:")
-        for action in planned_actions():
+        for action in planned_actions(rename_with_iv=rename_with_iv):
             typer.echo(f"- {action['name']} ({action['kind']}): {action['coordinates']}")
 
     try:
@@ -332,6 +339,7 @@ def scan_auto_one(
         ).scan_one(
             debug=debug,
             dry_run=dry_run,
+            rename_with_iv=rename_with_iv,
             serial_number=serial_number,
             notes=notes,
         )
@@ -367,6 +375,13 @@ def scan_batch(
         bool,
         typer.Option("--debug", help="Keep per-scan automation and switch evidence."),
     ] = False,
+    rename_with_iv: Annotated[
+        bool,
+        typer.Option(
+            "--rename-with-iv",
+            help="Reset each nickname to the default Chinese name and append recognized IVs.",
+        ),
+    ] = False,
     resume: Annotated[
         bool,
         typer.Option("--resume", help="Validate and continue an existing batch CSV."),
@@ -400,6 +415,7 @@ def scan_batch(
             debug=debug,
             resume=resume,
             delay_seconds=delay_seconds,
+            rename_with_iv=rename_with_iv,
         )
     except KeyboardInterrupt:
         typer.echo(

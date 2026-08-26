@@ -49,6 +49,13 @@ def test_root_help_includes_scan_one() -> None:
     assert "scan-batch" in result.stdout
 
 
+def test_scan_batch_help_exposes_opt_in_rename() -> None:
+    result = runner.invoke(cli.app, ["scan-batch", "--help"])
+
+    assert result.exit_code == 0
+    assert "--rename-with-iv" in result.stdout
+
+
 def test_scan_one_requires_guided_flag() -> None:
     result = runner.invoke(
         cli.app,

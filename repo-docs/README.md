@@ -67,8 +67,31 @@ Exact source and test links live in the
   atomic replacement, subject to the local filesystem's replacement guarantees.
 - PNG and JSON are separate writes. A local failure during the JSON write can
   leave the PNG without its sidecar.
-- Automatic and batch input remain limited to one fixed Huawei layout. Transfer,
-  power-up/evolution/rename/unlock/battle actions, account/private API access,
+- Automatic input remains limited to one fixed Huawei layout. `--rename-with-iv`
+  on `scan-auto-one` or `scan-batch` is the sole opt-in mutation: it resets the
+  nickname to the game's default Chinese species name, then appends recognized
+  IVs. Its first live run stopped safely because the original pencil coordinate
+  missed the real control. The current flow no longer targets the pencil: after
+  confirming `detail_summary`, both rename passes tap the fixed center of the
+  nickname row at `(720,1460)` and then require an OCR-confirmed keyboard/dialog
+  state before any delete or text input. The
+  flow OCR-clicks the input method's right-side confirmation before the real
+  dialog `OK`, and sends the complete ASCII IV suffix through the existing ADB
+  `input text` wrapper. Editor OCR is compared without NFKC width folding, so an
+  input method result such as `１２／２／５` cannot pass as `12/2/5`; the flow
+  stops before either confirmation if the requested half-width text is not
+  visible. Live scan `20260826_102152_537806_e166da7687744511bd0c9ef7d8534f99`
+  confirmed that the active Gboard Pinyin layout also converts the `/` characters
+  from `input text` to `／`; the guard stopped before both confirmation taps.
+  Operators must manually switch Gboard to English before enabling rename mode;
+  the program deliberately does not change or restore the user's keyboard layout.
+  Batch mode additionally requires that width-sensitive editor evidence,
+  a wide final-name ROI, unchanged CP/HP/static fingerprint, and durable rename
+  evidence before a row or switch. The first live batch rename saved the
+  correct `飄飄球12/2/5` but the original wide crop omitted the middle `2` during
+  OCR, so it correctly wrote no row and sent no left swipe; the tighter
+  nickname-row crop replays both failed screenshots exactly. Transfer,
+  power-up/evolution/unlock/battle actions, account/private API access,
   traffic inspection, and credentials remain outside.
 - A physical one-scan run completed. The first batch attempt safely stopped before
   input on a black screen; two-Pokémon switching still needs the prepared phone.

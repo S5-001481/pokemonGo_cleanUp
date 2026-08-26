@@ -9,7 +9,7 @@ import math
 import re
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Final, Literal, Protocol
@@ -41,6 +41,8 @@ PageState = Literal[
     "action_menu",
     "appraisal_dialogue",
     "appraisal_bars",
+    "rename_keyboard",
+    "rename_dialog",
     "unknown",
 ]
 ExpectedStates = tuple[PageState, ...]
@@ -55,8 +57,6 @@ _MOVE_PAGE_LABELS: Final = (
     "新攻撃招式",
 )
 _MOVE_EVIDENCE_MIN_CONFIDENCE: Final = 0.80
-
-
 @dataclass(frozen=True, slots=True)
 class Point:
     """One fixed Huawei screen coordinate."""
@@ -83,10 +83,14 @@ class HuaweiMate30AutomationConfig:
     scroll_to_moves: Swipe = Swipe(Point(720, 2380), Point(720, 930), 650)
     menu_button: Point = Point(1244, 2772)
     appraisal_advance: Point = Point(1120, 1660)
+    nickname_edit: Point = Point(720, 1460)
     action_menu_rect: tuple[int, int, int, int] = (160, 1150, 1320, 2860)
     appraisal_target_rect: tuple[int, int, int, int] = (160, 1450, 1320, 2700)
     transfer_forbidden_rect: tuple[int, int, int, int] = (0, 2700, 1440, 3120)
     appraisal_dialogue_rect: tuple[int, int, int, int] = (100, 1250, 1340, 2860)
+    rename_dialog_rect: tuple[int, int, int, int] = (100, 700, 1340, 2200)
+    nickname_input_rect: tuple[int, int, int, int] = (150, 1250, 1290, 1500)
+    nickname_summary_rect: tuple[int, int, int, int] = (150, 1300, 1290, 1550)
     menu_ocr_min_confidence: float = 0.85
     transfer_clearance_pixels: int = 150
     stable_interval_seconds: float = 0.3
@@ -101,6 +105,9 @@ class HuaweiMate30AutomationConfig:
     moves_poll_interval_seconds: float = 0.5
     moves_wait_timeout_seconds: float = 15.0
     max_moves_swipe_attempts: int = 2
+    rename_poll_interval_seconds: float = 0.5
+    rename_wait_timeout_seconds: float = 10.0
+    nickname_maximum_characters: int = 32
     total_timeout_seconds: float = 180.0
 
 
@@ -115,7 +122,10 @@ class PageDetection:
     confidence: float
     matched_texts: tuple[str, ...] = ()
     appraisal_target: Point | None = None
+    rename_keyboard_target: Point | None = None
+    rename_confirm_target: Point | None = None
     details: dict[str, object] = field(default_factory=dict)
+    nickname_edit_target: Point | None = None
 
     def to_json_data(self) -> dict[str, object]:
         return {
@@ -124,6 +134,21 @@ class PageDetection:
             "matched_texts": list(self.matched_texts),
             "appraisal_target": (
                 asdict(self.appraisal_target) if self.appraisal_target is not None else None
+            ),
+            "rename_keyboard_target": (
+                asdict(self.rename_keyboard_target)
+                if self.rename_keyboard_target is not None
+                else None
+            ),
+            "rename_confirm_target": (
+                asdict(self.rename_confirm_target)
+                if self.rename_confirm_target is not None
+                else None
+            ),
+            "nickname_edit_target": (
+                asdict(self.nickname_edit_target)
+                if self.nickname_edit_target is not None
+                else None
             ),
             "details": self.details,
         }
@@ -196,6 +221,20 @@ class AutoScanResult:
     recognition: RecognitionResult | None
     dry_run: bool
     planned_actions: tuple[dict[str, object], ...]
+    nickname_change: NicknameRenameResult | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class NicknameRenameResult:
+    """Verified nickname mutation evidence returned to the batch layer."""
+
+    nickname_before: str
+    default_nickname: str
+    expected_nickname: str
+    editor_observed_nickname: str
+    summary_observed_nickname: str
+    summary_png: bytes
+    summary_detection: PageDetection
 
 
 class AutomationAdbGateway(Protocol):
@@ -215,6 +254,8 @@ class AutomationAdbGateway(Protocol):
         duration_ms: int,
     ) -> None: ...
     def press_back(self, serial_number: str) -> None: ...
+    def press_key(self, serial_number: str, keycode: int) -> None: ...
+    def input_text(self, serial_number: str, value: str) -> None: ...
 
 
 class PageDetector(Protocol):
@@ -226,6 +267,8 @@ class PageDetector(Protocol):
         *,
         expected: ExpectedStates,
     ) -> PageDetection: ...
+
+    def read_summary_nickname(self, png_bytes: bytes) -> str: ...
 
 
 class ScanReader(Protocol):
@@ -260,12 +303,38 @@ def appraisal_target_is_safe(
     )
 
 
+def nickname_text_skeleton(value: str) -> str:
+    """Return OCR-comparable nickname text while ignoring rendered slash loss."""
+
+    return normalize_ocr_text(value).replace(" ", "").replace("/", "")
+
+
+def compact_editor_nickname_text(value: str) -> str:
+    """Remove OCR whitespace without folding full-width characters to ASCII."""
+
+    return re.sub(r"\s+", "", value)
+
+
+def _summary_name_from_detection(detection: PageDetection) -> str:
+    for raw in detection.matched_texts:
+        if normalize_cp_candidate(raw) is not None:
+            continue
+        normalized = normalize_ocr_text(raw).replace(" ", "")
+        if normalized:
+            return normalized
+    raise AutomationError(
+        "Default nickname could not be read after resetting it; no IV suffix was sent."
+    )
+
+
 def planned_actions(
     config: HuaweiMate30AutomationConfig = HUAWEI_MATE_30_AUTOMATION,
+    *,
+    rename_with_iv: bool = False,
 ) -> tuple[dict[str, object], ...]:
     """Return the exact fixed plan printed by dry-run."""
 
-    return (
+    actions: tuple[dict[str, object], ...] = (
         {"name": "scroll_to_moves", "kind": "swipe", "coordinates": asdict(config.scroll_to_moves)},
         {
             "name": "open_action_menu",
@@ -290,6 +359,24 @@ def planned_actions(
             "coordinates": {"x": 720, "y": 1560},
         },
     )
+    if not rename_with_iv:
+        return actions
+    return (*actions, {
+        "name": "reset_nickname_to_default_chinese_name",
+        "kind": "tap/keyevent/OCR-confirmed-tap",
+        "coordinates": {
+            "edit": asdict(config.nickname_edit),
+            "confirm": "OCR center of 確定, 完成, or OK; no fixed fallback",
+        },
+    }, {
+        "name": "append_iv_to_default_nickname",
+        "kind": "tap/keyevent/text/OCR-confirmed-tap",
+        "coordinates": {
+            "edit": asdict(config.nickname_edit),
+            "text": "attack_iv/defense_iv/hp_iv",
+            "confirm": "OCR center of 確定, 完成, or OK; no fixed fallback",
+        },
+    })
 
 
 def _thumbnail(png_bytes: bytes) -> Image.Image:
@@ -408,6 +495,11 @@ class HuaweiMate30PageDetector:
                         "move_section_anchor": anchor_found,
                     },
                 )
+
+        if "rename_dialog" in expected_set or "rename_keyboard" in expected_set:
+            rename_detection = self._detect_rename_dialog(image)
+            if rename_detection is not None:
+                return rename_detection
 
         if "detail_summary" in expected_set:
             cp_candidates, _ = self._reader._ocr_cp_variants(image)
@@ -532,6 +624,20 @@ class HuaweiMate30PageDetector:
             )
         return image
 
+    def read_summary_nickname(self, png_bytes: bytes) -> str:
+        """Read a wide name row without changing generic page-identity OCR."""
+
+        image = self._decode(png_bytes)
+        candidates = tuple(
+            candidate
+            for candidate in self._ocr_rectangle(image, self._config.nickname_summary_rect)
+            if (candidate.box[1] + candidate.box[3]) // 2 <= 1500
+        )
+        return "".join(
+            normalize_ocr_text(candidate.raw).replace(" ", "")
+            for candidate in sorted(candidates, key=lambda candidate: candidate.box[0])
+        )
+
     def _ocr_rectangle(
         self,
         image: object,
@@ -587,6 +693,86 @@ class HuaweiMate30PageDetector:
                 "transfer_centers": [asdict(item) for item in transfer_targets],
             },
         )
+
+    def _detect_rename_dialog(self, image: object) -> PageDetection | None:
+        candidates = self._ocr_rectangle(image, self._config.rename_dialog_rect)
+        input_left, input_top, input_right, input_bottom = self._config.nickname_input_rect
+        nickname_candidates = tuple(
+            compact_editor_nickname_text(candidate.raw)
+            for candidate in candidates
+            if input_left <= (candidate.box[0] + candidate.box[2]) // 2 <= input_right
+            and input_top <= (candidate.box[1] + candidate.box[3]) // 2 <= input_bottom
+        )
+        nickname_details: dict[str, object] = {
+            "nickname_text_candidates": list(nickname_candidates)
+        }
+        normalized = tuple(
+            (candidate, normalize_ocr_text(candidate.raw).replace(" ", "").upper())
+            for candidate in candidates
+        )
+        confirm_candidates = tuple(
+            candidate
+            for candidate, value in normalized
+            if value in ("確定", "确定", "完成", "OK")
+            and candidate.confidence >= self._config.menu_ocr_min_confidence
+        )
+        has_cancel = any(value in ("取消", "CANCEL") for _, value in normalized)
+        if confirm_candidates and has_cancel:
+            confirm = max(confirm_candidates, key=lambda candidate: candidate.confidence)
+            return PageDetection(
+                state="rename_dialog",
+                confidence=confirm.confidence,
+                matched_texts=tuple(candidate.raw for candidate in candidates),
+                rename_confirm_target=Point(
+                    x=(confirm.box[0] + confirm.box[2]) // 2,
+                    y=(confirm.box[1] + confirm.box[3]) // 2,
+                ),
+                details=nickname_details,
+            )
+
+        title_candidates = tuple(
+            candidate
+            for candidate, value in normalized
+            if value in ("設定暱稱", "設定暱称", "设定昵称")
+            and candidate.confidence >= self._config.menu_ocr_min_confidence
+        )
+        keyboard_hits = tuple(
+            candidate
+            for candidate, value in normalized
+            if candidate.box[1] >= 1800
+            and (
+                value in ("GIF", "拼音", "?123")
+                or re.fullmatch(r"[A-Z0-9]", value) is not None
+            )
+            and candidate.confidence >= 0.80
+        )
+        keyboard_confirm_candidates = tuple(
+            candidate
+            for candidate, value in normalized
+            if value in ("確定", "确定", "完成", "OK")
+            and (candidate.box[0] + candidate.box[2]) // 2 >= 1000
+            and candidate.confidence >= self._config.menu_ocr_min_confidence
+        )
+        if title_candidates and keyboard_confirm_candidates:
+            title = max(title_candidates, key=lambda candidate: candidate.confidence)
+            keyboard_confirm = max(
+                keyboard_confirm_candidates,
+                key=lambda candidate: candidate.confidence,
+            )
+            return PageDetection(
+                state="rename_keyboard",
+                confidence=title.confidence,
+                matched_texts=tuple(candidate.raw for candidate in candidates),
+                rename_keyboard_target=Point(
+                    x=(keyboard_confirm.box[0] + keyboard_confirm.box[2]) // 2,
+                    y=(keyboard_confirm.box[1] + keyboard_confirm.box[3]) // 2,
+                ),
+                details={
+                    **nickname_details,
+                    "keyboard_evidence_count": len(keyboard_hits),
+                },
+            )
+        return None
 
 
 class _DebugRecorder:
@@ -766,6 +952,7 @@ class AutoScanService:
         *,
         debug: bool = False,
         dry_run: bool = False,
+        rename_with_iv: bool = False,
         serial_number: str | None = None,
         notes: str | None = None,
     ) -> AutoScanResult:
@@ -811,7 +998,7 @@ class AutoScanService:
             manifest=manifest,
             recorder=_DebugRecorder(scan_directory, debug),
         )
-        actions = planned_actions(self._automation)
+        actions = planned_actions(self._automation, rename_with_iv=rename_with_iv)
         session.recorder.write_plan(actions)
         deadline = self._monotonic() + self._automation.total_timeout_seconds
         try:
@@ -822,6 +1009,7 @@ class AutoScanService:
                 actions,
                 debug=debug,
                 dry_run=dry_run,
+                rename_with_iv=rename_with_iv,
             )
         except KeyboardInterrupt:
             self._mark_incomplete_after_interrupt(session)
@@ -842,6 +1030,7 @@ class AutoScanService:
         *,
         debug: bool,
         dry_run: bool,
+        rename_with_iv: bool,
     ) -> AutoScanResult:
         session.current_step = "verify_detail_summary"
         initial = self._adb.capture_screen(serial)
@@ -984,6 +1173,16 @@ class AutoScanService:
         self._check_deadline(deadline)
         session.current_step = "recognize_scan"
         recognition = self._reader.read_scan(session.scan_directory, debug=debug)
+        nickname_change: NicknameRenameResult | None = None
+        if rename_with_iv:
+            self._check_deadline(deadline)
+            session.current_step = "rename_with_iv"
+            nickname_change = self._rename_with_iv(
+                session,
+                serial,
+                recognition,
+                deadline,
+            )
         session.manifest = session.manifest.model_copy(
             update={"scan_status": "complete", "failed_step": None}
         )
@@ -995,7 +1194,363 @@ class AutoScanService:
                 "scan_directory": str(session.scan_directory.resolve()),
             },
         )
-        return self._result(session, recognition, False, actions)
+        return self._result(
+            session,
+            recognition,
+            False,
+            actions,
+            nickname_change=nickname_change,
+        )
+
+    def _rename_with_iv(
+        self,
+        session: _Session,
+        serial: str,
+        recognition: RecognitionResult,
+        deadline: float,
+    ) -> NicknameRenameResult:
+        """Restore the game-provided Chinese name, then append recognized IVs."""
+
+        values = (recognition.attack_iv, recognition.defense_iv, recognition.hp_iv)
+        if any(value is None for value in values):
+            raise AutomationError(
+                "Cannot rename with IV because attack, defense, or HP IV was not recognized."
+            )
+        iv_suffix = "/".join(str(value) for value in values)
+        if re.fullmatch(r"(?:[0-9]|1[0-5])/(?:[0-9]|1[0-5])/(?:[0-9]|1[0-5])", iv_suffix) is None:
+            raise AutomationError("IV suffix was not a valid half-width ASCII value.")
+        editor = self._open_nickname_editor(
+            session, serial, deadline, "open_nickname_editor_reset"
+        )
+        self._clear_nickname(
+            session, serial, "clear_nickname_for_default", editor.state
+        )
+        default_summary = self._confirm_nickname_editor(
+            session,
+            serial,
+            deadline,
+            "confirm_default_nickname",
+        )
+        default_nickname = _summary_name_from_detection(default_summary.detection)
+        expected_nickname = f"{default_nickname}{iv_suffix}"
+        editor = self._open_nickname_editor(
+            session, serial, deadline, "open_nickname_editor_append_iv"
+        )
+        self._append_nickname_text(
+            session, serial, iv_suffix, "append_iv_suffix", editor.state
+        )
+        renamed_summary = self._confirm_nickname_editor(
+            session,
+            serial,
+            deadline,
+            "confirm_iv_nickname",
+            expected_nickname=expected_nickname,
+        )
+        atomic_write_bytes(
+            session.scan_directory / "renamed_summary.png",
+            renamed_summary.png_bytes,
+        )
+        summary_observed = self._detector.read_summary_nickname(renamed_summary.png_bytes)
+        if nickname_text_skeleton(summary_observed) != nickname_text_skeleton(
+            expected_nickname
+        ):
+            raise AutomationError(
+                "The renamed summary did not show the expected nickname characters. "
+                "No further input was sent."
+            )
+        editor_candidates = renamed_summary.detection.details.get(
+            "verified_editor_nickname_candidates"
+        )
+        editor_observed: str | None = None
+        if isinstance(editor_candidates, list):
+            editor_observed = next(
+                (
+                    value
+                    for value in editor_candidates
+                    if isinstance(value, str)
+                    and compact_editor_nickname_text(value) == expected_nickname
+                ),
+                None,
+            )
+        if editor_observed is None:
+            raise AutomationError(
+                "Verified editor nickname evidence was lost before persistence."
+            )
+        evidence = NicknameRenameResult(
+            nickname_before=recognition.pokemon_name.value or "",
+            default_nickname=default_nickname,
+            expected_nickname=expected_nickname,
+            editor_observed_nickname=editor_observed,
+            summary_observed_nickname=summary_observed,
+            summary_png=renamed_summary.png_bytes,
+            summary_detection=renamed_summary.detection,
+        )
+        atomic_write_text(
+            session.scan_directory / "nickname_change.json",
+            json.dumps(
+                {
+                    "nickname_before": evidence.nickname_before,
+                    "default_nickname": evidence.default_nickname,
+                    "nickname_after": evidence.expected_nickname,
+                    "editor_observed_nickname": evidence.editor_observed_nickname,
+                    "summary_observed_nickname": evidence.summary_observed_nickname,
+                    "summary_filename": "renamed_summary.png",
+                    "status": "verified",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+        )
+        return evidence
+
+    def _open_nickname_editor(
+        self,
+        session: _Session,
+        serial: str,
+        deadline: float,
+        label: str,
+    ) -> PageDetection:
+        self._check_deadline(deadline)
+        screen = self._adb.capture_screen(serial)
+        detection = self._detect(session, f"{label}_before", screen, ("detail_summary",))
+        self._require_state(detection, ("detail_summary",))
+        target = self._automation.nickname_edit
+        detection = replace(detection, nickname_edit_target=target)
+        session.recorder.detection(f"{label}_target", detection)
+        session.recorder.screen(f"before_{label}", screen)
+        session.recorder.action(
+            name=label,
+            kind="tap",
+            coordinates=asdict(target),
+            executed=True,
+            before_state=detection.state,
+        )
+        self._adb.tap(
+            serial,
+            target.x,
+            target.y,
+        )
+        result = self._wait_for_rename_dialog(session, serial, label, deadline)
+        if result.outcome != "reached":
+            raise AutomationError(
+                "Nickname editor did not expose an OCR-confirmed editor state. "
+                "No text input was sent."
+            )
+        return result.detection
+
+    def _clear_nickname(
+        self,
+        session: _Session,
+        serial: str,
+        label: str,
+        before_state: PageState,
+    ) -> None:
+        session.recorder.action(
+            name=label,
+            kind="keyevent",
+            coordinates={
+                "end": 123,
+                "delete": 67,
+                "delete_count": self._automation.nickname_maximum_characters,
+            },
+            executed=True,
+            before_state=before_state,
+        )
+        self._adb.press_key(serial, 123)  # KEYCODE_MOVE_END
+        for _ in range(self._automation.nickname_maximum_characters):
+            self._adb.press_key(serial, 67)  # KEYCODE_DEL
+
+    def _append_nickname_text(
+        self,
+        session: _Session,
+        serial: str,
+        value: str,
+        label: str,
+        before_state: PageState,
+    ) -> None:
+        session.recorder.action(
+            name=label,
+            kind="text",
+            coordinates={"end": 123, "ascii_text": value},
+            executed=True,
+            before_state=before_state,
+        )
+        self._adb.press_key(serial, 123)  # Ensure the IVs become a suffix.
+        self._adb.input_text(serial, value)
+
+    def _confirm_nickname_editor(
+        self,
+        session: _Session,
+        serial: str,
+        deadline: float,
+        label: str,
+        *,
+        expected_nickname: str | None = None,
+    ) -> _StateWaitResult:
+        result = self._poll_for_state(
+            session,
+            serial,
+            f"{label}_ready",
+            target=("rename_keyboard", "rename_dialog"),
+            expected=("rename_keyboard", "rename_dialog", "unknown"),
+            deadline=deadline,
+        )
+        if result.outcome != "reached":
+            raise AutomationError("Nickname editor was not ready for confirmation.")
+        verified_candidates: list[str] = []
+        if expected_nickname is not None:
+            raw_candidates = result.detection.details.get("nickname_text_candidates")
+            candidates = (
+                raw_candidates
+                if isinstance(raw_candidates, list)
+                and all(isinstance(value, str) for value in raw_candidates)
+                else []
+            )
+            verified_candidates = [
+                value
+                for value in candidates
+                if compact_editor_nickname_text(value) == expected_nickname
+            ]
+            if not verified_candidates:
+                raise AutomationError(
+                    "Nickname editor text did not exactly match the expected IV nickname. "
+                    "The keyboard and dialog confirmations were not tapped."
+                )
+        if result.detection.state == "rename_keyboard":
+            self._dismiss_nickname_keyboard(session, serial, result.detection, label)
+            result = self._wait_for_visible_rename_dialog(session, serial, label, deadline)
+        detection = result.detection
+        self._require_state(detection, ("rename_dialog",))
+        target = detection.rename_confirm_target
+        if target is None:
+            raise AutomationError("Nickname editor has no OCR-confirmed confirmation target.")
+        session.recorder.screen(f"before_{label}", result.png_bytes)
+        session.recorder.action(
+            name=label,
+            kind="tap",
+            coordinates=asdict(target),
+            executed=True,
+            before_state=detection.state,
+        )
+        self._adb.tap(serial, target.x, target.y)
+        summary = self._wait_for_detail_summary(session, serial, label, deadline)
+        if verified_candidates:
+            summary.detection.details["verified_editor_nickname_candidates"] = list(
+                verified_candidates
+            )
+        return summary
+
+    def _dismiss_nickname_keyboard(
+        self,
+        session: _Session,
+        serial: str,
+        detection: PageDetection,
+        label: str,
+    ) -> None:
+        target = detection.rename_keyboard_target
+        if target is None:
+            raise AutomationError(
+                "Nickname keyboard has no OCR-confirmed right-side confirmation target."
+            )
+        session.recorder.action(
+            name=f"{label}_hide_keyboard",
+            kind="tap",
+            coordinates=asdict(target),
+            executed=True,
+            before_state="rename_keyboard",
+        )
+        self._adb.tap(serial, target.x, target.y)
+
+    def _wait_for_rename_dialog(
+        self,
+        session: _Session,
+        serial: str,
+        label: str,
+        deadline: float,
+    ) -> _StateWaitResult:
+        return self._poll_for_state(
+            session,
+            serial,
+            label,
+            target=("rename_keyboard", "rename_dialog"),
+            expected=("rename_keyboard", "rename_dialog", "detail_summary", "unknown"),
+            deadline=deadline,
+        )
+
+    def _wait_for_visible_rename_dialog(
+        self,
+        session: _Session,
+        serial: str,
+        label: str,
+        deadline: float,
+    ) -> _StateWaitResult:
+        return self._poll_for_state(
+            session,
+            serial,
+            f"{label}_keyboard_hidden",
+            target="rename_dialog",
+            expected=("rename_dialog", "rename_keyboard", "detail_summary", "unknown"),
+            deadline=deadline,
+        )
+
+    def _wait_for_detail_summary(
+        self,
+        session: _Session,
+        serial: str,
+        label: str,
+        deadline: float,
+    ) -> _StateWaitResult:
+        result = self._poll_for_state(
+            session,
+            serial,
+            label,
+            target="detail_summary",
+            expected=("detail_summary", "rename_dialog", "unknown"),
+            deadline=deadline,
+        )
+        if result.outcome != "reached":
+            raise AutomationError(
+                "Nickname confirmation did not return to detail_summary before timeout."
+            )
+        return result
+
+    def _poll_for_state(
+        self,
+        session: _Session,
+        serial: str,
+        label: str,
+        *,
+        target: PageState | tuple[PageState, ...],
+        expected: ExpectedStates,
+        deadline: float,
+    ) -> _StateWaitResult:
+        target_states = target if isinstance(target, tuple) else (target,)
+        interval = self._automation.rename_poll_interval_seconds
+        timeout = min(self._automation.rename_wait_timeout_seconds, deadline - self._monotonic())
+        if timeout <= 0:
+            self._check_deadline(deadline)
+        started = self._monotonic()
+        last_screen = self._adb.capture_screen(serial)
+        last_detection = self._detect(session, f"{label}_wait_00", last_screen, expected)
+        for sample_index in range(math.ceil(timeout / interval) + 1):
+            if last_detection.state in target_states:
+                return _StateWaitResult(
+                    last_screen,
+                    last_detection,
+                    "reached",
+                    self._monotonic() - started,
+                )
+            elapsed = self._monotonic() - started
+            if elapsed >= timeout:
+                break
+            self._sleeper(min(interval, timeout - elapsed))
+            last_screen = self._adb.capture_screen(serial)
+            last_detection = self._detect(
+                session, f"{label}_wait_{sample_index + 1:02d}", last_screen, expected
+            )
+            session.recorder.screen(f"{label}_wait_{sample_index + 1:02d}", last_screen)
+        return _StateWaitResult(last_screen, last_detection, "timeout", timeout)
 
     def _verify_detail_summary(
         self,
@@ -1787,6 +2342,8 @@ class AutoScanService:
         recognition: RecognitionResult | None,
         dry_run: bool,
         actions: tuple[dict[str, object], ...],
+        *,
+        nickname_change: NicknameRenameResult | None = None,
     ) -> AutoScanResult:
         return AutoScanResult(
             scan_directory=session.scan_directory.resolve(),
@@ -1795,4 +2352,5 @@ class AutoScanService:
             recognition=recognition,
             dry_run=dry_run,
             planned_actions=actions,
+            nickname_change=nickname_change,
         )

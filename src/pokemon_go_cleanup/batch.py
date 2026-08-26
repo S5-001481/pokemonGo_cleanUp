@@ -19,9 +19,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pokemon_go_cleanup.automation import (
     AutoScanResult,
     ExpectedStates,
+    NicknameRenameResult,
     PageDetection,
     Point,
     Swipe,
+    compact_editor_nickname_text,
+    nickname_text_skeleton,
 )
 from pokemon_go_cleanup.exceptions import BatchAutomationError, LocalStorageError
 from pokemon_go_cleanup.models import Device, ScanManifest
@@ -34,7 +37,7 @@ from pokemon_go_cleanup.storage import atomic_write_bytes, atomic_write_text
 
 logger = logging.getLogger(__name__)
 
-BATCH_CSV_COLUMNS: Final = (
+LEGACY_BATCH_CSV_COLUMNS: Final = (
     "batch_index",
     "scan_id",
     "pokemon_name",
@@ -49,7 +52,14 @@ BATCH_CSV_COLUMNS: Final = (
     "warnings",
     "scan_directory",
 )
+BATCH_CSV_COLUMNS: Final = (
+    *LEGACY_BATCH_CSV_COLUMNS,
+    "nickname_before",
+    "nickname_after",
+    "rename_status",
+)
 BatchStopReason = Literal["limit_reached", "wrapped_to_first"]
+RenameStatus = Literal["not_requested", "verified"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +100,9 @@ class BatchCsvRow(BaseModel):
     hp_iv: int | None = Field(default=None, ge=0, le=15)
     warnings: str = ""
     scan_directory: Path
+    nickname_before: str | None = None
+    nickname_after: str | None = None
+    rename_status: RenameStatus = "not_requested"
 
     def to_csv_row(self) -> dict[str, object]:
         """Return values formatted for ``csv.DictWriter``."""
@@ -108,6 +121,9 @@ class BatchCsvRow(BaseModel):
             "hp_iv": "" if self.hp_iv is None else self.hp_iv,
             "warnings": self.warnings,
             "scan_directory": str(self.scan_directory),
+            "nickname_before": self.nickname_before or "",
+            "nickname_after": self.nickname_after or "",
+            "rename_status": self.rename_status,
         }
 
 
@@ -119,6 +135,50 @@ class SummaryIdentity:
     cp: int
     page_fingerprint: str
     hp_text: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ExpectedNicknameTransition:
+    """The only context allowed to accept an expected nickname mutation."""
+
+    before: SummaryIdentity
+    after: SummaryIdentity
+    expected_nickname: str
+    editor_observed_nickname: str
+    summary_observed_nickname: str
+
+
+def matches_expected_nickname_transition(
+    transition: ExpectedNicknameTransition,
+    config: HuaweiMate30BatchConfig = HUAWEI_MATE_30_BATCH,
+) -> bool:
+    """Require exact planned text while every non-name identity feature remains."""
+
+    expected = compact_editor_nickname_text(transition.expected_nickname)
+    editor_observed = compact_editor_nickname_text(
+        transition.editor_observed_nickname
+    )
+    if editor_observed != expected:
+        return False
+    if nickname_text_skeleton(transition.summary_observed_nickname) != (
+        nickname_text_skeleton(expected)
+    ):
+        return False
+    if transition.before.cp != transition.after.cp:
+        return False
+    if (
+        transition.before.hp_text is not None
+        and transition.after.hp_text is not None
+        and transition.before.hp_text != transition.after.hp_text
+    ):
+        return False
+    return (
+        fingerprint_distance(
+            transition.before.page_fingerprint,
+            transition.after.page_fingerprint,
+        )
+        <= config.duplicate_distance_threshold
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +224,7 @@ class SingleScanRunner(Protocol):
         *,
         debug: bool = False,
         dry_run: bool = False,
+        rename_with_iv: bool = False,
         serial_number: str | None = None,
         notes: str | None = None,
     ) -> AutoScanResult: ...
@@ -178,6 +239,8 @@ class BatchPageDetector(Protocol):
         *,
         expected: ExpectedStates,
     ) -> PageDetection: ...
+
+    def read_summary_nickname(self, png_bytes: bytes) -> str: ...
 
 
 def _static_summary_image(
@@ -262,6 +325,42 @@ def same_static_summary(
     )
 
 
+def _same_immutable_summary(
+    current: SummaryIdentity,
+    previous: SummaryIdentity,
+    config: HuaweiMate30BatchConfig,
+) -> bool:
+    """Detect an ambiguous renamed page without weakening general identity checks."""
+
+    if current.cp != previous.cp:
+        return False
+    if (
+        current.hp_text is not None
+        and previous.hp_text is not None
+        and current.hp_text != previous.hp_text
+    ):
+        return False
+    return (
+        fingerprint_distance(current.page_fingerprint, previous.page_fingerprint)
+        <= config.duplicate_distance_threshold
+    )
+
+
+def matches_verified_renamed_identity(
+    current: SummaryIdentity,
+    baseline: SummaryIdentity,
+    *,
+    expected_nickname: str,
+    observed_nickname: str,
+    config: HuaweiMate30BatchConfig = HUAWEI_MATE_30_BATCH,
+) -> bool:
+    """Match one verified renamed page without trusting generic long-name OCR."""
+
+    return nickname_text_skeleton(observed_nickname) == nickname_text_skeleton(
+        expected_nickname
+    ) and _same_immutable_summary(current, baseline, config)
+
+
 def summary_identity(
     detection: PageDetection,
     png_bytes: bytes,
@@ -329,8 +428,16 @@ def _optional_integer(value: str) -> int | None:
     return None if not normalized else int(normalized)
 
 
+def _rename_status(value: str | None) -> RenameStatus:
+    if value in (None, "", "not_requested"):
+        return "not_requested"
+    if value == "verified":
+        return "verified"
+    raise ValueError(f"unsupported rename_status: {value}")
+
+
 class _BatchCsvStore:
-    def __init__(self, path: Path, *, resume: bool) -> None:
+    def __init__(self, path: Path, *, resume: bool, rename_with_iv: bool) -> None:
         self.path = path.expanduser().resolve()
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -347,6 +454,12 @@ class _BatchCsvStore:
         if len(self._scan_ids) != len(self.rows):
             raise BatchAutomationError(
                 f"Batch CSV '{self.path}' contains duplicate scan_id values."
+            )
+        expected_status: RenameStatus = "verified" if rename_with_iv else "not_requested"
+        if self.rows and any(row.rename_status != expected_status for row in self.rows):
+            raise BatchAutomationError(
+                "Resume must use the same --rename-with-iv setting as every existing "
+                "row in the batch CSV."
             )
         if resume:
             self._validate_completed_rows()
@@ -365,7 +478,8 @@ class _BatchCsvStore:
         try:
             with self.path.open("r", encoding="utf-8-sig", newline="") as source:
                 reader = csv.DictReader(source)
-                if tuple(reader.fieldnames or ()) != BATCH_CSV_COLUMNS:
+                header = tuple(reader.fieldnames or ())
+                if header not in (LEGACY_BATCH_CSV_COLUMNS, BATCH_CSV_COLUMNS):
                     raise BatchAutomationError(
                         f"Batch CSV '{self.path}' has an incompatible header."
                     )
@@ -386,6 +500,11 @@ class _BatchCsvStore:
                             hp_iv=_optional_integer(raw["hp_iv"]),
                             warnings=raw["warnings"],
                             scan_directory=Path(raw["scan_directory"]),
+                            nickname_before=(
+                                raw.get("nickname_before") or raw["pokemon_name"] or None
+                            ),
+                            nickname_after=raw.get("nickname_after") or None,
+                            rename_status=_rename_status(raw.get("rename_status")),
                         )
                     )
                 return output
@@ -411,6 +530,33 @@ class _BatchCsvStore:
                 raise BatchAutomationError(
                     f"Resume row {row.scan_id} does not reference a complete scan."
                 )
+            if row.rename_status == "verified":
+                self._validate_nickname_evidence(row)
+
+    @staticmethod
+    def _validate_nickname_evidence(row: BatchCsvRow) -> None:
+        if row.nickname_after is None:
+            raise BatchAutomationError(
+                f"Resume row {row.scan_id} is missing its verified nickname."
+            )
+        summary_path = row.scan_directory / "renamed_summary.png"
+        evidence_path = row.scan_directory / "nickname_change.json"
+        try:
+            summary_path.read_bytes()
+            raw = json.loads(evidence_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise BatchAutomationError(
+                f"Resume row {row.scan_id} has invalid nickname evidence: {error}"
+            ) from error
+        if (
+            not isinstance(raw, dict)
+            or raw.get("status") != "verified"
+            or raw.get("nickname_after") != row.nickname_after
+            or raw.get("summary_filename") != "renamed_summary.png"
+        ):
+            raise BatchAutomationError(
+                f"Resume row {row.scan_id} nickname evidence does not match its CSV row."
+            )
 
     def _write(self) -> None:
         buffer = io.StringIO(newline="")
@@ -480,6 +626,7 @@ class BatchScanService:
         debug: bool,
         resume: bool,
         delay_seconds: float,
+        rename_with_iv: bool = False,
         serial_number: str | None = None,
     ) -> BatchScanResult:
         """Run the proven one-scan workflow repeatedly with guarded switching."""
@@ -488,7 +635,11 @@ class BatchScanService:
             raise BatchAutomationError("--limit must be greater than 0.")
         if delay_seconds < 0:
             raise BatchAutomationError("--delay cannot be negative.")
-        store = _BatchCsvStore(csv_path, resume=resume)
+        store = _BatchCsvStore(
+            csv_path,
+            resume=resume,
+            rename_with_iv=rename_with_iv,
+        )
         if len(store.rows) >= limit:
             return BatchScanResult(
                 csv_path=store.path,
@@ -498,7 +649,9 @@ class BatchScanService:
             )
 
         device = self._adb.resolve_device(serial_number)
-        first_identity = self._identity_from_row(store.rows[0]) if store.rows else None
+        first_identity = (
+            self._completed_identity_from_row(store.rows[0]) if store.rows else None
+        )
         new_rows: list[BatchCsvRow] = []
         if resume and store.rows:
             self._prepare_resume_position(
@@ -510,6 +663,7 @@ class BatchScanService:
         while len(store.rows) < limit:
             scan = self._scanner.scan_one(
                 debug=debug,
+                rename_with_iv=rename_with_iv,
                 serial_number=device.serial_number,
             )
             if scan.manifest.scan_status != "complete" or scan.recognition is None:
@@ -543,6 +697,13 @@ class BatchScanService:
                 raise BatchAutomationError(
                     "Saved summary OCR does not match the completed recognition result."
                 )
+            completed_identity = current_identity
+            if rename_with_iv:
+                completed_identity = self._verified_renamed_identity(
+                    current_identity,
+                    scan,
+                    debug=debug,
+                )
             if store.rows:
                 recorder = _BatchDebugRecorder(scan.scan_directory, debug)
                 _, same_as_last = self._compare_with_row(
@@ -561,6 +722,7 @@ class BatchScanService:
                 len(store.rows) + 1,
                 scan,
                 current_identity.page_fingerprint,
+                rename_with_iv=rename_with_iv,
             )
             if store.append(row):
                 new_rows.append(row)
@@ -586,17 +748,58 @@ class BatchScanService:
                     stop_reason="limit_reached",
                 )
             if first_identity is None:
-                first_identity = current_identity
+                first_identity = completed_identity
 
             if delay_seconds:
                 self._sleeper(delay_seconds)
-            next_identity = self._switch_to_next(
+            switched = self._switch_to_next(
                 device.serial_number,
-                current_identity,
+                completed_identity,
                 scan.scan_directory,
                 debug=debug,
             )
-            if _same_switch_identity(next_identity, first_identity, self._config):
+            next_identity = switched.identity
+            if next_identity is None:
+                raise AssertionError("A completed switch did not return summary identity.")
+            wrapped = _same_switch_identity(
+                next_identity,
+                first_identity,
+                self._config,
+            )
+            first_row = store.rows[0]
+            wrap_observed_nickname: str | None = None
+            if rename_with_iv:
+                if (
+                    first_row.rename_status != "verified"
+                    or first_row.nickname_after is None
+                ):
+                    raise BatchAutomationError(
+                        "Rename batch first row is missing verified nickname evidence."
+                    )
+                wrap_observed_nickname = self._detector.read_summary_nickname(
+                    switched.screenshot
+                )
+                wrapped = matches_verified_renamed_identity(
+                    next_identity,
+                    first_identity,
+                    expected_nickname=first_row.nickname_after,
+                    observed_nickname=wrap_observed_nickname,
+                    config=self._config,
+                )
+            wrap_recorder = _BatchDebugRecorder(scan.scan_directory, debug)
+            wrap_recorder.json(
+                "wrap_comparison_state.json",
+                {
+                    "first_identity": asdict(first_identity),
+                    "next_identity": asdict(next_identity),
+                    "expected_nickname": (
+                        first_row.nickname_after if rename_with_iv else None
+                    ),
+                    "observed_nickname": wrap_observed_nickname,
+                    "wrapped_to_first": wrapped,
+                },
+            )
+            if wrapped:
                 return BatchScanResult(
                     csv_path=store.path,
                     rows=tuple(store.rows),
@@ -605,6 +808,143 @@ class BatchScanService:
                 )
 
         raise AssertionError("Batch loop terminated without a stop reason.")
+
+    def _verified_renamed_identity(
+        self,
+        before: SummaryIdentity,
+        scan: AutoScanResult,
+        *,
+        debug: bool,
+    ) -> SummaryIdentity:
+        change = scan.nickname_change
+        recognition = scan.recognition
+        if change is None or recognition is None:
+            raise BatchAutomationError(
+                "The one-Pokémon scan did not return verified nickname evidence."
+            )
+        if change.nickname_before != (recognition.pokemon_name.value or ""):
+            raise BatchAutomationError(
+                "Verified nickname evidence does not match the recognized original name."
+            )
+        saved_summary_path = scan.scan_directory / "renamed_summary.png"
+        saved_evidence_path = scan.scan_directory / "nickname_change.json"
+        try:
+            saved_summary = saved_summary_path.read_bytes()
+            saved_evidence = json.loads(saved_evidence_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise BatchAutomationError(
+                f"Verified nickname artifacts were not durable: {error}"
+            ) from error
+        if (
+            saved_summary != change.summary_png
+            or not isinstance(saved_evidence, dict)
+            or saved_evidence.get("status") != "verified"
+            or saved_evidence.get("nickname_after") != change.expected_nickname
+            or saved_evidence.get("editor_observed_nickname")
+            != change.editor_observed_nickname
+        ):
+            raise BatchAutomationError(
+                "Verified nickname artifacts do not match the in-memory result."
+            )
+        values = (recognition.attack_iv, recognition.defense_iv, recognition.hp_iv)
+        if any(value is None for value in values):
+            raise BatchAutomationError("Verified nickname evidence is missing an IV value.")
+        suffix = "/".join(str(value) for value in values)
+        if not change.expected_nickname.endswith(suffix):
+            raise BatchAutomationError(
+                "Verified nickname evidence does not contain the recognized half-width IV suffix."
+            )
+        after = summary_identity(
+            change.summary_detection,
+            change.summary_png,
+            self._config,
+        )
+        transition = ExpectedNicknameTransition(
+            before=before,
+            after=after,
+            expected_nickname=change.expected_nickname,
+            editor_observed_nickname=change.editor_observed_nickname,
+            summary_observed_nickname=change.summary_observed_nickname,
+        )
+        recorder = _BatchDebugRecorder(scan.scan_directory, debug)
+        recorder.screen("rename_verified_summary", change.summary_png)
+        recorder.json(
+            "rename_transition_state.json",
+            {
+                "before": asdict(before),
+                "after": asdict(after),
+                "expected_nickname": change.expected_nickname,
+                "editor_observed_nickname": change.editor_observed_nickname,
+                "summary_observed_nickname": change.summary_observed_nickname,
+                "fingerprint_distance": fingerprint_distance(
+                    before.page_fingerprint,
+                    after.page_fingerprint,
+                ),
+                "matched": matches_expected_nickname_transition(
+                    transition,
+                    self._config,
+                ),
+            },
+        )
+        if not matches_expected_nickname_transition(transition, self._config):
+            raise BatchAutomationError(
+                "Expected nickname transition failed: nickname, CP, HP, or static "
+                "fingerprint did not preserve the same Pokémon. No row was appended "
+                "and no swipe was sent."
+            )
+        return after
+
+    def _completed_identity_from_row(self, row: BatchCsvRow) -> SummaryIdentity | None:
+        if row.rename_status != "verified":
+            return self._identity_from_row(row)
+        if row.nickname_after is None:
+            raise BatchAutomationError(
+                f"Resume row {row.scan_id} is missing its post-rename nickname."
+            )
+        pre_path = row.scan_directory / "summary.png"
+        post_path = row.scan_directory / "renamed_summary.png"
+        evidence_path = row.scan_directory / "nickname_change.json"
+        try:
+            pre_png = pre_path.read_bytes()
+            post_png = post_path.read_bytes()
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise BatchAutomationError(
+                f"Could not restore renamed identity for row {row.scan_id}: {error}"
+            ) from error
+        pre = summary_identity(
+            self._detector.detect(pre_png, expected=("detail_summary",)),
+            pre_png,
+            self._config,
+        )
+        row_identity = self._identity_from_row(row)
+        if row_identity is None or not _same_name_and_cp(pre, row_identity):
+            raise BatchAutomationError(
+                f"Resume row {row.scan_id} does not match its original summary.png."
+            )
+        post = summary_identity(
+            self._detector.detect(post_png, expected=("detail_summary",)),
+            post_png,
+            self._config,
+        )
+        editor_observed = evidence.get("editor_observed_nickname")
+        if not isinstance(editor_observed, str):
+            raise BatchAutomationError(
+                f"Resume row {row.scan_id} is missing exact editor nickname evidence."
+            )
+        summary_observed = self._detector.read_summary_nickname(post_png)
+        transition = ExpectedNicknameTransition(
+            before=pre,
+            after=post,
+            expected_nickname=row.nickname_after,
+            editor_observed_nickname=editor_observed,
+            summary_observed_nickname=summary_observed,
+        )
+        if not matches_expected_nickname_transition(transition, self._config):
+            raise BatchAutomationError(
+                f"Resume row {row.scan_id} failed its saved nickname transition check."
+            )
+        return post
 
     def _prepare_resume_position(
         self,
@@ -638,28 +978,86 @@ class BatchScanService:
             current_png,
             self._config,
         )
-        previous_identity, same_as_last = self._compare_with_row(
-            current_png,
-            current_identity,
-            last_row,
-            recorder,
-            prefix="resume",
-        )
+        resume_observed_nickname: str | None = None
+        if last_row.rename_status == "verified":
+            previous_identity = self._completed_identity_from_row(last_row)
+            if previous_identity is None or last_row.nickname_after is None:
+                raise BatchAutomationError(
+                    "Resume could not restore the last verified renamed identity."
+                )
+            resume_observed_nickname = self._detector.read_summary_nickname(current_png)
+            nickname_matches = nickname_text_skeleton(resume_observed_nickname) == (
+                nickname_text_skeleton(last_row.nickname_after)
+            )
+            same_as_last = nickname_matches and same_static_summary(
+                current_identity,
+                previous_identity,
+                self._config,
+            )
+            immutable_match = _same_immutable_summary(
+                current_identity,
+                previous_identity,
+                self._config,
+            )
+            recorder.screen(
+                "resume_current_static_roi",
+                static_summary_crop(current_png, self._config),
+            )
+            recorder.screen(
+                "resume_last_static_roi",
+                static_summary_crop(
+                    (last_row.scan_directory / "renamed_summary.png").read_bytes(),
+                    self._config,
+                ),
+            )
+            if immutable_match and not same_as_last:
+                recorder.json(
+                    "resume_state.json",
+                    {
+                        **self._comparison_data(
+                            current_identity,
+                            previous_identity,
+                            False,
+                        ),
+                        "expected_nickname": last_row.nickname_after,
+                        "observed_nickname": resume_observed_nickname,
+                        "immutable_match": True,
+                        "resume_pre_switch_executed": False,
+                    },
+                )
+                raise BatchAutomationError(
+                    "Resume found the last Pokémon's CP/HP/fingerprint but not its "
+                    "verified expected nickname. The state is ambiguous; no swipe or "
+                    "scan was sent."
+                )
+        else:
+            previous_identity, same_as_last = self._compare_with_row(
+                current_png,
+                current_identity,
+                last_row,
+                recorder,
+                prefix="resume",
+            )
         state_data = self._comparison_data(
             current_identity,
             previous_identity,
             same_as_last,
         )
+        if last_row.rename_status == "verified":
+            state_data["expected_nickname"] = last_row.nickname_after
+            state_data["observed_nickname"] = resume_observed_nickname
         state_data["resume_pre_switch_executed"] = same_as_last
         recorder.json("resume_state.json", state_data)
         if same_as_last:
-            next_identity = self._switch_to_next(
+            switched = self._switch_to_next(
                 serial,
                 previous_identity,
                 last_row.scan_directory,
                 debug=debug,
             )
-            state_data["next_identity"] = asdict(next_identity)
+            if switched.identity is None:
+                raise AssertionError("A completed resume switch has no summary identity.")
+            state_data["next_identity"] = asdict(switched.identity)
             recorder.json("resume_state.json", state_data)
 
     def _compare_with_row(
@@ -755,7 +1153,7 @@ class BatchScanService:
         scan_directory: Path,
         *,
         debug: bool,
-    ) -> SummaryIdentity:
+    ) -> _SwitchWaitResult:
         recorder = _BatchDebugRecorder(scan_directory, debug)
         before = self._adb.capture_screen(serial)
         recorder.screen("before_switch", before)
@@ -811,7 +1209,7 @@ class BatchScanService:
                 },
             )
             if result.outcome == "changed" and result.identity is not None:
-                return result.identity
+                return result
             if result.outcome == "unexpected":
                 raise BatchAutomationError(
                     "Unexpected page state while switching Pokémon: "
@@ -833,7 +1231,13 @@ class BatchScanService:
                     self._config,
                 )
                 if not _same_switch_identity(current, previous, self._config):
-                    return current
+                    return _SwitchWaitResult(
+                        confirmation,
+                        confirmation_detection,
+                        current,
+                        "changed",
+                        0.0,
+                    )
 
         raise BatchAutomationError(
             "Two left swipes did not reach a different Pokémon within 15 seconds "
@@ -986,10 +1390,15 @@ class BatchScanService:
         batch_index: int,
         scan: AutoScanResult,
         fingerprint: str,
+        *,
+        rename_with_iv: bool,
     ) -> BatchCsvRow:
         recognition = scan.recognition
         if recognition is None:
             raise BatchAutomationError("Missing recognition result for completed scan.")
+        change: NicknameRenameResult | None = scan.nickname_change
+        if rename_with_iv and change is None:
+            raise BatchAutomationError("Missing verified nickname result for completed scan.")
         return BatchCsvRow(
             batch_index=batch_index,
             scan_id=recognition.scan_id,
@@ -1004,4 +1413,11 @@ class BatchScanService:
             hp_iv=recognition.hp_iv,
             warnings=" | ".join(recognition.warnings),
             scan_directory=scan.scan_directory.resolve(),
+            nickname_before=(
+                change.nickname_before
+                if change is not None
+                else recognition.pokemon_name.value
+            ),
+            nickname_after=(change.expected_nickname if change is not None else None),
+            rename_status=("verified" if change is not None else "not_requested"),
         )
