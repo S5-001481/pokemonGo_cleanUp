@@ -2,26 +2,25 @@
 
 from __future__ import annotations
 
-import io
 import json
 import logging
 import math
 import re
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Final, Literal, Protocol
 from uuid import uuid4
 
-from PIL import Image, ImageChops, ImageStat
-
 from pokemon_go_cleanup import __version__
 from pokemon_go_cleanup.config import AppConfig
 from pokemon_go_cleanup.exceptions import AutomationError, LocalStorageError, PokemonGoCleanupError
 from pokemon_go_cleanup.models import Device, ScanManifest, ScanStep, ScreenResolution
 from pokemon_go_cleanup.recognition import (
+    CP_RECT,
     HEIGHT,
     NAME_RECT,
     WIDTH,
@@ -30,6 +29,7 @@ from pokemon_go_cleanup.recognition import (
     RecognitionService,
     normalize_cp_candidate,
     normalize_ocr_text,
+    parse_cp_raw,
 )
 from pokemon_go_cleanup.storage import atomic_write_bytes, atomic_write_text
 
@@ -55,6 +55,12 @@ _MOVE_PAGE_LABELS: Final = (
     "訓練家對戰",
     "新攻擊招式",
     "新攻撃招式",
+    "暗影獎勵",
+    "天氣優勢",
+    "天氣加成",
+    "極巨",
+    "LOCKED",
+    "等級",
 )
 _MOVE_EVIDENCE_MIN_CONFIDENCE: Final = 0.80
 @dataclass(frozen=True, slots=True)
@@ -88,15 +94,15 @@ class HuaweiMate30AutomationConfig:
     appraisal_target_rect: tuple[int, int, int, int] = (160, 1450, 1320, 2700)
     transfer_forbidden_rect: tuple[int, int, int, int] = (0, 2700, 1440, 3120)
     appraisal_dialogue_rect: tuple[int, int, int, int] = (100, 1250, 1340, 2860)
+    appraisal_greeting_rect: tuple[int, int, int, int] = (80, 2450, 420, 2615)
     rename_dialog_rect: tuple[int, int, int, int] = (100, 700, 1340, 2200)
     nickname_input_rect: tuple[int, int, int, int] = (150, 1250, 1290, 1500)
     nickname_summary_rect: tuple[int, int, int, int] = (150, 1300, 1290, 1550)
+    nickname_edit_row_tolerance: int = 70
+    nickname_summary_expected_center_y: int = 1450
+    nickname_summary_min_height_ratio: float = 0.4
     menu_ocr_min_confidence: float = 0.85
     transfer_clearance_pixels: int = 150
-    stable_interval_seconds: float = 0.3
-    stable_difference_threshold: float = 0.008
-    stable_consecutive_samples: int = 3
-    step_timeout_seconds: float = 8.0
     summary_poll_interval_seconds: float = 0.5
     summary_wait_timeout_seconds: float = 15.0
     menu_poll_interval_seconds: float = 0.5
@@ -194,14 +200,6 @@ def match_move_name_power_rows(
 
 
 @dataclass(frozen=True, slots=True)
-class StableScreenResult:
-    """The final stable screenshot and all measured differences."""
-
-    png_bytes: bytes
-    differences: tuple[float, ...]
-
-
-@dataclass(frozen=True, slots=True)
 class _StateWaitResult:
     """Final screenshot, detection, and outcome from one target-state attempt."""
 
@@ -270,14 +268,15 @@ class PageDetector(Protocol):
 
     def read_summary_nickname(self, png_bytes: bytes) -> str: ...
 
+    def read_summary_cp(self, png_bytes: bytes) -> int | None: ...
+
+    def read_summary_hp(self, png_bytes: bytes) -> str | None: ...
+
 
 class ScanReader(Protocol):
     """Existing screenshot reader surface used after automation succeeds."""
 
     def read_scan(self, directory: Path, *, debug: bool = False) -> RecognitionResult: ...
-
-
-StableWaiter = Callable[[Callable[[], bytes]], StableScreenResult]
 
 
 def _point_in_rect(point: Point, rectangle: tuple[int, int, int, int]) -> bool:
@@ -313,18 +312,6 @@ def compact_editor_nickname_text(value: str) -> str:
     """Remove OCR whitespace without folding full-width characters to ASCII."""
 
     return re.sub(r"\s+", "", value)
-
-
-def _summary_name_from_detection(detection: PageDetection) -> str:
-    for raw in detection.matched_texts:
-        if normalize_cp_candidate(raw) is not None:
-            continue
-        normalized = normalize_ocr_text(raw).replace(" ", "")
-        if normalized:
-            return normalized
-    raise AutomationError(
-        "Default nickname could not be read after resetting it; no IV suffix was sent."
-    )
 
 
 def planned_actions(
@@ -379,55 +366,6 @@ def planned_actions(
     })
 
 
-def _thumbnail(png_bytes: bytes) -> Image.Image:
-    try:
-        with Image.open(io.BytesIO(png_bytes)) as image:
-            return image.convert("L").resize((144, 312), Image.Resampling.BILINEAR)
-    except (OSError, ValueError) as error:
-        raise AutomationError(f"Could not decode stability screenshot: {error}") from error
-
-
-def screen_difference(previous_png: bytes, current_png: bytes) -> float:
-    """Return normalized mean pixel difference for two reduced screenshots."""
-
-    difference = ImageChops.difference(_thumbnail(previous_png), _thumbnail(current_png))
-    return float(ImageStat.Stat(difference).mean[0]) / 255.0
-
-
-def wait_for_stable_screen(
-    capture: Callable[[], bytes],
-    *,
-    interval_seconds: float = 0.3,
-    difference_threshold: float = 0.008,
-    consecutive_samples: int = 3,
-    timeout_seconds: float = 8.0,
-    monotonic: Callable[[], float] = time.monotonic,
-    sleeper: Callable[[float], None] = time.sleep,
-) -> StableScreenResult:
-    """Wait until several consecutive reduced screenshots are nearly identical."""
-
-    if interval_seconds <= 0 or timeout_seconds <= 0 or consecutive_samples <= 0:
-        raise ValueError("Stability timing values must be positive.")
-    previous = capture()
-    differences: list[float] = []
-    stable_count = 0
-    deadline = monotonic() + timeout_seconds
-    maximum_samples = math.ceil(timeout_seconds / interval_seconds) + 1
-    for _ in range(maximum_samples):
-        remaining = deadline - monotonic()
-        if remaining <= 0:
-            break
-        sleeper(min(interval_seconds, remaining))
-        current = capture()
-        difference = screen_difference(previous, current)
-        differences.append(difference)
-        stable_count = stable_count + 1 if difference <= difference_threshold else 0
-        if stable_count >= consecutive_samples:
-            return StableScreenResult(current, tuple(differences))
-        previous = current
-    raise AutomationError(f"Screen did not stabilize within {timeout_seconds:.1f} seconds.")
-
-
 class HuaweiMate30PageDetector:
     """Detect only the fixed Traditional Chinese 1440x3120 page layouts."""
 
@@ -458,6 +396,18 @@ class HuaweiMate30PageDetector:
                     confidence=1.0,
                     details={"iv_values": [bar.value for bar in bars]},
                 )
+
+        dialogue_has_priority_over_menu = (
+            "appraisal_dialogue" in expected_set
+            and (
+                "action_menu" not in expected_set
+                or expected.index("appraisal_dialogue") < expected.index("action_menu")
+            )
+        )
+        if dialogue_has_priority_over_menu:
+            greeting_detection = self._detect_appraisal_greeting(image)
+            if greeting_detection is not None:
+                return greeting_detection
 
         if "action_menu" in expected_set:
             menu_detection = self._detect_action_menu(image)
@@ -502,48 +452,63 @@ class HuaweiMate30PageDetector:
                 return rename_detection
 
         if "detail_summary" in expected_set:
-            cp_candidates, _ = self._reader._ocr_cp_variants(image)
-            name_candidates, _ = self._reader._ocr_variants(image, NAME_RECT)
+            cp_candidates, _ = self._reader._ocr_variants(image, CP_RECT)
             cp = self._reader._best_cp(cp_candidates)
+            name_candidates, _ = self._reader._ocr_variants(image, NAME_RECT)
             name = self._reader._best_text(name_candidates)
-            hp_candidates = self._ocr_rectangle(image, SUMMARY_HP_RECT)
-            hp = max(
-                (
-                    candidate
-                    for candidate in hp_candidates
-                    if re.search(
-                        r"\d+\s*/\s*\d+\s*HP",
-                        normalize_ocr_text(candidate.raw),
-                        re.IGNORECASE,
-                    )
-                ),
-                key=lambda candidate: candidate.confidence,
-                default=None,
-            )
-            if name is not None and (cp is not None or hp is not None):
-                details: dict[str, object] = {}
-                evidence = "name_hp"
-                matched_texts: tuple[str, ...] = (name.raw,)
-                confidence_candidates = [name.confidence]
-                if cp is not None:
-                    normalized_cp = normalize_cp_candidate(cp.raw)
-                    if normalized_cp is not None:
-                        details["cp"] = normalized_cp
-                    matched_texts = (cp.raw, name.raw)
-                    confidence_candidates.append(cp.confidence)
-                    evidence = "name_cp"
-                if hp is not None:
-                    details["hp"] = re.sub(r"\s+", "", normalize_ocr_text(hp.raw)).upper()
-                    confidence_candidates.append(hp.confidence)
-                    if cp is not None:
-                        evidence = "name_cp_hp"
-                details["summary_evidence"] = evidence
-                return PageDetection(
-                    state="detail_summary",
-                    confidence=min(confidence_candidates),
-                    matched_texts=matched_texts,
-                    details=details,
+            if name is not None and cp is not None:
+                return self._summary_name_cp_detection(
+                    name,
+                    cp,
+                    ocr_path="fast_name_cp",
                 )
+
+            if name is not None and cp is None:
+                hsv_candidates = self._reader._ocr_cp_hsv_variants(image)
+                cp = self._reader._best_cp(hsv_candidates)
+                if cp is not None:
+                    return self._summary_name_cp_detection(
+                        name,
+                        cp,
+                        ocr_path="hsv_cp_fallback",
+                    )
+
+                fallback_candidates = self._reader._ocr_cp_fallback_variants(image)
+                cp = self._reader._best_cp(fallback_candidates)
+                if name is not None and cp is not None:
+                    return self._summary_name_cp_detection(
+                        name,
+                        cp,
+                        ocr_path="enhanced_cp_fallback",
+                    )
+
+                hp_candidates = self._ocr_rectangle(image, SUMMARY_HP_RECT)
+                hp = max(
+                    (
+                        candidate
+                        for candidate in hp_candidates
+                        if re.search(
+                            r"\d+\s*/\s*\d+\s*HP",
+                            normalize_ocr_text(candidate.raw),
+                            re.IGNORECASE,
+                        )
+                    ),
+                    key=lambda candidate: candidate.confidence,
+                    default=None,
+                )
+                if name is not None and hp is not None:
+                    return PageDetection(
+                        state="detail_summary",
+                        confidence=min(name.confidence, hp.confidence),
+                        matched_texts=(name.raw,),
+                        details={
+                            "hp": re.sub(
+                                r"\s+", "", normalize_ocr_text(hp.raw)
+                            ).upper(),
+                            "summary_evidence": "name_hp",
+                            "summary_ocr_path": "hp_fallback",
+                        },
+                    )
 
         if "appraisal_dialogue" in expected_set:
             candidates = self._ocr_rectangle(
@@ -612,6 +577,27 @@ class HuaweiMate30PageDetector:
             details={"expected": list(expected)},
         )
 
+    @staticmethod
+    def _summary_name_cp_detection(
+        name: OcrCandidate,
+        cp: OcrCandidate,
+        *,
+        ocr_path: str,
+    ) -> PageDetection:
+        normalized_cp = normalize_cp_candidate(cp.raw)
+        if normalized_cp is None:
+            raise AssertionError("_best_cp returned a candidate without a CP prefix.")
+        return PageDetection(
+            state="detail_summary",
+            confidence=min(name.confidence, cp.confidence),
+            matched_texts=(cp.raw, name.raw),
+            details={
+                "cp": normalized_cp,
+                "summary_evidence": "name_cp",
+                "summary_ocr_path": ocr_path,
+            },
+        )
+
     def _decode(self, png_bytes: bytes) -> object:
         encoded = self._reader._np.frombuffer(png_bytes, dtype=self._reader._np.uint8)
         image = self._reader._cv2.imdecode(encoded, self._reader._cv2.IMREAD_COLOR)
@@ -624,19 +610,117 @@ class HuaweiMate30PageDetector:
             )
         return image
 
+    def _detect_appraisal_greeting(self, image: object) -> PageDetection | None:
+        candidates = tuple(
+            candidate
+            for candidate in self._ocr_rectangle(
+                image,
+                self._config.appraisal_greeting_rect,
+            )
+            if "你好" in normalize_ocr_text(candidate.raw)
+            and candidate.confidence >= self._config.menu_ocr_min_confidence
+        )
+        if not candidates:
+            return None
+        return PageDetection(
+            state="appraisal_dialogue",
+            confidence=max(candidate.confidence for candidate in candidates),
+            matched_texts=tuple(candidate.raw for candidate in candidates),
+            details={
+                "dialogue_evidence": "greeting",
+                "greeting_roi": list(self._config.appraisal_greeting_rect),
+            },
+        )
+
     def read_summary_nickname(self, png_bytes: bytes) -> str:
         """Read a wide name row without changing generic page-identity OCR."""
 
         image = self._decode(png_bytes)
-        candidates = tuple(
-            candidate
-            for candidate in self._ocr_rectangle(image, self._config.nickname_summary_rect)
-            if (candidate.box[1] + candidate.box[3]) // 2 <= 1500
+        normalized = tuple(
+            (candidate, normalize_ocr_text(candidate.raw).replace(" ", ""))
+            for candidate in self._ocr_rectangle(
+                image,
+                self._config.nickname_summary_rect,
+            )
+        )
+        normalized = tuple((candidate, text) for candidate, text in normalized if text)
+        if not normalized:
+            return ""
+
+        chinese_candidates = tuple(
+            (candidate, text)
+            for candidate, text in normalized
+            if re.search(r"[\u3400-\u9fff]", text)
+        )
+        anchor_pool = chinese_candidates or normalized
+        if chinese_candidates:
+            anchor, _ = max(
+                anchor_pool,
+                key=lambda item: (
+                    item[0].box[3] - item[0].box[1],
+                    item[0].confidence,
+                ),
+            )
+        else:
+            anchor, _ = max(
+                anchor_pool,
+                key=lambda item: (
+                    item[0].box[3] - item[0].box[1],
+                    -abs(
+                        (item[0].box[1] + item[0].box[3]) // 2
+                        - self._config.nickname_summary_expected_center_y
+                    ),
+                    item[0].confidence,
+                ),
+            )
+
+        anchor_center_y = (anchor.box[1] + anchor.box[3]) // 2
+        anchor_height = max(1, anchor.box[3] - anchor.box[1])
+        row_candidates = tuple(
+            (candidate, text)
+            for candidate, text in normalized
+            if abs((candidate.box[1] + candidate.box[3]) // 2 - anchor_center_y)
+            <= self._config.nickname_edit_row_tolerance
+            and candidate.box[3] - candidate.box[1]
+            >= anchor_height * self._config.nickname_summary_min_height_ratio
         )
         return "".join(
-            normalize_ocr_text(candidate.raw).replace(" ", "")
-            for candidate in sorted(candidates, key=lambda candidate: candidate.box[0])
+            text
+            for candidate, text in sorted(
+                row_candidates,
+                key=lambda item: item[0].box[0],
+            )
         )
+
+    def read_summary_cp(self, png_bytes: bytes) -> int | None:
+        """Run progressive CP-only OCR for a previously confirmed summary page."""
+
+        image = self._decode(png_bytes)
+        candidates, _ = self._reader._ocr_cp_variants(image)
+        best = self._reader._best_cp(candidates)
+        return parse_cp_raw(best.raw) if best is not None else None
+
+    def read_summary_hp(self, png_bytes: bytes) -> str | None:
+        """Read the fixed HP row without treating it as a replacement for CP."""
+
+        image = self._decode(png_bytes)
+        candidates = self._ocr_rectangle(image, SUMMARY_HP_RECT)
+        hp = max(
+            (
+                candidate
+                for candidate in candidates
+                if re.search(
+                    r"\d+\s*/\s*\d+\s*HP",
+                    normalize_ocr_text(candidate.raw),
+                    re.IGNORECASE,
+                )
+            ),
+            key=lambda candidate: candidate.confidence,
+            default=None,
+        )
+        if hp is None:
+            return None
+        return re.sub(r"\s+", "", normalize_ocr_text(hp.raw)).upper()
 
     def _ocr_rectangle(
         self,
@@ -828,13 +912,6 @@ class _DebugRecorder:
         )
         self._write_json("actions.json", {"actions": self._actions})
 
-    def stability(self, label: str, result: StableScreenResult) -> None:
-        if self._enabled:
-            self._write_json(
-                f"stability_{label}.json",
-                {"differences": list(result.differences)},
-            )
-
     def named_state(
         self,
         label: str,
@@ -892,11 +969,120 @@ class _DebugRecorder:
                 },
             )
 
+    def timings(
+        self,
+        *,
+        run_outcome: str,
+        total_elapsed_seconds: float,
+        stable_wait_seconds: float,
+        ocr_seconds: float,
+        steps: Sequence[dict[str, object]],
+    ) -> None:
+        if self._enabled:
+            self._write_json(
+                "timings.json",
+                {
+                    "run_outcome": run_outcome,
+                    "total_elapsed_seconds": total_elapsed_seconds,
+                    "stable_wait_seconds": stable_wait_seconds,
+                    "ocr_seconds": ocr_seconds,
+                    "steps": list(steps),
+                },
+            )
+
     def _write_json(self, name: str, data: object) -> None:
         atomic_write_text(
             self._directory / name,
             json.dumps(data, ensure_ascii=False, indent=2) + "\n",
         )
+
+
+class _StepProfiler:
+    """Persist flat, non-overlapping monotonic timings for one automatic scan."""
+
+    def __init__(
+        self,
+        recorder: _DebugRecorder,
+        monotonic: Callable[[], float],
+        ocr_seconds_total: Callable[[], float],
+        started_at: float,
+    ) -> None:
+        self._recorder = recorder
+        self._monotonic = monotonic
+        self._ocr_seconds_total = ocr_seconds_total
+        self._started_at = started_at
+        self._started_ocr_seconds = ocr_seconds_total()
+        self._steps: list[dict[str, object]] = []
+
+    def record_completed(self, name: str, started_at: float, ended_at: float) -> None:
+        self._append(name, started_at, ended_at, "completed", ocr_seconds=0.0)
+
+    @contextmanager
+    def step(self, name: str) -> Iterator[None]:
+        started_at = self._monotonic()
+        started_ocr_seconds = self._ocr_seconds_total()
+        try:
+            yield
+        except BaseException:
+            self._append(
+                name,
+                started_at,
+                self._monotonic(),
+                "failed",
+                ocr_seconds=self._ocr_seconds_total() - started_ocr_seconds,
+            )
+            raise
+        else:
+            self._append(
+                name,
+                started_at,
+                self._monotonic(),
+                "completed",
+                ocr_seconds=self._ocr_seconds_total() - started_ocr_seconds,
+            )
+
+    def finish(self, outcome: str) -> None:
+        self._persist(outcome, self._monotonic())
+
+    def _append(
+        self,
+        name: str,
+        started_at: float,
+        ended_at: float,
+        outcome: str,
+        *,
+        ocr_seconds: float,
+    ) -> None:
+        self._steps.append(
+            {
+                "sequence": len(self._steps) + 1,
+                "step": name,
+                "started_offset_seconds": round(started_at - self._started_at, 6),
+                "duration_seconds": round(ended_at - started_at, 6),
+                "stable_wait_seconds": 0.0,
+                "ocr_seconds": round(max(0.0, ocr_seconds), 6),
+                "outcome": outcome,
+            }
+        )
+        self._persist("in_progress", ended_at)
+
+    def _persist(self, outcome: str, ended_at: float) -> None:
+        try:
+            self._recorder.timings(
+                run_outcome=outcome,
+                total_elapsed_seconds=round(ended_at - self._started_at, 6),
+                stable_wait_seconds=0.0,
+                ocr_seconds=round(
+                    max(0.0, self._ocr_seconds_total() - self._started_ocr_seconds),
+                    6,
+                ),
+                steps=self._steps,
+            )
+        except PokemonGoCleanupError as error:
+            logger.error(
+                "automation_timing_write_failed",
+                extra={"error": str(error), "run_outcome": outcome},
+            )
 
 
 @dataclass(slots=True)
@@ -905,6 +1091,7 @@ class _Session:
     manifest_path: Path
     manifest: ScanManifest
     recorder: _DebugRecorder
+    profiler: _StepProfiler
     current_step: str = "initialize"
 
 
@@ -921,7 +1108,6 @@ class AutoScanService:
         automation: HuaweiMate30AutomationConfig = HUAWEI_MATE_30_AUTOMATION,
         clock: Callable[[], datetime] | None = None,
         token_factory: Callable[[], str] | None = None,
-        stable_waiter: StableWaiter | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
         application_version: str = __version__,
@@ -936,16 +1122,6 @@ class AutoScanService:
         self._monotonic = monotonic
         self._sleeper = sleeper
         self._application_version = application_version
-        if stable_waiter is None:
-            self._stable_waiter: StableWaiter = lambda capture: wait_for_stable_screen(
-                capture,
-                interval_seconds=automation.stable_interval_seconds,
-                difference_threshold=automation.stable_difference_threshold,
-                consecutive_samples=automation.stable_consecutive_samples,
-                timeout_seconds=automation.step_timeout_seconds,
-            )
-        else:
-            self._stable_waiter = stable_waiter
 
     def scan_one(
         self,
@@ -958,6 +1134,7 @@ class AutoScanService:
     ) -> AutoScanResult:
         """Capture, navigate, recognize, and safely return from one detail page."""
 
+        scan_started_monotonic = self._monotonic()
         device = self._adb.resolve_device(serial_number)
         resolution = self._adb.get_resolution(device.serial_number)
         if (resolution.width, resolution.height) != (
@@ -992,15 +1169,28 @@ class AutoScanService:
             notes=notes,
         )
         self._write_manifest(manifest_path, manifest)
+        recorder = _DebugRecorder(scan_directory, debug)
+        profiler = _StepProfiler(
+            recorder,
+            self._monotonic,
+            self._ocr_seconds_total,
+            scan_started_monotonic,
+        )
         session = _Session(
             scan_directory=scan_directory,
             manifest_path=manifest_path,
             manifest=manifest,
-            recorder=_DebugRecorder(scan_directory, debug),
+            recorder=recorder,
+            profiler=profiler,
         )
         actions = planned_actions(self._automation, rename_with_iv=rename_with_iv)
         session.recorder.write_plan(actions)
         deadline = self._monotonic() + self._automation.total_timeout_seconds
+        session.profiler.record_completed(
+            "initialize",
+            scan_started_monotonic,
+            self._monotonic(),
+        )
         try:
             result = self._run(
                 session,
@@ -1012,13 +1202,17 @@ class AutoScanService:
                 rename_with_iv=rename_with_iv,
             )
         except KeyboardInterrupt:
+            session.profiler.finish("interrupted")
             self._mark_incomplete_after_interrupt(session)
             raise
         except PokemonGoCleanupError as error:
+            session.profiler.finish("failed")
             raise self._fail(session, error) from error
         except Exception as error:
+            session.profiler.finish("failed")
             wrapped = AutomationError(f"Unexpected automation failure: {error}")
             raise self._fail(session, wrapped) from error
+        session.profiler.finish("dry_run" if result.dry_run else "complete")
         return result
 
     def _run(
@@ -1033,66 +1227,75 @@ class AutoScanService:
         rename_with_iv: bool,
     ) -> AutoScanResult:
         session.current_step = "verify_detail_summary"
-        initial = self._adb.capture_screen(serial)
-        session.recorder.screen("00_initial", initial)
-        initial, summary_detection = self._verify_detail_summary(
-            session, serial, initial, deadline
-        )
+        with session.profiler.step("verify_detail_summary"):
+            initial = self._adb.capture_screen(serial)
+            session.recorder.screen("00_initial", initial)
+            initial, summary_detection = self._verify_detail_summary(
+                session, serial, initial, deadline
+            )
         session.current_step = "capture_summary"
-        self._save_capture(session, "summary", initial)
+        with session.profiler.step("capture_summary"):
+            self._save_capture(session, "summary", initial)
 
         if dry_run:
             session.current_step = "dry_run"
-            session.manifest = session.manifest.model_copy(
-                update={"scan_status": "incomplete", "failed_step": "dry_run"}
-            )
-            self._write_manifest(session.manifest_path, session.manifest)
-            return self._result(session, None, True, actions)
+            with session.profiler.step("finalize_dry_run"):
+                session.manifest = session.manifest.model_copy(
+                    update={"scan_status": "incomplete", "failed_step": "dry_run"}
+                )
+                self._write_manifest(session.manifest_path, session.manifest)
+                result = self._result(session, None, True, actions)
+            return result
 
         self._check_deadline(deadline)
         session.current_step = "scroll_to_moves"
-        moves, _ = self._scroll_to_moves(
-            session,
-            serial,
-            initial,
-            summary_detection,
-            deadline,
-        )
+        with session.profiler.step("scroll_to_moves"):
+            moves, _ = self._scroll_to_moves(
+                session,
+                serial,
+                initial,
+                summary_detection,
+                deadline,
+            )
         session.current_step = "capture_moves"
-        self._save_capture(session, "moves", moves)
+        with session.profiler.step("capture_moves"):
+            self._save_capture(session, "moves", moves)
 
         self._check_deadline(deadline)
         session.current_step = "open_action_menu"
-        menu_screen, menu_detection = self._open_action_menu(
-            session,
-            serial,
-            deadline,
-        )
+        with session.profiler.step("open_action_menu"):
+            menu_screen, menu_detection = self._open_action_menu(
+                session,
+                serial,
+                deadline,
+            )
         if menu_detection.appraisal_target is None:
             raise AutomationError("Action menu did not provide a safe OCR target for 調查寶可夢.")
 
         self._check_deadline(deadline)
         session.current_step = "open_appraisal"
         appraisal_target = menu_detection.appraisal_target
-        self._require_state(menu_detection, ("action_menu",))
-        session.recorder.screen("before_open_appraisal", menu_screen)
-        session.recorder.action(
-            name="open_appraisal",
-            kind="tap",
-            coordinates=asdict(appraisal_target),
-            executed=True,
-            before_state=menu_detection.state,
-        )
-        self._adb.tap(
-            serial,
-            appraisal_target.x,
-            appraisal_target.y,
-        )
+        with session.profiler.step("open_appraisal_tap"):
+            self._require_state(menu_detection, ("action_menu",))
+            session.recorder.screen("before_open_appraisal", menu_screen)
+            session.recorder.action(
+                name="open_appraisal",
+                kind="tap",
+                coordinates=asdict(appraisal_target),
+                executed=True,
+                before_state=menu_detection.state,
+            )
+            self._adb.tap(
+                serial,
+                appraisal_target.x,
+                appraisal_target.y,
+            )
 
-        entry_result = self._wait_for_appraisal_entry(
-            session,
-            serial,
-        )
+        with session.profiler.step("wait_for_appraisal_entry"):
+            entry_result = self._wait_for_appraisal_entry(
+                session,
+                serial,
+            )
         appraisal_screen = entry_result.png_bytes
         appraisal_detection = entry_result.detection
 
@@ -1110,29 +1313,31 @@ class AutoScanService:
         if appraisal_detection.state == "appraisal_dialogue":
             self._check_deadline(deadline)
             session.current_step = "advance_appraisal_dialogue_1"
-            self._require_state(appraisal_detection, ("appraisal_dialogue",))
-            session.recorder.screen(
-                "before_advance_appraisal_dialogue_1",
-                appraisal_screen,
-            )
-            session.recorder.action(
-                name="advance_appraisal_dialogue_1",
-                kind="tap",
-                coordinates=asdict(self._automation.appraisal_advance),
-                executed=True,
-                before_state=appraisal_detection.state,
-            )
-            self._adb.tap(
-                serial,
-                self._automation.appraisal_advance.x,
-                self._automation.appraisal_advance.y,
-            )
+            with session.profiler.step("advance_appraisal_dialogue"):
+                self._require_state(appraisal_detection, ("appraisal_dialogue",))
+                session.recorder.screen(
+                    "before_advance_appraisal_dialogue_1",
+                    appraisal_screen,
+                )
+                session.recorder.action(
+                    name="advance_appraisal_dialogue_1",
+                    kind="tap",
+                    coordinates=asdict(self._automation.appraisal_advance),
+                    executed=True,
+                    before_state=appraisal_detection.state,
+                )
+                self._adb.tap(
+                    serial,
+                    self._automation.appraisal_advance.x,
+                    self._automation.appraisal_advance.y,
+                )
             session.current_step = "wait_for_appraisal_bars"
-            wait_result = self._wait_for_appraisal_bars(
-                session,
-                serial,
-                deadline,
-            )
+            with session.profiler.step("wait_for_appraisal_bars"):
+                wait_result = self._wait_for_appraisal_bars(
+                    session,
+                    serial,
+                    deadline,
+                )
             appraisal_screen = wait_result.png_bytes
             appraisal_detection = wait_result.detection
             if wait_result.outcome == "unexpected":
@@ -1154,25 +1359,28 @@ class AutoScanService:
             raise AutomationError("IV bars were not detected. No additional tap was sent.")
 
         session.current_step = "capture_appraisal"
-        appraisal = self._adb.capture_screen(serial)
-        appraisal_detection = self._detect(
-            session, "appraisal_capture", appraisal, ("appraisal_bars",)
-        )
-        self._require_state(appraisal_detection, ("appraisal_bars",))
-        self._save_capture(session, "appraisal", appraisal)
+        with session.profiler.step("capture_appraisal"):
+            appraisal = self._adb.capture_screen(serial)
+            appraisal_detection = self._detect(
+                session, "appraisal_capture", appraisal, ("appraisal_bars",)
+            )
+            self._require_state(appraisal_detection, ("appraisal_bars",))
+            self._save_capture(session, "appraisal", appraisal)
 
         self._check_deadline(deadline)
         session.current_step = "exit_appraisal"
-        self._exit_appraisal(
-            session,
-            serial,
-            before=appraisal,
-            before_detection=appraisal_detection,
-        )
+        with session.profiler.step("exit_appraisal"):
+            self._exit_appraisal(
+                session,
+                serial,
+                before=appraisal,
+                before_detection=appraisal_detection,
+            )
 
         self._check_deadline(deadline)
         session.current_step = "recognize_scan"
-        recognition = self._reader.read_scan(session.scan_directory, debug=debug)
+        with session.profiler.step("recognize_scan"):
+            recognition = self._reader.read_scan(session.scan_directory, debug=debug)
         nickname_change: NicknameRenameResult | None = None
         if rename_with_iv:
             self._check_deadline(deadline)
@@ -1183,24 +1391,26 @@ class AutoScanService:
                 recognition,
                 deadline,
             )
-        session.manifest = session.manifest.model_copy(
-            update={"scan_status": "complete", "failed_step": None}
-        )
-        self._write_manifest(session.manifest_path, session.manifest)
-        logger.info(
-            "automatic_scan_completed",
-            extra={
-                "scan_id": session.manifest.scan_id,
-                "scan_directory": str(session.scan_directory.resolve()),
-            },
-        )
-        return self._result(
-            session,
-            recognition,
-            False,
-            actions,
-            nickname_change=nickname_change,
-        )
+        with session.profiler.step("finalize_scan"):
+            session.manifest = session.manifest.model_copy(
+                update={"scan_status": "complete", "failed_step": None}
+            )
+            self._write_manifest(session.manifest_path, session.manifest)
+            logger.info(
+                "automatic_scan_completed",
+                extra={
+                    "scan_id": session.manifest.scan_id,
+                    "scan_directory": str(session.scan_directory.resolve()),
+                },
+            )
+            result = self._result(
+                session,
+                recognition,
+                False,
+                actions,
+                nickname_change=nickname_change,
+            )
+        return result
 
     def _rename_with_iv(
         self,
@@ -1211,97 +1421,134 @@ class AutoScanService:
     ) -> NicknameRenameResult:
         """Restore the game-provided Chinese name, then append recognized IVs."""
 
-        values = (recognition.attack_iv, recognition.defense_iv, recognition.hp_iv)
-        if any(value is None for value in values):
-            raise AutomationError(
-                "Cannot rename with IV because attack, defense, or HP IV was not recognized."
+        with session.profiler.step("rename_validate_iv_suffix"):
+            values = (recognition.attack_iv, recognition.defense_iv, recognition.hp_iv)
+            if any(value is None for value in values):
+                raise AutomationError(
+                    "Cannot rename with IV because attack, defense, or HP IV was not recognized."
+                )
+            iv_suffix = "/".join(str(value) for value in values)
+            if (
+                re.fullmatch(
+                    r"(?:[0-9]|1[0-5])/(?:[0-9]|1[0-5])/(?:[0-9]|1[0-5])",
+                    iv_suffix,
+                )
+                is None
+            ):
+                raise AutomationError("IV suffix was not a valid half-width ASCII value.")
+        with session.profiler.step("rename_open_editor_reset"):
+            editor = self._open_nickname_editor(
+                session, serial, deadline, "open_nickname_editor_reset"
             )
-        iv_suffix = "/".join(str(value) for value in values)
-        if re.fullmatch(r"(?:[0-9]|1[0-5])/(?:[0-9]|1[0-5])/(?:[0-9]|1[0-5])", iv_suffix) is None:
-            raise AutomationError("IV suffix was not a valid half-width ASCII value.")
-        editor = self._open_nickname_editor(
-            session, serial, deadline, "open_nickname_editor_reset"
-        )
-        self._clear_nickname(
-            session, serial, "clear_nickname_for_default", editor.state
-        )
-        default_summary = self._confirm_nickname_editor(
-            session,
-            serial,
-            deadline,
-            "confirm_default_nickname",
-        )
-        default_nickname = _summary_name_from_detection(default_summary.detection)
-        expected_nickname = f"{default_nickname}{iv_suffix}"
-        editor = self._open_nickname_editor(
-            session, serial, deadline, "open_nickname_editor_append_iv"
-        )
-        self._append_nickname_text(
-            session, serial, iv_suffix, "append_iv_suffix", editor.state
-        )
-        renamed_summary = self._confirm_nickname_editor(
-            session,
-            serial,
-            deadline,
-            "confirm_iv_nickname",
-            expected_nickname=expected_nickname,
-        )
-        atomic_write_bytes(
-            session.scan_directory / "renamed_summary.png",
-            renamed_summary.png_bytes,
-        )
-        summary_observed = self._detector.read_summary_nickname(renamed_summary.png_bytes)
-        if nickname_text_skeleton(summary_observed) != nickname_text_skeleton(
-            expected_nickname
-        ):
-            raise AutomationError(
-                "The renamed summary did not show the expected nickname characters. "
-                "No further input was sent."
+        with session.profiler.step("rename_clear_to_default"):
+            self._clear_nickname(
+                session, serial, "clear_nickname_for_default", editor.state
             )
-        editor_candidates = renamed_summary.detection.details.get(
-            "verified_editor_nickname_candidates"
-        )
-        editor_observed: str | None = None
-        if isinstance(editor_candidates, list):
-            editor_observed = next(
-                (
-                    value
-                    for value in editor_candidates
-                    if isinstance(value, str)
-                    and compact_editor_nickname_text(value) == expected_nickname
+        with session.profiler.step("rename_confirm_default"):
+            default_summary = self._confirm_nickname_editor(
+                session,
+                serial,
+                deadline,
+                "confirm_default_nickname",
+            )
+        with session.profiler.step("rename_read_default_name"):
+            default_nickname = compact_editor_nickname_text(
+                self._detector.read_summary_nickname(default_summary.png_bytes)
+            )
+            if not default_nickname:
+                raise AutomationError(
+                    "Default nickname could not be read from the dedicated wide "
+                    "summary row after resetting it; no IV suffix was sent."
+                )
+            session.recorder.detection(
+                "verified_default_nickname_wide",
+                PageDetection(
+                    state="detail_summary",
+                    confidence=default_summary.detection.confidence,
+                    matched_texts=(default_nickname,),
+                    details={
+                        "nickname_evidence": "wide_summary_row",
+                        "source_state": default_summary.detection.state,
+                    },
                 ),
-                None,
             )
-        if editor_observed is None:
-            raise AutomationError(
-                "Verified editor nickname evidence was lost before persistence."
+            expected_nickname = f"{default_nickname}{iv_suffix}"
+        with session.profiler.step("rename_open_editor_append_iv"):
+            editor = self._open_nickname_editor(
+                session, serial, deadline, "open_nickname_editor_append_iv"
             )
-        evidence = NicknameRenameResult(
-            nickname_before=recognition.pokemon_name.value or "",
-            default_nickname=default_nickname,
-            expected_nickname=expected_nickname,
-            editor_observed_nickname=editor_observed,
-            summary_observed_nickname=summary_observed,
-            summary_png=renamed_summary.png_bytes,
-            summary_detection=renamed_summary.detection,
-        )
-        atomic_write_text(
-            session.scan_directory / "nickname_change.json",
-            json.dumps(
-                {
-                    "nickname_before": evidence.nickname_before,
-                    "default_nickname": evidence.default_nickname,
-                    "nickname_after": evidence.expected_nickname,
-                    "editor_observed_nickname": evidence.editor_observed_nickname,
-                    "summary_observed_nickname": evidence.summary_observed_nickname,
-                    "summary_filename": "renamed_summary.png",
-                    "status": "verified",
-                },
-                ensure_ascii=False,
-                indent=2,
+        with session.profiler.step("rename_append_iv_suffix"):
+            self._append_nickname_text(
+                session, serial, iv_suffix, "append_iv_suffix", editor.state
             )
-            + "\n",
-        )
+        with session.profiler.step("rename_confirm_iv"):
+            renamed_summary = self._confirm_nickname_editor(
+                session,
+                serial,
+                deadline,
+                "confirm_iv_nickname",
+                expected_nickname=expected_nickname,
+            )
+        with session.profiler.step("rename_verify_final_summary"):
+            atomic_write_bytes(
+                session.scan_directory / "renamed_summary.png",
+                renamed_summary.png_bytes,
+            )
+            summary_observed = self._detector.read_summary_nickname(
+                renamed_summary.png_bytes
+            )
+            if nickname_text_skeleton(summary_observed) != nickname_text_skeleton(
+                expected_nickname
+            ):
+                raise AutomationError(
+                    "The renamed summary did not show the expected nickname characters. "
+                    "No further input was sent."
+                )
+            editor_candidates = renamed_summary.detection.details.get(
+                "verified_editor_nickname_candidates"
+            )
+            editor_observed: str | None = None
+            if isinstance(editor_candidates, list):
+                editor_observed = next(
+                    (
+                        value
+                        for value in editor_candidates
+                        if isinstance(value, str)
+                        and compact_editor_nickname_text(value) == expected_nickname
+                    ),
+                    None,
+                )
+            if editor_observed is None:
+                raise AutomationError(
+                    "Verified editor nickname evidence was lost before persistence."
+                )
+        with session.profiler.step("rename_persist_evidence"):
+            evidence = NicknameRenameResult(
+                nickname_before=recognition.pokemon_name.value or "",
+                default_nickname=default_nickname,
+                expected_nickname=expected_nickname,
+                editor_observed_nickname=editor_observed,
+                summary_observed_nickname=summary_observed,
+                summary_png=renamed_summary.png_bytes,
+                summary_detection=renamed_summary.detection,
+            )
+            atomic_write_text(
+                session.scan_directory / "nickname_change.json",
+                json.dumps(
+                    {
+                        "nickname_before": evidence.nickname_before,
+                        "default_nickname": evidence.default_nickname,
+                        "nickname_after": evidence.expected_nickname,
+                        "editor_observed_nickname": evidence.editor_observed_nickname,
+                        "summary_observed_nickname": evidence.summary_observed_nickname,
+                        "summary_filename": "renamed_summary.png",
+                        "status": "verified",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+            )
         return evidence
 
     def _open_nickname_editor(
@@ -2131,34 +2378,6 @@ class AutoScanService:
             timeout,
         )
 
-    def _tap(
-        self,
-        session: _Session,
-        serial: str,
-        *,
-        name: str,
-        point: Point,
-        before: bytes,
-        before_detection: PageDetection,
-        before_expected: ExpectedStates,
-        after_expected: ExpectedStates,
-    ) -> bytes:
-        self._require_state(before_detection, before_expected)
-        session.recorder.screen(f"before_{name}", before)
-        session.recorder.action(
-            name=name,
-            kind="tap",
-            coordinates=asdict(point),
-            executed=True,
-            before_state=before_detection.state,
-        )
-        self._adb.tap(serial, point.x, point.y)
-        stable = self._wait(session, serial, name)
-        session.recorder.screen(f"after_{name}", stable)
-        after_detection = self._detect(session, f"after_{name}", stable, after_expected)
-        self._require_state(after_detection, after_expected)
-        return stable
-
     def _exit_appraisal(
         self,
         session: _Session,
@@ -2227,11 +2446,6 @@ class AutoScanService:
             "15 seconds after exiting appraisal. No additional input was sent."
         )
 
-    def _wait(self, session: _Session, serial: str, label: str) -> bytes:
-        result = self._stable_waiter(lambda: self._adb.capture_screen(serial))
-        session.recorder.stability(label, result)
-        return result.png_bytes
-
     def _detect(
         self,
         session: _Session,
@@ -2242,6 +2456,10 @@ class AutoScanService:
         detection = self._detector.detect(png_bytes, expected=expected)
         session.recorder.detection(label, detection)
         return detection
+
+    def _ocr_seconds_total(self) -> float:
+        value = getattr(self._reader, "ocr_seconds_total", 0.0)
+        return float(value) if isinstance(value, int | float) else 0.0
 
     @staticmethod
     def _require_state(

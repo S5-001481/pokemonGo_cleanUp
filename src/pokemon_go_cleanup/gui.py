@@ -11,12 +11,14 @@ current implementation.
 
 from __future__ import annotations
 
+import csv
 import os
 import queue
 import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Final
 
@@ -35,6 +37,28 @@ DEFAULT_CSV: Final = PROJECT_ROOT / "inventory.csv"
 SCAN_ROOT: Final = PROJECT_ROOT / "data" / "scans"
 
 
+def count_csv_data_rows(path: Path) -> int | None:
+    """Return data-row count for one readable CSV, or ``None`` while unavailable."""
+
+    try:
+        with path.open("r", encoding="utf-8", newline="") as source:
+            reader = csv.reader(source)
+            if next(reader, None) is None:
+                return 0
+            return sum(1 for row in reader if row)
+    except (OSError, UnicodeError, csv.Error):
+        return None
+
+
+def format_elapsed_time(elapsed_seconds: float) -> str:
+    """Format a non-negative elapsed duration as hours, minutes, and seconds."""
+
+    total_seconds = max(0, int(elapsed_seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
 class PokemonGoCleanupGui(tk.Tk):
     """Small WSL GUI that launches the existing command-line application."""
 
@@ -48,6 +72,9 @@ class PokemonGoCleanupGui(tk.Tk):
         self._worker: threading.Thread | None = None
         self._messages: queue.Queue[tuple[str, object]] = queue.Queue()
         self._current_task = ""
+        self._batch_progress_csv: Path | None = None
+        self._batch_baseline_rows = 0
+        self._scan_started_at: float | None = None
 
         self._limit_var = tk.StringVar(value="5")
         self._delay_var = tk.StringVar(value="2")
@@ -56,6 +83,8 @@ class PokemonGoCleanupGui(tk.Tk):
         self._resume_var = tk.BooleanVar(value=False)
         self._rename_with_iv_var = tk.BooleanVar(value=False)
         self._status_var = tk.StringVar(value="就绪")
+        self._successful_scans_var = tk.StringVar(value="0")
+        self._elapsed_time_var = tk.StringVar(value="00:00:00")
         self._device_var = tk.StringVar(value="尚未检查手机")
 
         self._build_ui()
@@ -67,6 +96,8 @@ class PokemonGoCleanupGui(tk.Tk):
         style.configure("Title.TLabel", font=("", 18, "bold"))
         style.configure("Section.TLabelframe.Label", font=("", 11, "bold"))
         style.configure("Status.TLabel", font=("", 10, "bold"))
+        style.configure("Counter.TLabel", font=("", 18, "bold"))
+        style.configure("Timer.TLabel", font=("", 12, "bold"))
 
         outer = ttk.Frame(self, padding=16)
         outer.pack(fill=tk.BOTH, expand=True)
@@ -120,6 +151,34 @@ class PokemonGoCleanupGui(tk.Tk):
             textvariable=self._limit_var,
             width=12,
         ).grid(row=0, column=1, sticky=tk.W, pady=5)
+
+        scan_progress = ttk.Frame(settings)
+        scan_progress.grid(
+            row=0,
+            column=2,
+            rowspan=2,
+            sticky=tk.NE,
+            padx=(24, 0),
+            pady=5,
+        )
+        scan_count = ttk.Frame(scan_progress)
+        scan_count.pack(anchor=tk.E)
+        ttk.Label(scan_count, text="本次已成功扫描").pack(side=tk.LEFT)
+        ttk.Label(
+            scan_count,
+            textvariable=self._successful_scans_var,
+            style="Counter.TLabel",
+        ).pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Label(scan_count, text="只").pack(side=tk.LEFT)
+
+        scan_timer = ttk.Frame(scan_progress)
+        scan_timer.pack(anchor=tk.E, pady=(4, 0))
+        ttk.Label(scan_timer, text="本次已用时间").pack(side=tk.LEFT)
+        ttk.Label(
+            scan_timer,
+            textvariable=self._elapsed_time_var,
+            style="Timer.TLabel",
+        ).pack(side=tk.LEFT, padx=(10, 0))
 
         ttk.Label(settings, text="切换前等待秒数").grid(
             row=1, column=0, sticky=tk.W, padx=(0, 10), pady=5
@@ -224,6 +283,15 @@ class PokemonGoCleanupGui(tk.Tk):
             command=self._clear_log,
         ).pack(side=tk.RIGHT)
 
+        status_row = ttk.Frame(outer, padding=(10, 8))
+        status_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(status_row, text="状态：").pack(side=tk.LEFT)
+        ttk.Label(
+            status_row,
+            textvariable=self._status_var,
+            style="Status.TLabel",
+        ).pack(side=tk.LEFT)
+
         log_frame = ttk.LabelFrame(
             outer,
             text="运行日志",
@@ -239,15 +307,6 @@ class PokemonGoCleanupGui(tk.Tk):
             font=("TkFixedFont", 10),
         )
         self._log.pack(fill=tk.BOTH, expand=True)
-
-        status_row = ttk.Frame(outer)
-        status_row.pack(fill=tk.X, pady=(8, 0))
-        ttk.Label(status_row, text="状态：").pack(side=tk.LEFT)
-        ttk.Label(
-            status_row,
-            textvariable=self._status_var,
-            style="Status.TLabel",
-        ).pack(side=tk.LEFT)
 
     def _choose_csv(self) -> None:
         current = Path(self._csv_var.get()).expanduser()
@@ -355,7 +414,12 @@ class PokemonGoCleanupGui(tk.Tk):
             command.append("--rename-with-iv")
         if resume:
             command.append("--resume")
-        self._start_command(command, task="scan-batch", heading="开始批量扫描")
+        self._start_command(
+            command,
+            task="scan-batch",
+            heading="开始批量扫描",
+            progress_csv=csv_path,
+        )
 
     def _start_command(
         self,
@@ -363,12 +427,19 @@ class PokemonGoCleanupGui(tk.Tk):
         *,
         task: str,
         heading: str,
+        progress_csv: Path | None = None,
     ) -> None:
         if self._process is not None:
             messagebox.showinfo("正在运行", "已有一个任务正在运行。")
             return
 
         self._current_task = task
+        if task in ("scan-one", "scan-batch"):
+            self._successful_scans_var.set("0")
+            self._elapsed_time_var.set("00:00:00")
+        self._batch_progress_csv = progress_csv
+        baseline_rows = count_csv_data_rows(progress_csv) if progress_csv is not None else None
+        self._batch_baseline_rows = baseline_rows or 0
         self._append_log("")
         self._append_log(f"===== {heading} =====")
         self._append_log("$ " + " ".join(command))
@@ -393,10 +464,14 @@ class PokemonGoCleanupGui(tk.Tk):
             )
         except OSError as error:
             self._process = None
+            self._scan_started_at = None
             self._set_running(False)
             self._status_var.set("启动失败")
             messagebox.showerror("启动失败", str(error))
             return
+
+        if task in ("scan-one", "scan-batch"):
+            self._scan_started_at = time.monotonic()
 
         process = self._process
         self._worker = threading.Thread(
@@ -433,10 +508,18 @@ class PokemonGoCleanupGui(tk.Tk):
                     self._handle_worker_error(str(payload))
         except queue.Empty:
             pass
+        self._refresh_batch_success_count()
+        self._refresh_scan_elapsed_time()
         self.after(100, self._poll_messages)
 
     def _handle_process_done(self, return_code: int) -> None:
         task = self._current_task
+        self._refresh_batch_success_count()
+        self._refresh_scan_elapsed_time()
+        if task in ("scan-one", "scan-batch"):
+            self._scan_started_at = None
+        if task == "scan-one" and return_code == 0:
+            self._successful_scans_var.set("1")
         self._process = None
         self._worker = None
         self._current_task = ""
@@ -455,6 +538,21 @@ class PokemonGoCleanupGui(tk.Tk):
             self._append_log(f"===== 失败：退出码 {return_code} =====")
             if task == "device":
                 self._device_var.set("● 未能连接手机，请查看日志")
+
+    def _refresh_batch_success_count(self) -> None:
+        if self._current_task != "scan-batch" or self._batch_progress_csv is None:
+            return
+        current_rows = count_csv_data_rows(self._batch_progress_csv)
+        if current_rows is None:
+            return
+        successful_rows = max(0, current_rows - self._batch_baseline_rows)
+        self._successful_scans_var.set(str(successful_rows))
+
+    def _refresh_scan_elapsed_time(self) -> None:
+        if self._scan_started_at is None:
+            return
+        elapsed_seconds = time.monotonic() - self._scan_started_at
+        self._elapsed_time_var.set(format_elapsed_time(elapsed_seconds))
 
     def _handle_worker_error(self, detail: str) -> None:
         self._append_log(f"GUI 读取日志失败：{detail}")

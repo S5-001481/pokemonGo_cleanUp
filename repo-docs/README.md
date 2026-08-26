@@ -30,6 +30,7 @@ to see that lifecycle end to end; use the
 | Install and use the CLI | [Set up Windows, ADB, and Huawei authorization](../README.md) | Native Windows commands, Platform-Tools setup, USB debugging, and troubleshooting. |
 | Audit a behavior claim | [Inspect the source evidence](references/source-evidence.md) | Evidence passes, confidence labels, source/test links, caveats, and falsifying checks. |
 | See what changed over time | [Review project-guide changes](change-log.md) | Meaningful requests, actions, verification, and sync state. |
+| Review the 2026-08-26 debugging session | [Read the Chinese problem/change summary](2026-08-26-debugging-summary.zh-CN.md) | Rename, OCR/performance, GUI, special layouts, resume, switching, verification, and remaining live checks. |
 
 ## The short model
 
@@ -45,8 +46,10 @@ The downstream dataset path fully decodes present PNGs, validates typed JSON,
 
 The automatic path replaces user handoffs with a narrower state machine: it
 requires the fixed 1440x3120 layout, verifies the allowed pre-state before every
-input, waits for visual stability afterward, and refuses to guess the appraisal
-menu row. Follow the automatic walkthrough before running it on a phone.
+input, polls for the expected target state after actions, and refuses to guess the
+appraisal menu row. It does not use whole-screen pixel stability because the CP
+background and Pokémon model are permanently animated. Follow the automatic
+walkthrough before running it on a phone.
 separates missing artifacts from corrupt ones, and protects human annotations.
 Follow [that validation-to-annotation handoff](walkthroughs/dataset-validation-and-annotation.md)
 when the scan directory already exists.
@@ -95,6 +98,38 @@ Exact source and test links live in the
   traffic inspection, and credentials remain outside.
 - A physical one-scan run completed. The first batch attempt safely stopped before
   input on a black screen; two-Pokémon switching still needs the prepared phone.
+- The Tkinter launcher reports successful scans for the current run as a large
+  number in the open area to the right of the maximum-scan input. Single-scan
+  success is counted only on exit 0; batch progress reads complete records from
+  the atomically replaced CSV and subtracts the resume baseline, so historical
+  rows and failed partial scans are not counted. A monotonic `HH:MM:SS` timer sits
+  directly below the count, resets only for single/batch scan starts, updates
+  during the child process, and freezes at the final complete, failed, or stopped
+  duration.
+- Debug-enabled automatic scans write one monotonic `debug/automation/timings.json`
+  per scan directory. Ordered navigation, capture, recognition, finalization,
+  and rename substeps retain durations and completed/failed outcomes; the file is
+  finalized on success, safe failure, Ctrl+C, and dry run. A batch therefore has
+  a separate profile for every attempted Pokémon, including the failed item.
+  Each step and the top level split out cumulative OCR-engine time and report
+  `stable_wait_seconds: 0`, confirming that no production action waits for full-screen
+  stability.
+- `detail_summary` OCR uses progressive fallback without changing page identity
+  comparators: three ordinary CP and name variants return immediately on valid
+  name+CP; an HSV near-white mask runs after an ordinary CP miss, the six threshold
+  variants run only after HSV also misses, and HP OCR runs last. Final recognition
+  follows the same rule. Saved-real replay retains the known names and CP values,
+  including `古月鳥` CP1217, and recovers `索財靈` CP458 from some anniversary
+  animation frames without accepting isolated artwork numbers. A frame that still
+  loses CP cannot replace strict identity globally: only a verified renamed
+  pre-switch page may retry CP twice, then use exact nickname+HP+static fingerprint
+  evidence for one swipe.
+- Final move recognition keeps the normal anchor crop first and adds explicit
+  Shadow and Dynamax fallbacks only for an upper move-section anchor accompanied
+  by `暗影獎勵` or `極巨招式`. Modifier and Max Move labels remain excluded from
+  regular move names. Saved-real replay recovers `冰息`/`遷怒` for shadow 冰雪龍,
+  `躍起`/`遷怒` for shadow 果然翁, and `踢倒`/`地獄翻滾` for Dynamax 豪力.
+  The existing CSV warnings/remarks field records `类型：暗影` or `类型：极巨化`.
 - Ground truth remains manual and can be replaced only by confirmation or `--force`.
 
 Evidence status: Confirmed unless noted.

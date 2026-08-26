@@ -67,6 +67,12 @@ Pokémon GO Cleanup.bat
 5. 只有续接所选批量 CSV 时才勾选“续接已有 CSV”。未勾选时，GUI 不会覆盖
    已存在的 CSV。
 
+“最多扫描数量”同一行右侧的空白区域会用大号数字显示“本次已成功扫描”。
+单只扫描成功后显示 1；批量扫描每原子写入一条验证成功的 CSV 数据行就会
+实时更新。resume 只统计本次新增加的行，不把 CSV 中原有的历史行计算进去。
+成功计数正下方显示“本次已用时间”，单只或批量扫描启动时归零，运行中按
+`时:分:秒` 更新，并在完成、失败或手动停止后保留最终耗时。
+
 ## IV 改名的键盘要求
 
 在图形界面勾选“重置中文名后追加 IV”，或使用 `scan-auto-one`、
@@ -163,6 +169,8 @@ data/
             ├── nickname_change.json # 精确的改名验证证据
             ├── ground_truth.json  # 可选，由 annotate 创建
             └── debug/             # 可选，已被 Git 忽略
+                └── automation/
+                    └── timings.json # 使用 --debug 时的逐步骤单调时钟耗时
 ```
 
 单次截图的 PNG 与同名 JSON sidecar 位于：
@@ -175,10 +183,26 @@ data/screenshots/YYYY-MM-DD/
 `recognition.json` 保存机器识别值和 warning；
 `ground_truth.json` 独立保存经过校验的人工输入值。
 
+启用 `--debug` 后，每次自动扫描都会写入
+`debug/automation/timings.json`。其中记录导航、截图、识别和各个改名子步骤
+基于单调时钟测得的真实耗时、总耗时，以及最终的 `complete`、`failed`、
+`interrupted` 或 `dry_run` 结果。每个步骤和文件顶层还会记录 `ocr_seconds`
+与 `stable_wait_seconds`；后者固定为 0，因为正式自动流程只轮询目标页面状态，
+已经没有任何全屏稳定等待。批量模式下，每只宝可梦自己的扫描目录各有
+一份，失败的那一只也会保留，因此不必再通过文件修改时间估算耗时。
+
 批量扫描只有在单只扫描完成且身份、改名检查全部通过后，才会原子写入一行
 CSV。启用改名的新 CSV 当前共有 16 列，其中包括 `nickname_before`、
-`nickname_after` 和 `rename_status`。使用 `--resume` 时，程序会先验证表头、
-历史扫描目录、manifest、已保存截图、重复 scan ID 和当前页面位置。
+`nickname_after` 和 `rename_status`。现有 `warnings` 列同时作为备注字段：
+明确识别到暗影或极巨化招式布局时，会写入 `类型：暗影` 或 `类型：极巨化`，
+不会改变 CSV 表头。使用 `--resume` 时，程序会先验证表头、
+历史扫描目录、manifest、已保存截图、重复 scan ID 和当前页面位置。预检查会
+先比较可靠名字：名字明确不同时无需 CP 且不会预先左滑；同名但 CP 缺失时会
+做两次 CP-only 重试，仍失败只能使用名字、HP 和静态 fingerprint 全部一致的
+强兜底。普通未改名 switch、duplicate、改名转换和 wrap 验证仍保持严格。
+只有已经验证改名的页面在左滑前缺失 CP 时，才会再做两次 CP-only 重试；若仍
+失败，必须同时匹配已保存的预期昵称、完全一致的 HP 和现有静态 fingerprint
+阈值，而且只允许发送一次左滑。
 
 ## 自动扫描的安全与失败行为
 

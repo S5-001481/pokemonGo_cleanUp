@@ -9,7 +9,7 @@ import logging
 import math
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Final, Literal, Protocol, cast
 
@@ -30,6 +30,7 @@ from pokemon_go_cleanup.exceptions import BatchAutomationError, LocalStorageErro
 from pokemon_go_cleanup.models import Device, ScanManifest
 from pokemon_go_cleanup.recognition import (
     RecognitionResult,
+    normalize_cp_candidate,
     normalize_ocr_text,
     parse_cp_raw,
 )
@@ -74,6 +75,10 @@ class HuaweiMate30BatchConfig:
     )
     poll_interval_seconds: float = 0.5
     switch_timeout_seconds: float = 15.0
+    resume_cp_retry_frames: int = 2
+    resume_cp_retry_interval_seconds: float = 0.5
+    verified_switch_cp_retry_frames: int = 2
+    verified_switch_cp_retry_interval_seconds: float = 0.5
     fingerprint_crop: tuple[int, int, int, int] = (100, 1550, 1340, 2300)
     fingerprint_size: int = 16
     duplicate_distance_threshold: int = 8
@@ -135,6 +140,26 @@ class SummaryIdentity:
     cp: int
     page_fingerprint: str
     hp_text: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ResumeObservation:
+    """Partial current-page evidence used only before a resumed batch starts."""
+
+    pokemon_name: str
+    cp: int | None
+    hp_text: str | None
+    page_fingerprint: str
+    observed_nickname: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedRenameSwitchObservation:
+    """Name and static evidence used only by the renamed pre-switch CP retry."""
+
+    pokemon_name: str
+    hp_text: str | None
+    page_fingerprint: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,6 +266,10 @@ class BatchPageDetector(Protocol):
     ) -> PageDetection: ...
 
     def read_summary_nickname(self, png_bytes: bytes) -> str: ...
+
+    def read_summary_cp(self, png_bytes: bytes) -> int | None: ...
+
+    def read_summary_hp(self, png_bytes: bytes) -> str | None: ...
 
 
 def _static_summary_image(
@@ -391,6 +420,78 @@ def summary_identity(
         cp,
         page_fingerprint(png_bytes, config),
         hp_text,
+    )
+
+
+def resume_observation(
+    detection: PageDetection,
+    png_bytes: bytes,
+    *,
+    observed_nickname: str | None,
+    config: HuaweiMate30BatchConfig = HUAWEI_MATE_30_BATCH,
+) -> ResumeObservation:
+    """Extract name-first resume evidence while leaving strict identities unchanged."""
+
+    if detection.state != "detail_summary":
+        raise BatchAutomationError(f"Expected detail_summary; detected {detection.state}.")
+    cp: int | None = None
+    name: str | None = None
+    for raw in detection.matched_texts:
+        normalized_cp = normalize_cp_candidate(raw)
+        if normalized_cp is not None and cp is None:
+            cp = int(normalized_cp[2:])
+            continue
+        normalized = normalize_ocr_text(raw)
+        if normalized and name is None:
+            name = normalized
+    if name is None:
+        raise BatchAutomationError(
+            "Resume detail_summary did not provide a reliable Pokémon name."
+        )
+    hp_value = detection.details.get("hp")
+    hp_text = hp_value if isinstance(hp_value, str) else None
+    compact_nickname = (
+        compact_editor_nickname_text(observed_nickname)
+        if observed_nickname is not None
+        else ""
+    )
+    return ResumeObservation(
+        pokemon_name=name,
+        cp=cp,
+        hp_text=hp_text,
+        page_fingerprint=page_fingerprint(png_bytes, config),
+        observed_nickname=compact_nickname or None,
+    )
+
+
+def _verified_rename_switch_observation(
+    detection: PageDetection,
+    png_bytes: bytes,
+    config: HuaweiMate30BatchConfig,
+) -> _VerifiedRenameSwitchObservation:
+    """Extract only the evidence needed to retry a verified renamed switch."""
+
+    if detection.state != "detail_summary":
+        raise BatchAutomationError(
+            f"Verified rename switch expected detail_summary; detected {detection.state}."
+        )
+    name: str | None = None
+    for raw in detection.matched_texts:
+        if normalize_cp_candidate(raw) is not None:
+            continue
+        normalized = normalize_ocr_text(raw)
+        if normalized:
+            name = normalized
+            break
+    if name is None:
+        raise BatchAutomationError(
+            "Verified rename switch did not provide a reliable Pokémon name."
+        )
+    hp_value = detection.details.get("hp")
+    return _VerifiedRenameSwitchObservation(
+        pokemon_name=name,
+        hp_text=hp_value if isinstance(hp_value, str) else None,
+        page_fingerprint=page_fingerprint(png_bytes, config),
     )
 
 
@@ -757,6 +858,11 @@ class BatchScanService:
                 completed_identity,
                 scan.scan_directory,
                 debug=debug,
+                expected_nickname=(
+                    scan.nickname_change.expected_nickname
+                    if rename_with_iv and scan.nickname_change is not None
+                    else None
+                ),
             )
             next_identity = switched.identity
             if next_identity is None:
@@ -973,20 +1079,125 @@ class BatchScanService:
                 "Resume requires the current phone page to be detail_summary; "
                 f"detected {current_detection.state}. No swipe was sent."
             )
-        current_identity = summary_identity(
+        observed_nickname = self._detector.read_summary_nickname(current_png)
+        current_observation = resume_observation(
             current_detection,
             current_png,
-            self._config,
+            observed_nickname=observed_nickname,
+            config=self._config,
         )
-        resume_observed_nickname: str | None = None
+        expected_name = (
+            last_row.nickname_after
+            if last_row.rename_status == "verified"
+            else last_row.pokemon_name
+        )
+        if not expected_name:
+            raise BatchAutomationError(
+                "Resume CSV last row has no reliable name or verified nickname."
+            )
+        expected_skeleton = nickname_text_skeleton(expected_name)
+        generic_name_matches = nickname_text_skeleton(
+            current_observation.pokemon_name
+        ) == expected_skeleton
+        wide_name_matches = (
+            current_observation.observed_nickname is not None
+            and nickname_text_skeleton(current_observation.observed_nickname)
+            == expected_skeleton
+        )
+        clearly_different_name = (
+            not generic_name_matches
+            and current_observation.observed_nickname is not None
+            and not wide_name_matches
+        )
+        if clearly_different_name:
+            validated_previous, _ = self._resume_fallback_baseline(last_row)
+            recorder.json(
+                "resume_state.json",
+                {
+                    "current_observation": asdict(current_observation),
+                    "expected_name": expected_name,
+                    "last_identity": asdict(validated_previous),
+                    "name_relation": "different",
+                    "same_as_last": False,
+                    "cp_retry_attempts": [],
+                    "resume_pre_switch_executed": False,
+                },
+            )
+            return
+
+        cp_retry_attempts: list[dict[str, object]] = []
+        if current_observation.cp is None:
+            current_observation, cp_retry_attempts = self._retry_resume_cp(
+                serial,
+                current_observation,
+                recorder,
+            )
+
+        if current_observation.cp is None:
+            previous_identity, previous_png = self._resume_fallback_baseline(last_row)
+            previous_hp = self._detector.read_summary_hp(previous_png)
+            previous_identity = replace(previous_identity, hp_text=previous_hp)
+            fingerprint_gap = fingerprint_distance(
+                current_observation.page_fingerprint,
+                previous_identity.page_fingerprint,
+            )
+            strong_fallback = (
+                generic_name_matches
+                and wide_name_matches
+                and current_observation.hp_text is not None
+                and previous_identity.hp_text is not None
+                and current_observation.hp_text == previous_identity.hp_text
+                and fingerprint_gap <= self._config.duplicate_distance_threshold
+            )
+            state_data: dict[str, object] = {
+                "current_observation": asdict(current_observation),
+                "expected_name": expected_name,
+                "name_relation": "same",
+                "last_identity": asdict(previous_identity),
+                "fingerprint_distance": fingerprint_gap,
+                "duplicate_distance_threshold": self._config.duplicate_distance_threshold,
+                "strong_cp_missing_fallback": strong_fallback,
+                "same_as_last": strong_fallback,
+                "cp_retry_attempts": cp_retry_attempts,
+                "resume_pre_switch_executed": strong_fallback,
+            }
+            recorder.json("resume_state.json", state_data)
+            if not strong_fallback:
+                raise BatchAutomationError(
+                    "Resume could not read CP and did not have exact name/nickname, "
+                    "HP, and static-fingerprint evidence for the last Pokémon. "
+                    "No swipe or scan was sent."
+                )
+            switched = self._switch_after_resume_fallback(
+                serial,
+                previous_identity,
+                current_observation,
+                last_row.scan_directory,
+                debug=debug,
+            )
+            if switched.identity is None:
+                raise AssertionError("A completed resume switch has no summary identity.")
+            state_data["next_identity"] = asdict(switched.identity)
+            recorder.json("resume_state.json", state_data)
+            return
+
+        current_identity = SummaryIdentity(
+            pokemon_name=current_observation.pokemon_name,
+            cp=current_observation.cp,
+            page_fingerprint=current_observation.page_fingerprint,
+            hp_text=current_observation.hp_text,
+        )
+        resume_observed_nickname = current_observation.observed_nickname
         if last_row.rename_status == "verified":
-            previous_identity = self._completed_identity_from_row(last_row)
-            if previous_identity is None or last_row.nickname_after is None:
+            restored_identity = self._completed_identity_from_row(last_row)
+            if restored_identity is None or last_row.nickname_after is None:
                 raise BatchAutomationError(
                     "Resume could not restore the last verified renamed identity."
                 )
-            resume_observed_nickname = self._detector.read_summary_nickname(current_png)
-            nickname_matches = nickname_text_skeleton(resume_observed_nickname) == (
+            previous_identity = restored_identity
+            nickname_matches = nickname_text_skeleton(
+                resume_observed_nickname or ""
+            ) == (
                 nickname_text_skeleton(last_row.nickname_after)
             )
             same_as_last = nickname_matches and same_static_summary(
@@ -1046,6 +1257,8 @@ class BatchScanService:
         if last_row.rename_status == "verified":
             state_data["expected_nickname"] = last_row.nickname_after
             state_data["observed_nickname"] = resume_observed_nickname
+        state_data["current_observation"] = asdict(current_observation)
+        state_data["cp_retry_attempts"] = cp_retry_attempts
         state_data["resume_pre_switch_executed"] = same_as_last
         recorder.json("resume_state.json", state_data)
         if same_as_last:
@@ -1054,11 +1267,136 @@ class BatchScanService:
                 previous_identity,
                 last_row.scan_directory,
                 debug=debug,
+                expected_nickname=(
+                    last_row.nickname_after
+                    if last_row.rename_status == "verified"
+                    else None
+                ),
             )
             if switched.identity is None:
                 raise AssertionError("A completed resume switch has no summary identity.")
             state_data["next_identity"] = asdict(switched.identity)
             recorder.json("resume_state.json", state_data)
+
+    def _retry_resume_cp(
+        self,
+        serial: str,
+        observation: ResumeObservation,
+        recorder: _BatchDebugRecorder,
+    ) -> tuple[ResumeObservation, list[dict[str, object]]]:
+        attempts: list[dict[str, object]] = []
+        for attempt in range(1, self._config.resume_cp_retry_frames + 1):
+            self._sleeper(self._config.resume_cp_retry_interval_seconds)
+            screenshot = self._adb.capture_screen(serial)
+            recorder.screen(f"resume_cp_retry_{attempt}", screenshot)
+            retry_fingerprint = page_fingerprint(screenshot, self._config)
+            distance = fingerprint_distance(
+                observation.page_fingerprint,
+                retry_fingerprint,
+            )
+            if distance > self._config.duplicate_distance_threshold:
+                attempts.append(
+                    {
+                        "attempt": attempt,
+                        "cp": None,
+                        "fingerprint_distance": distance,
+                        "page_changed": True,
+                    }
+                )
+                recorder.json("resume_cp_retry_state.json", {"attempts": attempts})
+                raise BatchAutomationError(
+                    "Resume page changed during CP-only retry. No swipe or scan was sent."
+                )
+            cp = self._detector.read_summary_cp(screenshot)
+            attempts.append(
+                {
+                    "attempt": attempt,
+                    "cp": cp,
+                    "fingerprint_distance": distance,
+                    "page_changed": False,
+                }
+            )
+            recorder.json("resume_cp_retry_state.json", {"attempts": attempts})
+            if cp is not None:
+                return replace(observation, cp=cp), attempts
+        return observation, attempts
+
+    def _resume_fallback_baseline(
+        self,
+        row: BatchCsvRow,
+    ) -> tuple[SummaryIdentity, bytes]:
+        path = row.scan_directory / (
+            "renamed_summary.png" if row.rename_status == "verified" else "summary.png"
+        )
+        try:
+            png_bytes = path.read_bytes()
+        except OSError as error:
+            raise BatchAutomationError(
+                f"Could not read resume baseline screenshot '{path}': {error}"
+            ) from error
+        if row.rename_status == "verified":
+            identity = self._completed_identity_from_row(row)
+        else:
+            detection = self._detector.detect(
+                png_bytes,
+                expected=("detail_summary",),
+            )
+            identity = summary_identity(detection, png_bytes, self._config)
+            row_identity = self._identity_from_row(row)
+            if row_identity is None or not _same_name_and_cp(identity, row_identity):
+                raise BatchAutomationError(
+                    "The last CSV row does not match its referenced summary.png."
+                )
+        if identity is None:
+            raise BatchAutomationError("Resume could not restore the last identity.")
+        return identity, png_bytes
+
+    def _switch_after_resume_fallback(
+        self,
+        serial: str,
+        previous: SummaryIdentity,
+        observation: ResumeObservation,
+        scan_directory: Path,
+        *,
+        debug: bool,
+    ) -> _SwitchWaitResult:
+        """Send one switch after the dedicated no-CP resume proof succeeds."""
+
+        recorder = _BatchDebugRecorder(scan_directory, debug)
+        gesture = self._config.next_pokemon
+        recorder.json(
+            "resume_fallback_switch_action.json",
+            {
+                "kind": "swipe",
+                "coordinates": asdict(gesture),
+                "before": asdict(observation),
+            },
+        )
+        self._adb.swipe(
+            serial,
+            gesture.start.x,
+            gesture.start.y,
+            gesture.end.x,
+            gesture.end.y,
+            gesture.duration_ms,
+        )
+        result = self._wait_for_next_summary(serial, previous, recorder, 1)
+        recorder.screen("after_resume_fallback_switch", result.screenshot)
+        recorder.json(
+            "resume_fallback_switch_state.json",
+            {
+                "outcome": result.outcome,
+                "elapsed_seconds": result.elapsed_seconds,
+                "detection": result.detection.to_json_data(),
+                "identity": asdict(result.identity) if result.identity is not None else None,
+            },
+        )
+        if result.outcome == "changed" and result.identity is not None:
+            return result
+        raise BatchAutomationError(
+            "The CP-missing resume fallback sent one verified left swipe but did "
+            "not confirm a different Pokémon. No retry swipe was sent."
+        )
 
     def _compare_with_row(
         self,
@@ -1153,6 +1491,7 @@ class BatchScanService:
         scan_directory: Path,
         *,
         debug: bool,
+        expected_nickname: str | None = None,
     ) -> _SwitchWaitResult:
         recorder = _BatchDebugRecorder(scan_directory, debug)
         before = self._adb.capture_screen(serial)
@@ -1162,11 +1501,44 @@ class BatchScanService:
             expected=("detail_summary",),
         )
         recorder.json("before_switch_state.json", before_detection.to_json_data())
-        current = summary_identity(before_detection, before, self._config)
-        if not _same_switch_identity(current, previous, self._config):
+        current: SummaryIdentity | None = None
+        verified_rename_fallback = False
+        try:
+            current = summary_identity(before_detection, before, self._config)
+        except BatchAutomationError:
+            if expected_nickname is None:
+                raise
+            current, verified_rename_fallback = (
+                self._verified_rename_switch_precheck(
+                    serial,
+                    before,
+                    before_detection,
+                    previous,
+                    expected_nickname,
+                    scan_directory,
+                    recorder,
+                )
+            )
+        if current is not None and not _same_switch_identity(
+            current,
+            previous,
+            self._config,
+        ):
             raise BatchAutomationError(
                 "The detail page changed after the one-Pokémon scan; no swipe was sent."
             )
+
+        if verified_rename_fallback:
+            if expected_nickname is None:
+                raise AssertionError("Verified rename fallback has no expected nickname.")
+            return self._switch_after_verified_rename_fallback(
+                serial,
+                previous,
+                expected_nickname,
+                recorder,
+            )
+        if current is None:
+            raise AssertionError("A strict switch precheck returned no identity.")
 
         gestures = (
             self._config.next_pokemon,
@@ -1243,6 +1615,185 @@ class BatchScanService:
             "Two left swipes did not reach a different Pokémon within 15 seconds "
             "each. The list may be at its end or the gesture did not take effect. "
             "Batch stopped safely."
+        )
+
+    def _verified_rename_switch_precheck(
+        self,
+        serial: str,
+        before: bytes,
+        detection: PageDetection,
+        previous: SummaryIdentity,
+        expected_nickname: str,
+        scan_directory: Path,
+        recorder: _BatchDebugRecorder,
+    ) -> tuple[SummaryIdentity | None, bool]:
+        """Retry CP, then require nickname, HP, and static ROI before one swipe."""
+
+        observation = _verified_rename_switch_observation(
+            detection,
+            before,
+            self._config,
+        )
+        attempts: list[dict[str, object]] = []
+        fallback_screen = before
+        fallback_fingerprint = observation.page_fingerprint
+        for attempt in range(1, self._config.verified_switch_cp_retry_frames + 1):
+            self._sleeper(self._config.verified_switch_cp_retry_interval_seconds)
+            screenshot = self._adb.capture_screen(serial)
+            recorder.screen(f"before_switch_cp_retry_{attempt}", screenshot)
+            retry_fingerprint = page_fingerprint(screenshot, self._config)
+            previous_frame_distance = fingerprint_distance(
+                observation.page_fingerprint,
+                retry_fingerprint,
+            )
+            baseline_distance = fingerprint_distance(
+                previous.page_fingerprint,
+                retry_fingerprint,
+            )
+            fallback_screen = screenshot
+            fallback_fingerprint = retry_fingerprint
+            if (
+                previous_frame_distance > self._config.duplicate_distance_threshold
+                or baseline_distance > self._config.duplicate_distance_threshold
+            ):
+                attempts.append(
+                    {
+                        "attempt": attempt,
+                        "cp": None,
+                        "previous_frame_fingerprint_distance": previous_frame_distance,
+                        "baseline_fingerprint_distance": baseline_distance,
+                        "page_changed": True,
+                    }
+                )
+                recorder.json(
+                    "before_switch_cp_retry_state.json",
+                    {"attempts": attempts},
+                )
+                raise BatchAutomationError(
+                    "The detail page changed during the verified-rename CP retry; "
+                    "no swipe was sent."
+                )
+            cp = self._detector.read_summary_cp(screenshot)
+            attempts.append(
+                {
+                    "attempt": attempt,
+                    "cp": cp,
+                    "previous_frame_fingerprint_distance": previous_frame_distance,
+                    "baseline_fingerprint_distance": baseline_distance,
+                    "page_changed": False,
+                }
+            )
+            recorder.json(
+                "before_switch_cp_retry_state.json",
+                {"attempts": attempts},
+            )
+            if cp is not None:
+                return (
+                    SummaryIdentity(
+                        pokemon_name=observation.pokemon_name,
+                        cp=cp,
+                        page_fingerprint=retry_fingerprint,
+                        hp_text=observation.hp_text,
+                    ),
+                    False,
+                )
+
+        baseline_path = scan_directory / "renamed_summary.png"
+        try:
+            baseline_png = baseline_path.read_bytes()
+        except OSError as error:
+            raise BatchAutomationError(
+                f"Could not read verified rename switch baseline '{baseline_path}': {error}"
+            ) from error
+        baseline_hp = self._detector.read_summary_hp(baseline_png)
+        observed_nickname = self._detector.read_summary_nickname(fallback_screen)
+        current_hp = self._detector.read_summary_hp(fallback_screen)
+        distance = fingerprint_distance(
+            fallback_fingerprint,
+            previous.page_fingerprint,
+        )
+        nickname_matches = nickname_text_skeleton(observed_nickname) == (
+            nickname_text_skeleton(expected_nickname)
+        )
+        strong_fallback = (
+            nickname_matches
+            and current_hp is not None
+            and baseline_hp is not None
+            and current_hp == baseline_hp
+            and distance <= self._config.duplicate_distance_threshold
+        )
+        recorder.json(
+            "before_switch_verified_rename_fallback_state.json",
+            {
+                "expected_nickname": expected_nickname,
+                "observed_nickname": observed_nickname,
+                "nickname_matches": nickname_matches,
+                "current_hp": current_hp,
+                "baseline_hp": baseline_hp,
+                "hp_matches": (
+                    current_hp is not None
+                    and baseline_hp is not None
+                    and current_hp == baseline_hp
+                ),
+                "current_fingerprint": fallback_fingerprint,
+                "baseline_fingerprint": previous.page_fingerprint,
+                "fingerprint_distance": distance,
+                "duplicate_distance_threshold": self._config.duplicate_distance_threshold,
+                "cp_retry_attempts": attempts,
+                "matched": strong_fallback,
+            },
+        )
+        if not strong_fallback:
+            raise BatchAutomationError(
+                "Before-switch CP retry failed and the verified rename did not have "
+                "exact nickname, HP, and static-fingerprint evidence. No swipe was sent."
+            )
+        return None, True
+
+    def _switch_after_verified_rename_fallback(
+        self,
+        serial: str,
+        previous: SummaryIdentity,
+        expected_nickname: str,
+        recorder: _BatchDebugRecorder,
+    ) -> _SwitchWaitResult:
+        """Send only one swipe after the CP-missing verified-rename proof."""
+
+        gesture = self._config.next_pokemon
+        recorder.json(
+            "verified_rename_fallback_switch_action.json",
+            {
+                "kind": "swipe",
+                "coordinates": asdict(gesture),
+                "expected_nickname": expected_nickname,
+            },
+        )
+        self._adb.swipe(
+            serial,
+            gesture.start.x,
+            gesture.start.y,
+            gesture.end.x,
+            gesture.end.y,
+            gesture.duration_ms,
+        )
+        result = self._wait_for_next_summary(serial, previous, recorder, 1)
+        recorder.screen("after_verified_rename_fallback_switch", result.screenshot)
+        recorder.json(
+            "verified_rename_fallback_switch_state.json",
+            {
+                "outcome": result.outcome,
+                "elapsed_seconds": result.elapsed_seconds,
+                "detection": result.detection.to_json_data(),
+                "identity": (
+                    asdict(result.identity) if result.identity is not None else None
+                ),
+            },
+        )
+        if result.outcome == "changed" and result.identity is not None:
+            return result
+        raise BatchAutomationError(
+            "The CP-missing verified-rename fallback sent one left swipe but did "
+            "not confirm a different Pokémon. No retry swipe was sent."
         )
 
     def _wait_for_next_summary(

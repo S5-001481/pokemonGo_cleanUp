@@ -66,6 +66,15 @@ does not use a separate automation implementation.
 5. Enable **Resume existing CSV** only when continuing the selected batch CSV.
    Without resume, the GUI refuses to overwrite an existing CSV.
 
+The open space to the right of **Maximum scan count** shows
+**Successful scans this run** with a large count. A successful single
+scan changes it to 1. During a batch it updates whenever an atomically verified
+CSV row is added; resume counts only rows added by the current run, not rows that
+were already present.
+Directly below the count, **Elapsed time this run** resets when a single or batch
+scan starts, updates as `hours:minutes:seconds`, and keeps the final duration after
+completion, failure, or a manual stop.
+
 ## Rename-with-IV Keyboard Requirement
 
 Before enabling **Reset Chinese name and append IV** in the GUI or using
@@ -164,6 +173,8 @@ data/
             ├── nickname_change.json # Exact verified rename evidence
             ├── ground_truth.json  # Optional; created by annotate
             └── debug/             # Optional; ignored by Git
+                └── automation/
+                    └── timings.json # Per-step monotonic timings with --debug
 ```
 
 PNG files from individual screenshots and their matching JSON sidecar files are stored in:
@@ -176,11 +187,30 @@ data/screenshots/YYYY-MM-DD/
 `recognition.json` stores machine-recognized values and warnings;
 `ground_truth.json` separately stores verified manual input values.
 
+When `--debug` is enabled, every automatic scan writes
+`debug/automation/timings.json`. It records the real monotonic duration of each
+navigation, capture, recognition, and rename substep, plus total elapsed time and
+the final `complete`, `failed`, `interrupted`, or `dry_run` outcome. Each step and
+the top level also report `ocr_seconds` and `stable_wait_seconds`; the latter is
+zero because live automation uses target-state polling and contains no full-screen
+stability wait. Batch mode
+creates one timing file inside each Pokémon's scan directory, including the item
+that fails, so timings do not need to be estimated from file modification times.
+
 Batch scanning writes one CSV row atomically only after a complete single scan
 and all identity/rename checks pass. A rename-enabled CSV currently contains 16
 columns, including `nickname_before`, `nickname_after`, and `rename_status`.
+The existing `warnings` column is also used for informational remarks: an
+explicitly detected Shadow or Dynamax move layout adds `类型：暗影` or
+`类型：极巨化`, without changing the CSV header.
 `--resume` validates the header, prior scan directories, manifests, saved
 screenshots, duplicate scan IDs, and the last-page position before continuing.
+Its precheck compares a reliable current name before requiring CP; same-name CP
+misses get two CP-only retries and may use only an exact HP plus static-fingerprint
+fallback. Ordinary non-rename switch, duplicate, rename-transition, and wrap checks
+remain strict. Only a verified post-rename pre-switch CP miss gets its own two
+CP-only retries; a total miss permits one left swipe only when the saved expected
+nickname, exact HP, and existing static fingerprint threshold all match.
 
 ## Automation Safety and Failure Behavior
 
