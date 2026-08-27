@@ -244,6 +244,43 @@ class BadTransitionScanner(FakeScanner):
         )
 
 
+class CpMissingTransitionScanner(FakeScanner):
+    def __init__(self, root: Path, results: list[RecognitionResult], *, hp: str) -> None:
+        super().__init__(root, results)
+        self.hp = hp
+
+    def scan_one(
+        self,
+        *,
+        debug: bool = False,
+        dry_run: bool = False,
+        rename_with_iv: bool = False,
+        serial_number: str | None = None,
+        notes: str | None = None,
+    ) -> AutoScanResult:
+        result = super().scan_one(
+            debug=debug,
+            dry_run=dry_run,
+            rename_with_iv=rename_with_iv,
+            serial_number=serial_number,
+            notes=notes,
+        )
+        assert result.nickname_change is not None
+        change = result.nickname_change
+        return replace(
+            result,
+            nickname_change=replace(
+                change,
+                summary_detection=PageDetection(
+                    "detail_summary",
+                    0.99,
+                    (change.expected_nickname,),
+                    details={"hp": self.hp, "summary_evidence": "name_hp"},
+                ),
+            ),
+        )
+
+
 def _recognition(
     scan_id: str,
     name: str,
@@ -356,6 +393,155 @@ def test_batch_rename_verifies_transition_and_switches_from_post_identity(
     assert [row["rename_status"] for row in rows] == ["verified", "verified"]
 
 
+def test_saved_summary_reuses_cp_recognized_from_the_same_png(tmp_path: Path) -> None:
+    destination = tmp_path / "recognized-cp.csv"
+    detector = QueueDetector(
+        [
+            PageDetection(
+                "detail_summary",
+                0.99,
+                ("甲",),
+                details={"hp": "50/50HP", "summary_evidence": "name_hp"},
+            )
+        ]
+    )
+
+    result = BatchScanService(
+        FakeBatchAdb([]),
+        FakeScanner(tmp_path / "scans", [_recognition("scan-a", "甲", 100)]),
+        detector,
+    ).scan(
+        limit=1,
+        csv_path=destination,
+        debug=True,
+        resume=False,
+        delay_seconds=0,
+    )
+
+    assert result.stop_reason == "limit_reached"
+    assert result.rows[0].cp == 100
+
+
+def test_rename_transition_uses_exact_nickname_hp_fingerprint_without_cp(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "rename-no-cp.csv"
+    detector = QueueDetector(
+        [PageDetection("detail_summary", 0.99, ("CP100", "甲"))],
+        summary_hps=["50/50HP"],
+    )
+
+    result = BatchScanService(
+        FakeBatchAdb([]),
+        CpMissingTransitionScanner(
+            tmp_path / "scans",
+            [_recognition("scan-a", "甲", 100)],
+            hp="50/50HP",
+        ),
+        detector,
+    ).scan(
+        limit=1,
+        csv_path=destination,
+        debug=True,
+        resume=False,
+        delay_seconds=0,
+        rename_with_iv=True,
+    )
+
+    assert result.stop_reason == "limit_reached"
+    assert result.rows[0].nickname_after == "甲15/14/13"
+    state = json.loads(
+        (
+            tmp_path
+            / "scans"
+            / "scan-a"
+            / "debug"
+            / "batch"
+            / "rename_transition_state.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert state["cp_source"] == "exact_nickname_hp_fingerprint_fallback"
+
+
+def test_rename_transition_no_cp_rejects_hp_mismatch(tmp_path: Path) -> None:
+    destination = tmp_path / "rename-no-cp-hp-mismatch.csv"
+    detector = QueueDetector(
+        [PageDetection("detail_summary", 0.99, ("CP100", "甲"))],
+        summary_hps=["49/50HP"],
+    )
+
+    with pytest.raises(BatchAutomationError, match="exact nickname, HP"):
+        BatchScanService(
+            FakeBatchAdb([]),
+            CpMissingTransitionScanner(
+                tmp_path / "scans",
+                [_recognition("scan-a", "甲", 100)],
+                hp="50/50HP",
+            ),
+            detector,
+        ).scan(
+            limit=1,
+            csv_path=destination,
+            debug=True,
+            resume=False,
+            delay_seconds=0,
+            rename_with_iv=True,
+        )
+
+    assert not destination.exists()
+
+
+def test_completed_renamed_row_restores_with_saved_cp_fallback(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "restore-rename-no-cp.csv"
+    writer_detector = QueueDetector(
+        [PageDetection("detail_summary", 0.99, ("CP100", "甲"))],
+        summary_hps=["50/50HP"],
+    )
+    written = BatchScanService(
+        FakeBatchAdb([]),
+        CpMissingTransitionScanner(
+            tmp_path / "scans",
+            [_recognition("scan-a", "甲", 100)],
+            hp="50/50HP",
+        ),
+        writer_detector,
+    ).scan(
+        limit=1,
+        csv_path=destination,
+        debug=True,
+        resume=False,
+        delay_seconds=0,
+        rename_with_iv=True,
+    )
+    row = written.rows[0]
+    expected = "甲15/14/13"
+    restore_detector = QueueDetector(
+        [
+            PageDetection("detail_summary", 0.99, ("CP100", "甲")),
+            PageDetection(
+                "detail_summary",
+                0.99,
+                (expected,),
+                details={"hp": "50/50HP", "summary_evidence": "name_hp"},
+            ),
+        ],
+        summary_nickname=expected,
+        summary_hps=["50/50HP"],
+    )
+
+    restored = BatchScanService(
+        FakeBatchAdb([]),
+        FakeScanner(tmp_path / "unused", []),
+        restore_detector,
+    )._completed_identity_from_row(row)
+
+    assert restored is not None
+    assert restored.cp == 100
+    assert restored.hp_text == "50/50HP"
+
+
 def test_verified_rename_switch_recovers_cp_before_using_strict_identity(
     tmp_path: Path,
 ) -> None:
@@ -377,6 +563,7 @@ def test_verified_rename_switch_recovers_cp_before_using_strict_identity(
     adb = FakeBatchAdb([PNG_A, PNG_A, PNG_B])
     scan_directory = tmp_path / "scan"
     scan_directory.mkdir()
+    atomic_write_bytes(scan_directory / "renamed_summary.png", PNG_A)
     service = BatchScanService(
         adb,
         FakeScanner(tmp_path / "scans", []),
@@ -415,6 +602,90 @@ def test_verified_rename_switch_recovers_cp_before_using_strict_identity(
             "page_changed": False,
         }
     ]
+
+
+def test_switch_wait_keeps_polling_when_same_page_uses_cp_fallback(
+    tmp_path: Path,
+) -> None:
+    clock = FakeTime()
+    expected = "索財靈"
+    detector = QueueDetector(
+        [
+            PageDetection("detail_summary", 0.99, ("CP458", expected)),
+            PageDetection(
+                "detail_summary",
+                0.99,
+                (expected,),
+                details={"hp": "73/73HP", "summary_evidence": "name_hp"},
+            ),
+            PageDetection("detail_summary", 0.99, ("CP200", "下一隻")),
+        ],
+        summary_nickname=expected,
+    )
+    adb = FakeBatchAdb([PNG_A, PNG_A, PNG_B])
+    scan_directory = tmp_path / "scan"
+    scan_directory.mkdir()
+    atomic_write_bytes(scan_directory / "summary.png", PNG_A)
+
+    result = BatchScanService(
+        adb,
+        FakeScanner(tmp_path / "scans", []),
+        detector,
+        monotonic=clock.monotonic,
+        sleeper=clock.sleep,
+    )._switch_to_next(
+        "ABC",
+        SummaryIdentity(expected, 458, page_fingerprint(PNG_A), "73/73HP"),
+        scan_directory,
+        debug=True,
+    )
+
+    assert result.outcome == "changed"
+    assert result.identity is not None
+    assert result.identity.cp == 200
+    assert adb.swipes == [(1180, 1500, 260, 1500, 600)]
+
+
+def test_switch_wait_cp_fallback_never_authorizes_stronger_retry(
+    tmp_path: Path,
+) -> None:
+    clock = FakeTime()
+    expected = "索財靈"
+    same_without_cp = PageDetection(
+        "detail_summary",
+        0.99,
+        (expected,),
+        details={"hp": "73/73HP", "summary_evidence": "name_hp"},
+    )
+    detector = QueueDetector(
+        [
+            PageDetection("detail_summary", 0.99, ("CP458", expected)),
+            same_without_cp,
+            same_without_cp,
+        ],
+        summary_nicknames=[expected, expected],
+    )
+    adb = FakeBatchAdb([PNG_A, PNG_A, PNG_A])
+    scan_directory = tmp_path / "scan"
+    scan_directory.mkdir()
+    atomic_write_bytes(scan_directory / "summary.png", PNG_A)
+
+    with pytest.raises(BatchAutomationError, match="No stronger retry swipe"):
+        BatchScanService(
+            adb,
+            FakeScanner(tmp_path / "scans", []),
+            detector,
+            config=HuaweiMate30BatchConfig(switch_timeout_seconds=1.0),
+            monotonic=clock.monotonic,
+            sleeper=clock.sleep,
+        )._switch_to_next(
+            "ABC",
+            SummaryIdentity(expected, 458, page_fingerprint(PNG_A), "73/73HP"),
+            scan_directory,
+            debug=True,
+        )
+
+    assert adb.swipes == [(1180, 1500, 260, 1500, 600)]
 
 
 def test_verified_rename_switch_uses_one_strong_no_cp_fallback_swipe(
@@ -515,7 +786,7 @@ def test_verified_rename_switch_rejects_weak_no_cp_fallback_without_swipe(
         sleeper=clock.sleep,
     )
 
-    with pytest.raises(BatchAutomationError, match="exact nickname, HP"):
+    with pytest.raises(BatchAutomationError, match="exact name/nickname, HP"):
         service._switch_to_next(
             "ABC",
             SummaryIdentity(expected, 458, page_fingerprint(PNG_A)),
@@ -547,6 +818,7 @@ def test_verified_rename_switch_cp_retry_rejects_static_page_change(
     adb = FakeBatchAdb([PNG_A, output.getvalue()])
     scan_directory = tmp_path / "scan"
     scan_directory.mkdir()
+    atomic_write_bytes(scan_directory / "renamed_summary.png", PNG_A)
 
     with pytest.raises(BatchAutomationError, match="page changed during"):
         BatchScanService(
@@ -570,31 +842,43 @@ def test_verified_rename_switch_cp_retry_rejects_static_page_change(
     assert adb.swipes == []
 
 
-def test_non_rename_switch_does_not_use_cp_missing_fallback(tmp_path: Path) -> None:
+def test_non_rename_switch_uses_exact_name_hp_fingerprint_fallback(
+    tmp_path: Path,
+) -> None:
+    expected = "索財靈"
     detector = QueueDetector(
         [
             PageDetection(
                 "detail_summary",
                 0.99,
-                ("索財靈",),
+                (expected,),
                 details={"hp": "73/73HP", "summary_evidence": "name_hp"},
-            )
-        ]
+            ),
+            PageDetection("detail_summary", 0.99, ("CP200", "下一隻")),
+        ],
+        summary_nickname=expected,
+        summary_cps=[None, None],
+        summary_hps=["73/73HP", "73/73HP"],
     )
-    adb = FakeBatchAdb([PNG_A])
+    adb = FakeBatchAdb([PNG_A, PNG_A, PNG_A, PNG_B])
     scan_directory = tmp_path / "scan"
     scan_directory.mkdir()
+    atomic_write_bytes(scan_directory / "summary.png", PNG_A)
 
-    with pytest.raises(BatchAutomationError, match="reliable Pokémon name and CP"):
-        BatchScanService(adb, FakeScanner(tmp_path / "scans", []), detector)._switch_to_next(
-            "ABC",
-            SummaryIdentity("索財靈", 458, page_fingerprint(PNG_A)),
-            scan_directory,
-            debug=True,
-        )
+    result = BatchScanService(
+        adb,
+        FakeScanner(tmp_path / "scans", []),
+        detector,
+    )._switch_to_next(
+        "ABC",
+        SummaryIdentity(expected, 458, page_fingerprint(PNG_A)),
+        scan_directory,
+        debug=True,
+    )
 
-    assert detector.cp_calls == 0
-    assert adb.swipes == []
+    assert result.outcome == "changed"
+    assert detector.cp_calls == 2
+    assert adb.swipes == [(1180, 1500, 260, 1500, 600)]
 
 
 def test_renamed_batch_wraps_on_exact_wide_nickname_and_immutable_identity(

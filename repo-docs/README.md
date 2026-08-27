@@ -121,9 +121,13 @@ Exact source and test links live in the
   follows the same rule. Saved-real replay retains the known names and CP values,
   including `古月鳥` CP1217, and recovers `索財靈` CP458 from some anniversary
   animation frames without accepting isolated artwork numbers. A frame that still
-  loses CP cannot replace strict identity globally: only a verified renamed
-  pre-switch page may retry CP twice, then use exact nickname+HP+static fingerprint
-  evidence for one swipe.
+  loses CP cannot establish a new Pokémon's CP. When a batch checkpoint already
+  has a trusted baseline, however, it may reuse that baseline CP only after exact
+  name/nickname, exact HP, and distance-8 static-fingerprint evidence all match.
+  Live pre-switch checks retry CP twice first and a strong fallback authorizes only
+  one swipe. This applies to ordinary and renamed pages, rename transitions, saved
+  row restoration, duplicate/resume baselines, switch polling, and retry
+  confirmation; a different/new page still has to yield CP.
 - Final move recognition keeps the normal anchor crop first and adds explicit
   Shadow and Dynamax fallbacks only for an upper move-section anchor accompanied
   by `暗影獎勵` or `極巨招式`. Modifier and Max Move labels remain excluded from

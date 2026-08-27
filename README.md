@@ -207,10 +207,16 @@ explicitly detected Shadow or Dynamax move layout adds `类型：暗影` or
 screenshots, duplicate scan IDs, and the last-page position before continuing.
 Its precheck compares a reliable current name before requiring CP; same-name CP
 misses get two CP-only retries and may use only an exact HP plus static-fingerprint
-fallback. Ordinary non-rename switch, duplicate, rename-transition, and wrap checks
-remain strict. Only a verified post-rename pre-switch CP miss gets its own two
-CP-only retries; a total miss permits one left swipe only when the saved expected
-nickname, exact HP, and existing static fingerprint threshold all match.
+fallback. Every batch checkpoint that is proving a page against a known identity
+uses the same fail-closed rule when CP is unreadable: an ordinary page requires
+both generic and wide exact names, while a verified rename requires its saved
+expected nickname; both also require exact HP and the existing static-fingerprint
+threshold. This covers post-rename pre-append verification, saved-row restoration,
+duplicate/resume baselines, pre-switch checks, switch polling, and retry
+confirmation. A completed recognition may also supply CP when it came from the
+same saved PNG. The fallback never invents CP for a different/new Pokémon; that
+page must still yield CP before its new identity is accepted. A strong CP-missing
+pre-switch proof authorizes only one left swipe.
 
 ## Automation Safety and Failure Behavior
 
