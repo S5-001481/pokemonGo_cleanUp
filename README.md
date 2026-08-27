@@ -31,11 +31,7 @@ After that, double-click `Pokémon GO Cleanup.bat` on the Windows desktop to lau
 
 ## Interface Example
 
-<img
-src="示例图片.png"
-width="900"
-alt="Example of the Pokémon GO Cleanup graphical interface"
-/>
+![Pokémon GO Cleanup interface](docs/images/interface-example.png)
 
 > [!IMPORTANT]
 > OCR and automated scanning are not general-purpose features. They have currently been calibrated only for the following environment:

@@ -14,25 +14,34 @@ from PIL import Image
 from pokemon_go_cleanup.automation import (
     AutoScanService,
     HuaweiMate30AutomationConfig,
+    HuaweiMate30PageDetector,
     PageDetection,
     Point,
-    StableScreenResult,
     appraisal_target_is_safe,
+    compact_editor_nickname_text,
     match_move_name_power_rows,
-    wait_for_stable_screen,
+    planned_actions,
 )
 from pokemon_go_cleanup.config import AppConfig
 from pokemon_go_cleanup.exceptions import AutomationError
 from pokemon_go_cleanup.models import Device, ScreenResolution
 from pokemon_go_cleanup.recognition import (
+    CP_RECT,
+    NAME_RECT,
     OcrCandidate,
     RecognitionResult,
+    RecognitionService,
     RecognizedInteger,
     RecognizedText,
 )
 from pokemon_go_cleanup.storage import atomic_write_text
 
 JST = timezone(timedelta(hours=9))
+REAL_GOLD_RESUME_SCREEN = (
+    Path(__file__).parents[1]
+    / "data/scans/2026-08-26/20260826_191504_866082_20bedd09a527482db74183ff7c2ecf6e"
+    / "debug/batch/resume_current.png"
+)
 
 
 def _png(color: tuple[int, int, int]) -> bytes:
@@ -92,10 +101,24 @@ class FakeAutomationAdb:
     def press_back(self, serial_number: str) -> None:
         self.inputs.append(("back",))
 
+    def press_key(self, serial_number: str, keycode: int) -> None:
+        self.inputs.append(("keyevent", keycode))
+
+    def input_text(self, serial_number: str, value: str) -> None:
+        self.inputs.append(("text", value))
+
 
 class QueueDetector:
-    def __init__(self, detections: list[PageDetection]) -> None:
+    def __init__(
+        self,
+        detections: list[PageDetection],
+        *,
+        summary_nickname: str = "妙蛙花15/13/11",
+        summary_nicknames: tuple[str, ...] = (),
+    ) -> None:
         self._detections = deque(detections)
+        self.summary_nickname = summary_nickname
+        self._summary_nicknames = deque(summary_nicknames)
 
     def detect(
         self,
@@ -107,6 +130,19 @@ class QueueDetector:
         assert expected
         return self._detections.popleft()
 
+    def read_summary_nickname(self, png_bytes: bytes) -> str:
+        assert png_bytes == PNG
+        if self._summary_nicknames:
+            return self._summary_nicknames.popleft()
+        return self.summary_nickname
+
+    def read_summary_cp(self, png_bytes: bytes) -> int | None:
+        assert png_bytes == PNG
+        return None
+
+    def read_summary_hp(self, png_bytes: bytes) -> str | None:
+        assert png_bytes == PNG
+        return None
 
 class MovesAwareQueueDetector(QueueDetector):
     def __init__(self, detections: list[PageDetection]) -> None:
@@ -125,20 +161,6 @@ class MovesAwareQueueDetector(QueueDetector):
         return detection
 
 
-class RejectStabilityBeforeMoves:
-    def __init__(self, detector: MovesAwareQueueDetector) -> None:
-        self.detector = detector
-        self.calls = 0
-
-    def __call__(self, capture: object) -> StableScreenResult:
-        assert callable(capture)
-        assert self.detector.moves_seen, (
-            "full-screen stability was requested before detail_moves appeared"
-        )
-        self.calls += 1
-        return StableScreenResult(capture(), (1.0,))
-
-
 class InterruptingDetector:
     def detect(
         self,
@@ -150,13 +172,92 @@ class InterruptingDetector:
         assert expected
         raise KeyboardInterrupt
 
+    def read_summary_nickname(self, png_bytes: bytes) -> str:
+        raise KeyboardInterrupt
+
+    def read_summary_cp(self, png_bytes: bytes) -> int | None:
+        raise KeyboardInterrupt
+
+    def read_summary_hp(self, png_bytes: bytes) -> str | None:
+        raise KeyboardInterrupt
+
+
+class ProgressiveSummaryReader:
+    def __init__(
+        self,
+        *,
+        fast_cp: tuple[OcrCandidate, ...],
+        name: tuple[OcrCandidate, ...],
+        hsv_cp: tuple[OcrCandidate, ...] = (),
+        fallback_cp: tuple[OcrCandidate, ...] = (),
+    ) -> None:
+        self.fast_cp = fast_cp
+        self.name = name
+        self.hsv_cp = hsv_cp
+        self.fallback_cp = fallback_cp
+        self.variant_calls: list[tuple[int, int, int, int]] = []
+        self.hsv_calls = 0
+        self.fallback_calls = 0
+
+    def _ocr_variants(
+        self,
+        image: object,
+        rectangle: tuple[int, int, int, int],
+    ) -> tuple[tuple[OcrCandidate, ...], object]:
+        self.variant_calls.append(rectangle)
+        candidates = self.fast_cp if rectangle == CP_RECT else self.name
+        return candidates, image
+
+    def _ocr_cp_fallback_variants(
+        self,
+        image: object,
+    ) -> tuple[OcrCandidate, ...]:
+        self.fallback_calls += 1
+        return self.fallback_cp
+
+    def _ocr_cp_hsv_variants(
+        self,
+        image: object,
+    ) -> tuple[OcrCandidate, ...]:
+        self.hsv_calls += 1
+        return self.hsv_cp
+
+    _best_cp = staticmethod(RecognitionService._best_cp)
+    _best_text = staticmethod(RecognitionService._best_text)
+
+
+class ProgressiveSummaryDetector(HuaweiMate30PageDetector):
+    def __init__(
+        self,
+        reader: ProgressiveSummaryReader,
+        hp_candidates: tuple[OcrCandidate, ...] = (),
+    ) -> None:
+        self._reader = reader  # type: ignore[assignment]
+        self._config = HuaweiMate30AutomationConfig()
+        self.hp_candidates = hp_candidates
+        self.hp_calls = 0
+
+    def _decode(self, png_bytes: bytes) -> object:
+        assert png_bytes == PNG
+        return object()
+
+    def _ocr_rectangle(
+        self,
+        image: object,
+        rectangle: tuple[int, int, int, int],
+    ) -> tuple[OcrCandidate, ...]:
+        self.hp_calls += 1
+        return self.hp_candidates
+
 
 class FakeReader:
     def __init__(self) -> None:
         self.calls: list[tuple[Path, bool]] = []
+        self.ocr_seconds_total = 0.0
 
     def read_scan(self, directory: Path, *, debug: bool = False) -> RecognitionResult:
         self.calls.append((directory, debug))
+        self.ocr_seconds_total += 1.25
         result = RecognitionResult(
             scan_id=directory.name,
             pokemon_name=RecognizedText(value="妙蛙花", raw="妙蛙花", confidence=0.99),
@@ -183,55 +284,6 @@ class Clock:
         result = self.current
         self.current += timedelta(seconds=1)
         return result
-
-
-def _stable(capture: object) -> StableScreenResult:
-    assert callable(capture)
-    return StableScreenResult(capture(), (0.0,))
-
-
-def test_wait_for_stable_screen_requires_consecutive_low_differences() -> None:
-    frames = iter(
-        [
-            _png((0, 0, 0)),
-            _png((255, 255, 255)),
-            _png((255, 255, 255)),
-            _png((255, 255, 255)),
-            _png((255, 255, 255)),
-        ]
-    )
-
-    result = wait_for_stable_screen(
-        lambda: next(frames),
-        interval_seconds=0.1,
-        consecutive_samples=3,
-        timeout_seconds=2,
-        monotonic=lambda: 0.0,
-        sleeper=lambda _: None,
-    )
-
-    assert result.png_bytes == _png((255, 255, 255))
-    assert result.differences[0] > 0.9
-    assert result.differences[-3:] == (0.0, 0.0, 0.0)
-
-
-def test_wait_for_stable_screen_reports_timeout() -> None:
-    frames = deque([_png((0, 0, 0)), _png((255, 255, 255))])
-
-    def capture() -> bytes:
-        frame = frames[0]
-        frames.rotate(-1)
-        return frame
-
-    with pytest.raises(AutomationError, match="did not stabilize"):
-        wait_for_stable_screen(
-            capture,
-            interval_seconds=0.1,
-            consecutive_samples=2,
-            timeout_seconds=0.3,
-            monotonic=lambda: 0.0,
-            sleeper=lambda _: None,
-        )
 
 
 def test_appraisal_target_rejects_transfer_proximity_and_forbidden_band() -> None:
@@ -267,6 +319,286 @@ def test_detail_moves_does_not_treat_appraisal_labels_as_move_rows() -> None:
     assert match_move_name_power_rows(candidates) == ()
 
 
+def test_summary_nickname_reader_uses_tight_row_and_combines_split_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the real long-name crop that retains a slash-separated middle IV."""
+
+    detector = object.__new__(HuaweiMate30PageDetector)
+    detector._config = HuaweiMate30AutomationConfig()
+    observed_rectangles: list[tuple[int, int, int, int]] = []
+    candidates = (
+        OcrCandidate("飄飄球12", 0.999, (339, 1379, 803, 1531)),
+        OcrCandidate("2", 0.999, (855, 1403, 928, 1503)),
+        OcrCandidate("5", 0.999, (1001, 1400, 1076, 1502)),
+        OcrCandidate("✎", 0.9, (1110, 1510, 1180, 1580)),
+    )
+
+    monkeypatch.setattr(detector, "_decode", lambda _png: object())
+
+    def ocr_rectangle(
+        _image: object,
+        rectangle: tuple[int, int, int, int],
+    ) -> tuple[OcrCandidate, ...]:
+        observed_rectangles.append(rectangle)
+        return candidates
+
+    monkeypatch.setattr(detector, "_ocr_rectangle", ocr_rectangle)
+
+    assert detector.read_summary_nickname(PNG) == "飄飄球1225"
+    assert observed_rectangles == [(150, 1300, 1290, 1550)]
+
+
+def test_summary_nickname_reader_excludes_date_badge_and_small_row_noise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    detector = object.__new__(HuaweiMate30PageDetector)
+    detector._config = HuaweiMate30AutomationConfig()
+    candidates = (
+        OcrCandidate("1", 0.9679, (1259, 1325, 1289, 1377)),
+        OcrCandidate("哈力栗", 0.99847, (540, 1374, 895, 1536)),
+        OcrCandidate("7", 0.99, (1100, 1424, 1130, 1476)),
+    )
+
+    monkeypatch.setattr(detector, "_decode", lambda _png: object())
+    monkeypatch.setattr(
+        detector,
+        "_ocr_rectangle",
+        lambda _image, _rectangle: candidates,
+    )
+
+    assert detector.read_summary_nickname(PNG) == "哈力栗"
+
+
+def test_appraisal_greeting_is_a_direct_dialogue_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    detector = object.__new__(HuaweiMate30PageDetector)
+    detector._config = HuaweiMate30AutomationConfig()
+    observed_rectangles: list[tuple[int, int, int, int]] = []
+
+    def ocr_rectangle(
+        _image: object,
+        rectangle: tuple[int, int, int, int],
+    ) -> tuple[OcrCandidate, ...]:
+        observed_rectangles.append(rectangle)
+        return (OcrCandidate("你好", 0.999, (100, 2500, 250, 2580)),)
+
+    monkeypatch.setattr(detector, "_ocr_rectangle", ocr_rectangle)
+
+    result = detector._detect_appraisal_greeting(object())
+
+    assert result == PageDetection(
+        state="appraisal_dialogue",
+        confidence=0.999,
+        matched_texts=("你好",),
+        details={
+            "dialogue_evidence": "greeting",
+            "greeting_roi": [80, 2450, 420, 2615],
+        },
+    )
+    assert observed_rectangles == [(80, 2450, 420, 2615)]
+
+
+def test_appraisal_entry_checks_greeting_before_action_menu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MissingBarsReader:
+        @staticmethod
+        def _ivs(_image: object) -> tuple[None, object, object]:
+            return None, object(), object()
+
+    detector = object.__new__(HuaweiMate30PageDetector)
+    detector._reader = MissingBarsReader()  # type: ignore[assignment]
+    detector._config = HuaweiMate30AutomationConfig()
+    greeting = PageDetection(
+        "appraisal_dialogue",
+        0.999,
+        matched_texts=("你好",),
+    )
+    monkeypatch.setattr(detector, "_decode", lambda _png: object())
+    monkeypatch.setattr(detector, "_detect_appraisal_greeting", lambda _image: greeting)
+
+    def unexpected_menu_check(_image: object) -> None:
+        raise AssertionError("menu OCR must not run after greeting success")
+
+    monkeypatch.setattr(detector, "_detect_action_menu", unexpected_menu_check)
+
+    assert detector.detect(
+        PNG,
+        expected=("appraisal_bars", "appraisal_dialogue", "action_menu"),
+    ) == greeting
+
+
+def test_action_menu_polling_does_not_pay_for_greeting_ocr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    detector = object.__new__(HuaweiMate30PageDetector)
+    detector._config = HuaweiMate30AutomationConfig()
+    menu = PageDetection("action_menu", 0.99)
+    monkeypatch.setattr(detector, "_decode", lambda _png: object())
+
+    def unexpected_greeting_check(_image: object) -> None:
+        raise AssertionError("ordinary menu polling must not run greeting OCR")
+
+    monkeypatch.setattr(
+        detector,
+        "_detect_appraisal_greeting",
+        unexpected_greeting_check,
+    )
+    monkeypatch.setattr(detector, "_detect_action_menu", lambda _image: menu)
+
+    assert detector.detect(
+        PNG,
+        expected=("action_menu", "appraisal_dialogue"),
+    ) == menu
+
+
+@pytest.mark.parametrize(
+    ("raw", "confidence"),
+    (("你女子", 0.999), ("你好", 0.84)),
+)
+def test_appraisal_greeting_requires_exact_text_and_confidence(
+    monkeypatch: pytest.MonkeyPatch,
+    raw: str,
+    confidence: float,
+) -> None:
+    detector = object.__new__(HuaweiMate30PageDetector)
+    detector._config = HuaweiMate30AutomationConfig()
+    monkeypatch.setattr(
+        detector,
+        "_ocr_rectangle",
+        lambda _image, _rectangle: (
+            OcrCandidate(raw, confidence, (100, 2500, 250, 2580)),
+        ),
+    )
+
+    assert detector._detect_appraisal_greeting(object()) is None
+
+
+def test_summary_fast_name_cp_skips_enhanced_cp_and_hp() -> None:
+    reader = ProgressiveSummaryReader(
+        fast_cp=(OcrCandidate("CP300", 0.98, (500, 300, 650, 360)),),
+        name=(OcrCandidate("冰雪龍", 0.99, (600, 1350, 840, 1450)),),
+    )
+    detector = ProgressiveSummaryDetector(reader)
+
+    result = detector.detect(PNG, expected=("detail_summary",))
+
+    assert result.state == "detail_summary"
+    assert result.matched_texts == ("CP300", "冰雪龍")
+    assert result.details == {
+        "cp": "CP300",
+        "summary_evidence": "name_cp",
+        "summary_ocr_path": "fast_name_cp",
+    }
+    assert reader.variant_calls == [CP_RECT, NAME_RECT]
+    assert reader.hsv_calls == 0
+    assert reader.fallback_calls == 0
+    assert detector.hp_calls == 0
+
+
+def test_summary_runs_hsv_cp_only_after_fast_cp_fails() -> None:
+    reader = ProgressiveSummaryReader(
+        fast_cp=(),
+        name=(OcrCandidate("冰雪龍", 0.99, (600, 1350, 840, 1450)),),
+        hsv_cp=(OcrCandidate("CP300", 0.97, (500, 300, 650, 360)),),
+    )
+    detector = ProgressiveSummaryDetector(reader)
+
+    result = detector.detect(PNG, expected=("detail_summary",))
+
+    assert result.state == "detail_summary"
+    assert result.details["summary_evidence"] == "name_cp"
+    assert result.details["summary_ocr_path"] == "hsv_cp_fallback"
+    assert reader.variant_calls == [CP_RECT, NAME_RECT]
+    assert reader.hsv_calls == 1
+    assert reader.fallback_calls == 0
+    assert detector.hp_calls == 0
+
+
+def test_summary_runs_threshold_cp_only_after_hsv_cp_fails() -> None:
+    reader = ProgressiveSummaryReader(
+        fast_cp=(),
+        name=(OcrCandidate("冰雪龍", 0.99, (600, 1350, 840, 1450)),),
+        fallback_cp=(OcrCandidate("CP300", 0.97, (500, 300, 650, 360)),),
+    )
+    detector = ProgressiveSummaryDetector(reader)
+
+    result = detector.detect(PNG, expected=("detail_summary",))
+
+    assert result.state == "detail_summary"
+    assert result.details["summary_ocr_path"] == "enhanced_cp_fallback"
+    assert reader.hsv_calls == 1
+    assert reader.fallback_calls == 1
+    assert detector.hp_calls == 0
+
+
+def test_summary_runs_hp_only_after_all_cp_paths_fail() -> None:
+    reader = ProgressiveSummaryReader(
+        fast_cp=(),
+        name=(OcrCandidate("冰雪龍", 0.99, (600, 1350, 840, 1450)),),
+    )
+    detector = ProgressiveSummaryDetector(
+        reader,
+        hp_candidates=(
+            OcrCandidate("57 / 57 HP", 0.96, (550, 1530, 880, 1610)),
+        ),
+    )
+
+    result = detector.detect(PNG, expected=("detail_summary",))
+
+    assert result.state == "detail_summary"
+    assert result.matched_texts == ("冰雪龍",)
+    assert result.details == {
+        "hp": "57/57HP",
+        "summary_evidence": "name_hp",
+        "summary_ocr_path": "hp_fallback",
+    }
+    assert reader.variant_calls == [CP_RECT, NAME_RECT]
+    assert reader.hsv_calls == 1
+    assert reader.fallback_calls == 1
+    assert detector.hp_calls == 1
+
+
+@pytest.mark.skipif(
+    not REAL_GOLD_RESUME_SCREEN.is_file(),
+    reason="local ignored real-device replay screenshot is unavailable",
+)
+def test_real_gold_resume_summary_recovers_name_hp_and_cp458() -> None:
+    detector = HuaweiMate30PageDetector(RecognitionService())
+    screenshot = REAL_GOLD_RESUME_SCREEN.read_bytes()
+
+    result = detector.detect(screenshot, expected=("detail_summary",))
+
+    assert result.state == "detail_summary"
+    assert result.matched_texts == ("CP458", "索財靈")
+    assert result.details["summary_ocr_path"] == "hsv_cp_fallback"
+    assert detector.read_summary_hp(screenshot) == "73/73HP"
+
+
+def test_summary_skips_cp_and_hp_fallback_when_name_is_missing() -> None:
+    reader = ProgressiveSummaryReader(fast_cp=(), name=())
+    detector = ProgressiveSummaryDetector(reader)
+
+    result = detector.detect(PNG, expected=("detail_summary",))
+
+    assert result.state == "unknown"
+    assert reader.variant_calls == [CP_RECT, NAME_RECT]
+    assert reader.fallback_calls == 0
+    assert detector.hp_calls == 0
+
+
+def test_rename_plan_uses_fixed_name_row_center() -> None:
+    actions = planned_actions(rename_with_iv=True)
+    rename_actions = actions[-2:]
+
+    for action in rename_actions:
+        coordinates = action["coordinates"]
+        assert isinstance(coordinates, dict)
+        assert coordinates["edit"] == {"x": 720, "y": 1460}
+
+
 def test_dry_run_captures_summary_but_sends_no_input(tmp_path: Path) -> None:
     adb = FakeAutomationAdb()
     reader = FakeReader()
@@ -277,7 +609,6 @@ def test_dry_run_captures_summary_but_sends_no_input(tmp_path: Path) -> None:
         reader,
         clock=Clock(),
         token_factory=lambda: "dryrun",
-        stable_waiter=_stable,
         monotonic=lambda: 0.0,
     )
 
@@ -312,7 +643,6 @@ def test_unknown_initial_page_stops_before_any_input(tmp_path: Path) -> None:
         ),
         clock=Clock(),
         token_factory=lambda: "unknown",
-        stable_waiter=_stable,
         monotonic=lambda: 0.0,
     )
 
@@ -335,7 +665,6 @@ def test_ctrl_c_marks_manifest_incomplete_without_input(tmp_path: Path) -> None:
         FakeReader(),
         clock=Clock(),
         token_factory=lambda: "interrupt",
-        stable_waiter=_stable,
         monotonic=lambda: 0.0,
     )
 
@@ -371,7 +700,6 @@ def test_live_flow_sends_only_gated_single_scan_actions(tmp_path: Path) -> None:
     )
     adb = FakeAutomationAdb()
     reader = FakeReader()
-    stability = RejectStabilityBeforeMoves(detector)
     app_config = AppConfig(data_dir=tmp_path)
     assert not hasattr(app_config, "appraisal_exit")
     service = AutoScanService(
@@ -381,7 +709,6 @@ def test_live_flow_sends_only_gated_single_scan_actions(tmp_path: Path) -> None:
         reader,
         clock=Clock(),
         token_factory=lambda: "live",
-        stable_waiter=stability,
         monotonic=lambda: 0.0,
         sleeper=lambda _: None,
     )
@@ -389,8 +716,8 @@ def test_live_flow_sends_only_gated_single_scan_actions(tmp_path: Path) -> None:
     result = service.scan_one(debug=True)
 
     assert result.manifest.scan_status == "complete"
+    assert not hasattr(service, "_stable_waiter")
     assert result.recognition is not None
-    assert stability.calls == 0
     assert [action[0] for action in adb.inputs] == [
         "swipe",
         "tap",
@@ -430,6 +757,278 @@ def test_live_flow_sends_only_gated_single_scan_actions(tmp_path: Path) -> None:
     assert not (debug_directory / "stability_scroll_to_moves.json").exists()
 
 
+def test_rename_with_iv_resets_default_name_then_appends_suffix(tmp_path: Path) -> None:
+    rename_dialog = PageDetection(
+        "rename_dialog",
+        0.99,
+        matched_texts=("取消", "確定"),
+        rename_confirm_target=Point(1120, 1860),
+    )
+    rename_keyboard = PageDetection(
+        "rename_keyboard",
+        0.99,
+        matched_texts=("設定暱稱", "确定", "GIF", "1", "2", "3", "4"),
+        rename_keyboard_target=Point(1248, 1712),
+        details={"nickname_text_candidates": ["妙蛙花15/13/11"]},
+    )
+    detector = QueueDetector(
+        [
+            _summary_detection(),
+            PageDetection("detail_moves", 0.99),
+            PageDetection("detail_moves", 0.99),
+            PageDetection(
+                "action_menu",
+                0.99,
+                matched_texts=("調查寶可夢",),
+                appraisal_target=Point(700, 2400),
+            ),
+            PageDetection("appraisal_bars", 1.0),
+            PageDetection("appraisal_bars", 1.0),
+            PageDetection(
+                "detail_summary",
+                0.99,
+                matched_texts=("CP1761", "妙"),
+                details={"summary_evidence": "name_cp"},
+            ),
+            _summary_detection(),
+            rename_dialog,
+            rename_keyboard,
+            rename_dialog,
+            PageDetection(
+                "detail_summary",
+                0.99,
+                matched_texts=("CP1761", "妙蛙花"),
+                details={"summary_evidence": "name_cp"},
+            ),
+            _summary_detection(),
+            rename_dialog,
+            rename_keyboard,
+            rename_dialog,
+            _summary_detection(),
+        ],
+        summary_nicknames=("妙蛙花", "妙蛙花15/13/11"),
+    )
+    adb = FakeAutomationAdb()
+    service = AutoScanService(
+        AppConfig(data_dir=tmp_path),
+        adb,
+        detector,
+        FakeReader(),
+        automation=HuaweiMate30AutomationConfig(nickname_maximum_characters=2),
+        clock=Clock(),
+        token_factory=lambda: "rename",
+        monotonic=lambda: 0.0,
+        sleeper=lambda _: None,
+    )
+
+    result = service.scan_one(rename_with_iv=True, debug=True)
+
+    assert result.manifest.scan_status == "complete"
+    assert result.nickname_change is not None
+    assert result.nickname_change.expected_nickname == "妙蛙花15/13/11"
+    assert (result.scan_directory / "renamed_summary.png").is_file()
+    assert (result.scan_directory / "nickname_change.json").is_file()
+    assert adb.inputs[-11:] == [
+        ("tap", 720, 1460),
+        ("keyevent", 123),
+        ("keyevent", 67),
+        ("keyevent", 67),
+        ("tap", 1248, 1712),
+        ("tap", 1120, 1860),
+        ("tap", 720, 1460),
+        ("keyevent", 123),
+        ("text", "15/13/11"),
+        ("tap", 1248, 1712),
+        ("tap", 1120, 1860),
+    ]
+    actions = json.loads(
+        (result.scan_directory / "debug" / "automation" / "actions.json").read_text(
+            encoding="utf-8"
+        )
+    )["actions"]
+    assert [action["name"] for action in actions[-8:]] == [
+        "open_nickname_editor_reset",
+        "clear_nickname_for_default",
+        "confirm_default_nickname_hide_keyboard",
+        "confirm_default_nickname",
+        "open_nickname_editor_append_iv",
+        "append_iv_suffix",
+        "confirm_iv_nickname_hide_keyboard",
+        "confirm_iv_nickname",
+    ]
+    append_action = next(
+        action for action in actions if action["name"] == "append_iv_suffix"
+    )
+    assert append_action["kind"] == "text"
+    assert append_action["coordinates"] == {
+        "end": 123,
+        "ascii_text": "15/13/11",
+    }
+    default_name_state = json.loads(
+        next(
+            (result.scan_directory / "debug" / "automation").glob(
+                "state_*_verified_default_nickname_wide.json"
+            )
+        ).read_text(encoding="utf-8")
+    )
+    assert default_name_state["matched_texts"] == ["妙蛙花"]
+    assert default_name_state["details"] == {
+        "nickname_evidence": "wide_summary_row",
+        "source_state": "detail_summary",
+    }
+    timings = json.loads(
+        (result.scan_directory / "debug" / "automation" / "timings.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert timings["run_outcome"] == "complete"
+    assert timings["total_elapsed_seconds"] >= 0
+    assert timings["stable_wait_seconds"] == 0
+    assert timings["ocr_seconds"] == 1.25
+    timing_steps = timings["steps"]
+    assert [step["sequence"] for step in timing_steps] == list(
+        range(1, len(timing_steps) + 1)
+    )
+    assert all(step["duration_seconds"] >= 0 for step in timing_steps)
+    assert all(step["stable_wait_seconds"] == 0 for step in timing_steps)
+    assert sum(step["ocr_seconds"] for step in timing_steps) == 1.25
+    assert {
+        "verify_detail_summary",
+        "scroll_to_moves",
+        "wait_for_appraisal_entry",
+        "recognize_scan",
+        "rename_open_editor_reset",
+        "rename_clear_to_default",
+        "rename_append_iv_suffix",
+        "rename_verify_final_summary",
+    }.issubset({step["step"] for step in timing_steps})
+    assert all(step["outcome"] == "completed" for step in timing_steps)
+
+
+def test_editor_nickname_compaction_preserves_character_width() -> None:
+    assert compact_editor_nickname_text("妙蛙花 15/13/11") == "妙蛙花15/13/11"
+    full_width = "妙蛙花\uff11\uff15\uff0f\uff11\uff13\uff0f\uff11\uff11"
+    assert compact_editor_nickname_text(full_width) != "妙蛙花15/13/11"
+
+
+def test_fixed_nickname_row_tap_stops_before_text_when_editor_does_not_open(
+    tmp_path: Path,
+) -> None:
+    detector = QueueDetector(
+        [
+            _summary_detection(),
+            PageDetection("detail_moves", 0.99),
+            PageDetection("detail_moves", 0.99),
+            PageDetection(
+                "action_menu",
+                0.99,
+                matched_texts=("調查寶可夢",),
+                appraisal_target=Point(700, 2400),
+            ),
+            PageDetection("appraisal_bars", 1.0),
+            PageDetection("appraisal_bars", 1.0),
+            _summary_detection(),
+            _summary_detection(),
+            _summary_detection(),
+            _summary_detection(),
+            _summary_detection(),
+        ]
+    )
+    adb = FakeAutomationAdb()
+    service = AutoScanService(
+        AppConfig(data_dir=tmp_path),
+        adb,
+        detector,
+        FakeReader(),
+        automation=HuaweiMate30AutomationConfig(rename_wait_timeout_seconds=0.5),
+        clock=Clock(),
+        token_factory=lambda: "rename-fixed-center-no-editor",
+        monotonic=lambda: 0.0,
+        sleeper=lambda _: None,
+    )
+
+    with pytest.raises(AutomationError, match="did not expose an OCR-confirmed"):
+        service.scan_one(rename_with_iv=True, debug=True)
+
+    assert adb.inputs[-1] == ("tap", 720, 1460)
+    assert not any(action[0] in ("keyevent", "text") for action in adb.inputs)
+    scan_directory = next((tmp_path / "scans" / "2026-07-29").iterdir())
+    timings = json.loads(
+        (scan_directory / "debug" / "automation" / "timings.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert timings["run_outcome"] == "failed"
+    assert timings["steps"][-1]["step"] == "rename_open_editor_reset"
+    assert timings["steps"][-1]["outcome"] == "failed"
+
+
+def test_rename_with_iv_rejects_wrong_editor_text_before_final_confirmation(
+    tmp_path: Path,
+) -> None:
+    rename_dialog = PageDetection(
+        "rename_dialog",
+        0.99,
+        matched_texts=("取消", "確定"),
+        rename_confirm_target=Point(1120, 1860),
+    )
+    wrong_keyboard = PageDetection(
+        "rename_keyboard",
+        0.99,
+        matched_texts=("設定暱稱", "妙蛙花15/13/10", "确定"),
+        rename_keyboard_target=Point(1248, 1712),
+        details={"nickname_text_candidates": ["妙蛙花15/13/10"]},
+    )
+    detector = QueueDetector(
+        [
+            _summary_detection(),
+            PageDetection("detail_moves", 0.99),
+            PageDetection("detail_moves", 0.99),
+            PageDetection(
+                "action_menu",
+                0.99,
+                matched_texts=("調查寶可夢",),
+                appraisal_target=Point(700, 2400),
+            ),
+            PageDetection("appraisal_bars", 1.0),
+            PageDetection("appraisal_bars", 1.0),
+            _summary_detection(),
+            _summary_detection(),
+            rename_dialog,
+            wrong_keyboard,
+            rename_dialog,
+            PageDetection(
+                "detail_summary",
+                0.99,
+                matched_texts=("CP1761", "妙蛙花"),
+                details={"summary_evidence": "name_cp"},
+            ),
+            _summary_detection(),
+            rename_dialog,
+            wrong_keyboard,
+        ],
+        summary_nicknames=("妙蛙花",),
+    )
+    adb = FakeAutomationAdb()
+    service = AutoScanService(
+        AppConfig(data_dir=tmp_path),
+        adb,
+        detector,
+        FakeReader(),
+        automation=HuaweiMate30AutomationConfig(nickname_maximum_characters=1),
+        clock=Clock(),
+        token_factory=lambda: "rename-mismatch",
+        monotonic=lambda: 0.0,
+        sleeper=lambda _: None,
+    )
+
+    with pytest.raises(AutomationError, match="did not exactly match"):
+        service.scan_one(rename_with_iv=True, debug=True)
+
+    assert adb.inputs.count(("tap", 1248, 1712)) == 1
+    assert adb.inputs.count(("tap", 1120, 1860)) == 1
+
+
 def test_menu_open_retries_once_only_after_detail_state_timeout(
     tmp_path: Path,
 ) -> None:
@@ -464,7 +1063,6 @@ def test_menu_open_retries_once_only_after_detail_state_timeout(
         ),
         clock=Clock(),
         token_factory=lambda: "retry",
-        stable_waiter=_stable,
         monotonic=lambda: 0.0,
         sleeper=lambda _: None,
     )
@@ -508,7 +1106,6 @@ def test_scroll_to_moves_retries_only_after_summary_timeout(tmp_path: Path) -> N
         automation=HuaweiMate30AutomationConfig(moves_wait_timeout_seconds=0.5),
         clock=Clock(),
         token_factory=lambda: "moves-retry",
-        stable_waiter=_stable,
         monotonic=lambda: 0.0,
         sleeper=lambda _: None,
     )
@@ -542,7 +1139,6 @@ def test_scroll_to_moves_unknown_timeout_never_blindly_retries(
         automation=HuaweiMate30AutomationConfig(moves_wait_timeout_seconds=0.5),
         clock=Clock(),
         token_factory=lambda: "moves-unknown",
-        stable_waiter=_stable,
         monotonic=lambda: 0.0,
         sleeper=lambda _: None,
     )

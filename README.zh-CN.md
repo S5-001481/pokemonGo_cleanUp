@@ -29,11 +29,8 @@ Pokémon GO Cleanup.bat
 此后直接双击 Windows 桌面上的 `Pokémon GO Cleanup.bat` 启动图形界面。
 
 ## 界面示例
-<img
-  src="示例图片.png"
-  width="900"
-  alt="Pokémon GO Cleanup 图形界面示例"
-/>
+
+![Pokémon GO Cleanup 图形界面](docs/images/interface-example.png)
 
 
 > [!IMPORTANT]

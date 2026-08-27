@@ -63,8 +63,14 @@ any `ground_truth.json` is ignored independently. Tests generate synthetic
 solid-color PNGs in temporary directories; real device images are not copied
 into the repository.
 
-OCR, tap/swipe commands, gameplay automation, account or credential access,
-private APIs, and network inspection remain out of scope.
+Guided capture remains free of OCR and device input. The fixed automatic path
+uses OCR plus tap/swipe input, and its only opt-in gameplay mutation is
+`--rename-with-iv` on one-scan or batch; it restores the default Chinese name
+then appends recognized IVs. A verified rename adds local
+`renamed_summary.png` and `nickname_change.json`; batch CSV stores the before and
+after names plus `not_requested` or `verified`. Transfer, other gameplay
+mutations, account or credential access, private APIs, and network inspection
+remain out of scope.
 
 ## Evidence
 

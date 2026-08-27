@@ -5,6 +5,10 @@ first Pokémon detail summary. The batch layer delegates every Pokémon to the
 existing `AutoScanService`; it does not duplicate or alter the proven menu,
 appraisal, IV, exit, or recognition sequence.
 
+Use `pokemon-go-cleanup scan-batch --limit 5 --csv inventory-rename.csv
+--rename-with-iv --debug` for a new opt-in rename batch. Add `--resume` only when
+continuing that same verified-rename CSV, and keep the checkbox/flag consistent.
+
 ## Step 1: Establish one durable destination
 
 `--limit` is a positive total-row ceiling, defaulting to 20. The CSV path is
@@ -19,20 +23,75 @@ a 256-bit perceptual fingerprint. The current Mate 30 crop is `(100, 1550, 1340,
 animated background. Root CSV exports, all scan directories, recognition JSON, and
 debug files remain ignored by Git.
 
+New batch CSVs use an exact 16-column contract beginning with `batch_index` and
+including `page_fingerprint`, `scan_directory`, `nickname_before`,
+`nickname_after`, and `rename_status`. The loader still accepts the prior valid
+13-column batch header as `rename_status: not_requested`; it can only be resumed
+without `--rename-with-iv`. An older recognition
+export such as the 10-column `scan_id,pokemon_name,cp,...,warnings` inventory is
+not resumable: it lacks the screenshot reference and fingerprint needed for the
+same-Pokémon guard. Do not add blank columns to bypass this check. Start a new
+batch CSV, or migrate only when every referenced complete scan directory and its
+`summary.png` still exist so the missing evidence can be recomputed. `--limit` is
+the total row ceiling; to append five rows to a valid 90-row batch, use 95 rather
+than 5.
+
+The existing `warnings` column also serves as the informational remarks field.
+When the dedicated move-layout branch confirms `暗影獎勵` or `極巨招式`, it writes
+`类型：暗影` or `类型：极巨化` there. This does not add a CSV column or change
+header/resume compatibility; multiple warnings remain joined with ` | `.
+
 ## Step 2: Reuse the complete one-scan transaction
 
 For each item, `BatchScanService` calls `AutoScanService.scan_one()` with the
-same selected serial and debug flag. A batch row is eligible only after that call
-returns a complete manifest and a recognition result. It reads the already-saved
-`summary.png`, builds the row, and atomically rewrites the CSV immediately. The
-next phone input cannot erase or defer that durable row.
+same selected serial, debug flag, and optional `--rename-with-iv`. A batch row is
+eligible only after that call returns a complete manifest and recognition result.
+Without renaming, it reads the already-saved `summary.png`, builds the row, and
+atomically rewrites the CSV immediately. The next phone input cannot erase or
+defer that durable row.
+
+With `--rename-with-iv`, the one-scan layer also persists
+`renamed_summary.png` and `nickname_change.json`. The batch layer independently
+checks their exact editor nickname, wide summary-name evidence, unchanged CP,
+exact HP when CP cannot be reread, and the existing distance-8 static fingerprint
+before writing a row with `rename_status: verified`. A CP-missing final frame may
+reuse the already recognized pre-rename CP only when exact expected nickname, HP,
+and fingerprint all prove that it is the same Pokémon. A failed transition writes
+no CSV row and sends no horizontal swipe.
 
 On `--resume`, the service reads the last complete row and its referenced
-`summary.png`, captures the current phone page, and first requires
-`detail_summary`. It compares only these adjacent pages using the same static ROI
-hash plus OCR name, CP, and optional HP. If they are the same, it runs the existing
-bounded next-Pokémon switch before scanning; if already different, it scans without
-an extra switch.
+summary artifact, captures the current phone page, and first requires
+`detail_summary`. Normal rows compare against `summary.png` exactly as before.
+Verified rename rows restore the post-edit identity from `renamed_summary.png`,
+require the saved expected nickname through the wide name reader, and then reuse
+the strict name/CP/fingerprint comparison or the known-baseline CP fallback.
+Matching rows run the existing bounded next-Pokémon switch before scanning. If CP/HP/fingerprint still
+look like the last Pokémon but its nickname is neither the verified value nor a
+strict identity match, resume stops as ambiguous with no input.
+
+Resume now reads a dedicated partial observation without changing strict
+`SummaryIdentity.cp`. It includes generic name, optional CP/HP, static fingerprint,
+and the geometry-filtered wide nickname. If both name readers clearly differ from
+the last row's name or verified nickname, the current page is already next: the
+saved last-row evidence is still validated, but no CP or swipe is required before
+scanning it. If names match, a present CP follows the old strict path. A missing CP
+runs up to two 500 ms recaptures through CP-only OCR, with unchanged static
+fingerprint required between frames. Only a total retry miss may identify the last
+Pokémon through the strong conjunction of matching generic/wide name, exact HP,
+and distance-8 static fingerprint; verified rename rows additionally require the
+saved expected nickname. Insufficient evidence aborts. This dedicated fallback
+permits one verified left swipe. The same strong proof is now shared by every
+known-identity checkpoint rather than only resume: ordinary pages require both
+generic and wide exact names; renamed pages require the saved expected nickname;
+both require exact HP and the distance-8 fingerprint. `SummaryIdentity.cp` remains
+an `int`, and an unknown/new Pokémon still has to yield CP before its new identity
+can be accepted.
+
+The saved 20:36 `resume_current.png` that motivated the change now returns
+`索財靈`, `73/73HP`, and `CP458`: HSV near-white OCR suppresses the saturated gold
+anniversary artwork. A read-only replay against the real `0826.csv` validates its
+last renamed row, classifies the name as different, sends no swipe, and reports
+the current Pokémon ready to scan.
 
 Immediately before append, the new summary is compared once more only with the last
 CSV row. A highly similar static ROI plus matching auxiliary identity refuses the
@@ -42,16 +101,29 @@ on the current one-scan recovery path for any in-progress manifest.
 
 ## Step 3: Gate the only new gesture
 
-After the complete one-scan flow has tapped the appraisal center to exit, the batch layer captures a
-fresh screen and requires `detail_summary`. Its OCR name and CP must match the
-just-saved recognition result before any switch input is sent.
+After the complete one-scan flow, the batch layer captures a fresh screen and
+requires `detail_summary`. A normal row uses the original summary identity. A
+verified rename row uses the post-edit generic OCR identity returned with
+`renamed_summary.png`. When that fresh frame contains CP, the existing strict
+name/CP/fingerprint function remains unchanged and must match that baseline before
+any switch input is sent.
+
+A fresh-frame CP miss on either kind of known row first takes up to two additional
+animation frames at 500 ms intervals and runs CP-only OCR; every frame must retain
+the existing distance-8 static fingerprint. A recovered CP returns to the strict
+check. If both retries miss, an ordinary row must match both its generic and wide
+name, while a renamed row must match its saved expected wide nickname; both must
+also match exact baseline HP and the same fingerprint threshold. Missing or
+unequal HP, a different name, or a changed fingerprint sends no input. This strong
+conjunction authorizes only the first left swipe and never the stronger retry.
 
 The fixed Mate 30 batch profile performs one left swipe from `(1180, 1500)` to
 `(260, 1500)` over 600 ms. If the page is still the same after the bounded wait,
 the only retry is a stronger left swipe from `(1300, 1500)` to `(140, 1500)` over
 850 ms. Both y-coordinates remain far above the bottom menu and transfer band;
-there is no right-swipe fallback. The profile remains intentionally limited to
-1440x3120 Traditional Chinese.
+there is no right-swipe fallback. The stronger retry is available only after a
+normal strict precheck, not after any CP-missing strong fallback. The
+profile remains intentionally limited to 1440x3120 Traditional Chinese.
 
 ## Step 4: Prove that the page changed
 
@@ -60,6 +132,12 @@ seconds. A transient `unknown` may continue during animation. Any recognized
 menu, moves, or appraisal state stops immediately. A `detail_summary` is accepted
 only when at least one of OCR name, CP, or the static page fingerprint differs
 from the previous Pokémon.
+
+If a polling frame loses CP but exact name/nickname, HP, and fingerprint prove it
+is still the previous Pokémon, polling continues with the known baseline CP. If
+the frame no longer matches that baseline and still has no CP, the service waits
+for another readable frame; a total miss stops without sending the stronger retry.
+The fallback cannot assign the previous CP to a different page.
 
 If the summary stays the same through the first timeout, one fresh screenshot
 must still confirm that same detail summary before the second and final stronger
@@ -70,9 +148,71 @@ When the changed identity matches the first row's name and CP, the service stops
 with `wrapped_to_first` before scanning it again. Otherwise the next loop invokes
 the unchanged one-scan service.
 
+The first physical rename cycle exposed a fail-closed limitation in that rule:
+row 1 and the revisited row 6 both had CP175 and an identical distance-0 static
+fingerprint, but generic OCR returned different fragments (`"2"` and `"5"`) from
+the same long `飄飄球12/2/5` nickname. Because `_same_switch_identity` still
+requires exact generic name equality, the batch missed the wrap, appended the
+duplicate row 6, and advanced to the already-verified row-2 泥巴魚. The dedicated
+full nickname evidence was not consulted by this wrap branch. The renamed wrap
+branch now uses the first row's verified expected nickname through the wide-name
+reader plus unchanged CP, optional HP, and static fingerprint. The general
+`_same_switch_identity` comparator remains unchanged for non-rename switching.
+
+### Nickname-mutation boundary
+
+Batch renaming is opt-in through `scan-batch --rename-with-iv`. The static fingerprint does not contain
+the visible nickname: its fixed crop starts at y=1550, below the rendered name,
+and two device-confirmed before/after nickname pairs produced identical hashes
+(Hamming distance 0). Nickname is nevertheless a mandatory field outside that
+hash: the current page-identity, adjacent-row, resume, pre-swipe, and wrap guards
+require the OCR name to match alongside CP and the fingerprint (and resume also
+uses HP when both sides provide it).
+
+The implementation does not make those general-purpose guards name-agnostic or
+raise their existing fingerprint tolerance. A separate, narrowly scoped
+expected-nickname-transition check requires width-sensitive editor evidence to
+match the exact planned value (with half-width digits and punctuation), while CP, optional HP,
+and the existing static fingerprint continue to identify the same Pokémon. The
+generic summary name crop is not sufficient evidence for a long renamed value:
+both live `呆火駝15/14/15` confirmations were read as only `14`, so this path
+uses the full editor value before `OK` plus a separate wide final-summary ROI.
+The first live batch rename exposed a crop-dependent OCR false negative: the
+saved summary visibly contained `飄飄球12/2/5`, but `(150,1250,1290,1600)`
+returned only `飄飄球12` and `5`. The dedicated crop is now tightened to the
+actual name row `(150,1300,1290,1550)`; both saved failures return the ordered
+tokens `飄飄球12`, `2`, `5` and therefore the exact slash-insensitive skeleton
+`飄飄球1225`. This changes neither generic summary OCR nor any CP, HP,
+fingerprint, switch, or resume comparator.
+Only after that transition is
+verified may the post-edit identity become the baseline passed to the unchanged
+next-Pokémon switch. Resume data preserves the planned/post-edit nickname so
+that a completed rename can be distinguished from an already-advanced page; an
+ambiguous transition stops rather than being treated as either case.
+
+A 2026-08-27 live run exposed an earlier CP-readiness gap in this transition.
+Scan `20260827_104456_757116_2a0406bc2bc0430aa724e4c5591635bf`
+successfully recognized 毛崖蟹 CP999, renamed it to `毛崖蟹11/11/15`, persisted
+verified nickname evidence, and finalized its manifest as `complete`. The final
+renamed frame then classified as `detail_summary` through exact nickname plus
+`96/96HP`, but every CP OCR path missed the visibly rendered CP999 against the
+animated event background. The one-scan transaction therefore completed, while
+the batch-only `_verified_renamed_identity()` call subsequently failed in strict
+`summary_identity()` before CSV append and before any left swipe, returning exit
+16. Replaying that exact `renamed_summary.png` reproduces the name+HP/no-CP
+detection. The generalized known-identity fallback now covers this pre-append
+transition: it reuses the already recognized CP999 only after exact
+`毛崖蟹11/11/15`, exact `96/96HP`, and the unchanged static fingerprint all match.
+A read-only replay of the same saved artifacts now returns post-rename CP999 and
+passes the transition without changing the original evidence files.
+
 ## Step 5: Inspect evidence and stop reasons
 
-With `--debug`, each scan keeps its existing `debug/automation/` evidence. The
+With `--debug`, each scan keeps its existing `debug/automation/` evidence,
+including `timings.json` with that Pokémon's total and ordered per-step monotonic
+durations. The file is finalized for successful, failed, interrupted, and dry-run
+items, so the failed batch item remains profileable without inferring times from
+artifact mtimes. The
 preceding scan also receives `debug/batch/` with the pre-switch screenshot,
 coordinates, per-sample screenshots, OCR state/identity timeline, and final
 attempt state. Resume debug evidence adds `resume_current.png`, both static ROI
@@ -89,7 +229,16 @@ Synthetic tests cover two distinct scans, both exact left-swipe gestures, the
 `start.x > end.x` invariant with no reverse fallback, atomic CSV persistence,
 summary-before-IV classification, debug output, the two-attempt
 ceiling, resume-on-last pre-switching, already-next no-switch behavior, upper-screen
-animation exclusion, and the final adjacent-duplicate append guard. Physical testing saved 搗蛋小妖 CP318 as the first atomic row
+animation exclusion, the final adjacent-duplicate append guard, verified rename
+success/failure, exact editor mismatch, post-rename resume, ambiguous-name zero
+input, legacy schema loading, rename-mode consistency, recognition-CP reuse from
+the same PNG, CP-missing rename transition/restoration, ordinary pre-switch strong
+fallback, and CP-missing same-page switch polling. Both real
+`呆火駝15/14/15` final screenshots produce the expected `呆火駝151415` nickname
+skeleton. The two first live batch attempts both saved the correctly renamed
+`飄飄球12/2/5` summary, then stopped before CSV append and before left swipe when
+the old crop missed the middle `2`; both screenshots replay as the expected
+`飄飄球1225` after the crop correction. Physical testing saved 搗蛋小妖 CP318 as the first atomic row
 and switched to a reliably OCR-identified 睡睡菇 CP431 summary. The first attempt at the second one-scan run stopped when its move-section
 heading fell just above the old OCR crop, so the batch correctly preserved one row
 and sent no further switch. The fixed Mate 30 `detail_moves` gate now accepts a
@@ -107,4 +256,9 @@ run.
 
 Continue to the [source evidence and falsifying checks](../references/source-evidence.md) for the exact implementation and test anchors.
 
-Evidence status: Two-row batch persistence, resume, right switching, the repaired move gate, and bounded stopping are source-, test-, and device-confirmed.
+Evidence status: Two-row batch persistence, resume, left switching, the repaired
+move gate, and bounded stopping are source-, test-, and device-confirmed. The
+first live batch rename reached and saved the correct mutation, then demonstrated
+the no-row/no-swipe failure boundary. The corrected final-name read is
+saved-real-image-confirmed; a post-correction live run through CSV append and
+left switch remains pending.

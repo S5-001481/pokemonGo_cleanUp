@@ -7,11 +7,12 @@ import importlib
 import io
 import logging
 import re
+import time
 import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final, cast
+from typing import Any, Final, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -23,8 +24,10 @@ WIDTH: Final = 1440
 HEIGHT: Final = 3120
 LOW_CONFIDENCE: Final = 0.85
 CP_RECT: Final = (250, 220, 1150, 480)
+CP_TEXT_BAND: Final = (400, 240, 930, 480)
 NAME_RECT: Final = (350, 1280, 1100, 1570)
 MOVE_ANCHOR_RECT: Final = (100, 1100, 1340, 2320)
+SPECIAL_MOVE_ANCHOR_RECT: Final = (100, 800, 1340, 1800)
 BAR_START_X: Final = 171
 BAR_END_X: Final = 665
 BAR_TOP: Final = 2150
@@ -67,10 +70,16 @@ _MOVE_LABELS: Final = (
     "暗影獎勵",
     "天氣優勢",
     "天氣加成",
+    "極巨",
     "LOCKED",
     "等級",
 )
 _CP_CANDIDATE_PATTERN: Final = re.compile(r"CP\s*(\d{1,5})", re.IGNORECASE)
+SpecialMoveLayout = Literal["shadow", "dynamax"]
+_SPECIAL_MOVE_REMARKS: Final[dict[SpecialMoveLayout, str]] = {
+    "shadow": "类型：暗影",
+    "dynamax": "类型：极巨化",
+}
 
 
 class RecognizedText(BaseModel):
@@ -210,6 +219,13 @@ class RecognitionService:
         self._cv2, self._np, rapid_ocr = _load_dependencies()
         logging.getLogger("RapidOCR").setLevel(logging.ERROR)
         self._ocr: Any = rapid_ocr()
+        self._ocr_seconds_total = 0.0
+
+    @property
+    def ocr_seconds_total(self) -> float:
+        """Cumulative time spent inside the OCR engine for profiling."""
+
+        return self._ocr_seconds_total
 
     def read_scan(self, directory: Path, *, debug: bool = False) -> RecognitionResult:
         """Read one scan and save recognition.json."""
@@ -340,9 +356,81 @@ class RecognitionService:
         return tuple(candidates), debug_image
 
     def _ocr_cp_variants(self, image: Any) -> tuple[tuple[OcrCandidate, ...], Any]:
-        """Run the existing CP OCR plus threshold variants for bright backgrounds."""
+        """Run ordinary, color-preserving, then expensive threshold CP OCR."""
 
         existing, debug_image = self._ocr_variants(image, CP_RECT)
+        if self._best_cp(existing) is not None:
+            return existing, debug_image
+        hsv_candidates = self._ocr_cp_hsv_variants(image)
+        if self._best_cp(hsv_candidates) is not None:
+            return (*existing, *hsv_candidates), debug_image
+        fallback = self._ocr_cp_fallback_variants(image)
+        return (*existing, *hsv_candidates, *fallback), debug_image
+
+    def _ocr_cp_hsv_variants(self, image: Any) -> tuple[OcrCandidate, ...]:
+        """Isolate near-white CP text from saturated animated backgrounds."""
+
+        crop = self._crop(image, CP_RECT)
+        hsv = self._cv2.cvtColor(crop, self._cv2.COLOR_BGR2HSV)
+        mask = self._cv2.inRange(
+            hsv,
+            self._np.array((0, 0, 170), dtype=self._np.uint8),
+            self._np.array((179, 45, 255), dtype=self._np.uint8),
+        )
+        scale = 4.0
+        prepared = self._cv2.resize(
+            mask,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=self._cv2.INTER_CUBIC,
+        )
+        candidates = self._run_ocr(prepared, CP_RECT, scale)
+        return tuple(
+            validated
+            for candidate in candidates
+            if (validated := self._validated_hsv_cp_candidate(candidate)) is not None
+        )
+
+    @staticmethod
+    def _validated_hsv_cp_candidate(
+        candidate: OcrCandidate,
+    ) -> OcrCandidate | None:
+        """Require a CP-band prefix or exceptionally strong full-width digit geometry."""
+
+        left, top, right, bottom = candidate.box
+        band_left, band_top, band_right, band_bottom = CP_TEXT_BAND
+        center_x = (left + right) // 2
+        center_y = (top + bottom) // 2
+        in_expected_band = (
+            band_left <= center_x <= band_right
+            and band_top <= center_y <= band_bottom
+        )
+        if not in_expected_band or candidate.confidence < LOW_CONFIDENCE:
+            return None
+        if normalize_cp_candidate(candidate.raw) is not None:
+            return candidate
+
+        normalized = normalize_ocr_text(candidate.raw).replace(" ", "")
+        if (
+            re.fullmatch(r"\d{1,5}", normalized) is None
+            or candidate.confidence < 0.95
+            or right - left < 300
+            or bottom - top < 120
+        ):
+            return None
+        value = int(normalized)
+        if value <= 0:
+            return None
+        return OcrCandidate(
+            raw=f"CP{value}",
+            confidence=candidate.confidence,
+            box=candidate.box,
+        )
+
+    def _ocr_cp_fallback_variants(self, image: Any) -> tuple[OcrCandidate, ...]:
+        """Run only the six expensive bright-background CP fallback variants."""
+
         crop = self._crop(image, CP_RECT)
         gray = self._cv2.cvtColor(crop, self._cv2.COLOR_BGR2GRAY)
         clahe = self._cv2.createCLAHE(
@@ -371,7 +459,7 @@ class RecognitionService:
             adaptive,
             self._cv2.bitwise_not(adaptive),
         )
-        candidates = list(existing)
+        candidates: list[OcrCandidate] = []
         for source in variants:
             scale = 4.0
             prepared = self._cv2.resize(
@@ -382,7 +470,7 @@ class RecognitionService:
                 interpolation=self._cv2.INTER_CUBIC,
             )
             candidates.extend(self._run_ocr(prepared, CP_RECT, scale))
-        return tuple(candidates), debug_image
+        return tuple(candidates)
 
     def _run_ocr(
         self,
@@ -390,7 +478,11 @@ class RecognitionService:
         rectangle: tuple[int, int, int, int],
         scale: float,
     ) -> tuple[OcrCandidate, ...]:
-        result = self._ocr(image)
+        started_at = time.monotonic()
+        try:
+            result = self._ocr(image)
+        finally:
+            self._ocr_seconds_total += time.monotonic() - started_at
         texts = cast(Sequence[str] | None, getattr(result, "txts", None))
         if texts is None:
             return ()
@@ -429,18 +521,34 @@ class RecognitionService:
             interpolation=self._cv2.INTER_CUBIC,
         )
         anchors = self._run_ocr(prepared, MOVE_ANCHOR_RECT, 2.0)
-        anchor = next(
-            (
-                item
-                for item in anchors
-                if "道館" in normalize_ocr_text(item.raw)
-                or "團體戰" in normalize_ocr_text(item.raw)
-            ),
-            None,
-        )
+        anchor = self._move_section_anchor(anchors)
+        special_layout = self._special_move_layout(anchors)
         if anchor is None:
-            warnings.append("Move section anchor was not found; moves are null.")
-            return (), (), prepared
+            special_crop = self._crop(image, SPECIAL_MOVE_ANCHOR_RECT)
+            special_prepared = self._cv2.resize(
+                self._sharpen(special_crop),
+                None,
+                fx=2,
+                fy=2,
+                interpolation=self._cv2.INTER_CUBIC,
+            )
+            special_candidates = self._run_ocr(
+                special_prepared,
+                SPECIAL_MOVE_ANCHOR_RECT,
+                2.0,
+            )
+            special_layout = self._special_move_layout(special_candidates)
+            anchor = (
+                self._move_section_anchor(special_candidates)
+                if special_layout is not None
+                else None
+            )
+            if anchor is None:
+                warnings.append("Move section anchor was not found; moves are null.")
+                return (), (), special_prepared
+
+        if special_layout is not None:
+            warnings.append(_SPECIAL_MOVE_REMARKS[special_layout])
 
         section = (
             130,
@@ -461,6 +569,38 @@ class RecognitionService:
         )
         debug = tuple(self._candidate_crop(image, item) for item in candidates)
         return candidates, debug, section_prepared
+
+    @staticmethod
+    def _move_section_anchor(
+        candidates: Sequence[OcrCandidate],
+    ) -> OcrCandidate | None:
+        return next(
+            (
+                item
+                for item in candidates
+                if "道館" in normalize_ocr_text(item.raw)
+                or "團體戰" in normalize_ocr_text(item.raw)
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _special_move_layout(
+        candidates: Sequence[OcrCandidate],
+    ) -> SpecialMoveLayout | None:
+        has_shadow = any(
+            item.confidence >= LOW_CONFIDENCE
+            and "暗影獎勵" in normalize_ocr_text(item.raw)
+            for item in candidates
+        )
+        has_dynamax = any(
+            item.confidence >= LOW_CONFIDENCE
+            and "極巨招式" in normalize_ocr_text(item.raw)
+            for item in candidates
+        )
+        if has_shadow == has_dynamax:
+            return None
+        return "shadow" if has_shadow else "dynamax"
 
     def _ivs(
         self,

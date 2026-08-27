@@ -1,0 +1,67 @@
+"""Focused tests for GUI progress helpers without opening a Tk window."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from pokemon_go_cleanup.gui import (
+    PokemonGoCleanupGui,
+    count_csv_data_rows,
+    format_elapsed_time,
+)
+
+
+class FakeStringVar:
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def set(self, value: str) -> None:
+        self.value = value
+
+
+def test_count_csv_data_rows_ignores_header_and_handles_quoted_newline(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "inventory.csv"
+    destination.write_text(
+        'batch_index,pokemon_name,warnings\n1,古月鳥,"first line\nsecond line"\n2,咩利羊,\n',
+        encoding="utf-8",
+    )
+
+    assert count_csv_data_rows(destination) == 2
+
+
+def test_count_csv_data_rows_handles_missing_and_header_only_files(tmp_path: Path) -> None:
+    destination = tmp_path / "inventory.csv"
+
+    assert count_csv_data_rows(destination) is None
+    destination.write_text("batch_index,pokemon_name\n", encoding="utf-8")
+    assert count_csv_data_rows(destination) == 0
+
+
+def test_format_elapsed_time_uses_hours_minutes_and_seconds() -> None:
+    assert format_elapsed_time(-1) == "00:00:00"
+    assert format_elapsed_time(0.9) == "00:00:00"
+    assert format_elapsed_time(65.8) == "00:01:05"
+    assert format_elapsed_time(3661) == "01:01:01"
+
+
+def test_running_scan_timer_refreshes_from_monotonic_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gui = object.__new__(PokemonGoCleanupGui)
+    elapsed = FakeStringVar("00:00:00")
+    gui._scan_started_at = 100.0
+    gui._elapsed_time_var = elapsed  # type: ignore[assignment]
+    monkeypatch.setattr("pokemon_go_cleanup.gui.time.monotonic", lambda: 3761.9)
+
+    gui._refresh_scan_elapsed_time()
+
+    assert elapsed.value == "01:01:01"
+
+    gui._scan_started_at = None
+    elapsed.value = "stopped"
+    gui._refresh_scan_elapsed_time()
+    assert elapsed.value == "stopped"

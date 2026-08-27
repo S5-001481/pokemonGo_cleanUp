@@ -238,6 +238,20 @@ class AdbClient:
             ["-s", serial_number, "shell", "input", "keyevent", "BACK"]
         )
 
+    def press_key(self, serial_number: str, keycode: int) -> None:
+        """Send one Android key code to the currently focused text field."""
+
+        self._run_text(
+            ["-s", serial_number, "shell", "input", "keyevent", str(keycode)]
+        )
+
+    def input_text(self, serial_number: str, value: str) -> None:
+        """Request ASCII text input for the currently focused Android text field."""
+
+        self._run_text(
+            ["-s", serial_number, "shell", "input", "text", value]
+        )
+
     def _command(self, arguments: list[str]) -> list[str]:
         return [str(self._adb_path), *arguments]
 
