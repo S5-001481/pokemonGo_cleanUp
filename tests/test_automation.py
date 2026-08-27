@@ -6,6 +6,7 @@ import io
 import json
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,9 @@ from pokemon_go_cleanup.automation import (
     PageDetection,
     Point,
     appraisal_target_is_safe,
+    build_iv_nickname,
     compact_editor_nickname_text,
+    compact_iv_suffix,
     match_move_name_power_rows,
     planned_actions,
 )
@@ -28,11 +31,16 @@ from pokemon_go_cleanup.models import Device, ScreenResolution
 from pokemon_go_cleanup.recognition import (
     CP_RECT,
     NAME_RECT,
+    AppraisalRecognitionEvidence,
+    BarDetection,
+    MovesRecognitionEvidence,
     OcrCandidate,
+    RecognitionEvidence,
     RecognitionResult,
     RecognitionService,
     RecognizedInteger,
     RecognizedText,
+    SummaryRecognitionEvidence,
 )
 from pokemon_go_cleanup.storage import atomic_write_text
 
@@ -41,6 +49,21 @@ REAL_GOLD_RESUME_SCREEN = (
     Path(__file__).parents[1]
     / "data/scans/2026-08-26/20260826_191504_866082_20bedd09a527482db74183ff7c2ecf6e"
     / "debug/batch/resume_current.png"
+)
+REAL_MOUSE_RENAMED_SUMMARY = (
+    Path(__file__).parents[1]
+    / "data/scans/2026-08-27/20260827_185253_573760_81b3c80b7b094ff29dd3c90e31790069"
+    / "renamed_summary.png"
+)
+REAL_MOUSE_SECOND_RENAMED_SUMMARY = (
+    Path(__file__).parents[1]
+    / "data/scans/2026-08-27/20260827_211507_528118_e137f8b37b254daf8616110674bccb73"
+    / "renamed_summary.png"
+)
+REAL_SHIFTED_APPRAISAL = (
+    Path(__file__).parents[1]
+    / "data/scans/2026-08-27/20260827_224510_336106_4d6062a9fed44d7eb678fa76bcea62f2"
+    / "debug/automation/appraisal_bars_wait_01.png"
 )
 
 
@@ -62,6 +85,61 @@ def _summary_detection(
         "detail_summary",
         0.99,
         details={"summary_evidence": evidence},
+    )
+
+
+def _summary_detection_with_recognition() -> PageDetection:
+    name = OcrCandidate("妙蛙花", 0.99, (600, 1350, 840, 1450))
+    cp = OcrCandidate("CP1761", 0.99, (450, 270, 890, 448))
+    return PageDetection(
+        "detail_summary",
+        0.99,
+        matched_texts=(cp.raw, name.raw),
+        details={"summary_evidence": "name_cp"},
+        recognition_evidence=SummaryRecognitionEvidence(
+            png_sha256=sha256(PNG).hexdigest(),
+            name_candidates=(name,),
+            cp_candidates=(cp,),
+            name_debug=object(),
+            cp_debug=object(),
+        ),
+    )
+
+
+def _moves_detection_with_recognition() -> PageDetection:
+    moves = (
+        OcrCandidate("藤鞭", 0.99, (400, 1500, 600, 1600)),
+        OcrCandidate("污泥攻擊", 0.99, (400, 1700, 700, 1800)),
+    )
+    return PageDetection(
+        "detail_moves",
+        0.99,
+        matched_texts=tuple(move.raw for move in moves),
+        recognition_evidence=MovesRecognitionEvidence(
+            png_sha256=sha256(PNG).hexdigest(),
+            candidates=moves,
+            warnings=(),
+            debug=(object(), object()),
+            fallback_debug=object(),
+        ),
+    )
+
+
+def _appraisal_detection_with_recognition() -> PageDetection:
+    bars = (
+        BarDetection(2150, 2180, 665, 15),
+        BarDetection(2290, 2320, 602, 13),
+        BarDetection(2430, 2460, 537, 11),
+    )
+    return PageDetection(
+        "appraisal_bars",
+        1.0,
+        recognition_evidence=AppraisalRecognitionEvidence(
+            png_sha256=sha256(PNG).hexdigest(),
+            bars=bars,
+            bars_debug=object(),
+            detection_debug=object(),
+        ),
     )
 
 
@@ -115,10 +193,18 @@ class QueueDetector:
         *,
         summary_nickname: str = "妙蛙花15/13/11",
         summary_nicknames: tuple[str, ...] = (),
+        summary_cps: tuple[int | None, ...] = (),
+        returned_detections: tuple[PageDetection, ...] = (),
     ) -> None:
         self._detections = deque(detections)
         self.summary_nickname = summary_nickname
         self._summary_nicknames = deque(summary_nicknames)
+        self._summary_cps = deque(summary_cps)
+        self._returned_detections = deque(returned_detections)
+        self.returned_calls = 0
+        self.summary_nickname_calls = 0
+        self.summary_cp_calls = 0
+        self.summary_hp_calls = 0
 
     def detect(
         self,
@@ -130,18 +216,42 @@ class QueueDetector:
         assert expected
         return self._detections.popleft()
 
+    def detect_returned_from_appraisal(self, png_bytes: bytes) -> PageDetection:
+        assert png_bytes == PNG
+        self.returned_calls += 1
+        if self._returned_detections:
+            return self._returned_detections.popleft()
+        detection = self._detections.popleft()
+        if detection.state in ("detail_summary", "detail_moves"):
+            return PageDetection(
+                "detail_returned",
+                detection.confidence,
+                details={"test_evidence": "fixed_detail_buttons"},
+            )
+        return detection
+
     def read_summary_nickname(self, png_bytes: bytes) -> str:
         assert png_bytes == PNG
+        self.summary_nickname_calls += 1
         if self._summary_nicknames:
             return self._summary_nicknames.popleft()
         return self.summary_nickname
 
+    def read_summary_nickname_for_expected(
+        self,
+        png_bytes: bytes,
+        expected_nickname: str,
+    ) -> str:
+        return self.read_summary_nickname(png_bytes)
+
     def read_summary_cp(self, png_bytes: bytes) -> int | None:
         assert png_bytes == PNG
-        return None
+        self.summary_cp_calls += 1
+        return self._summary_cps.popleft() if self._summary_cps else None
 
     def read_summary_hp(self, png_bytes: bytes) -> str | None:
         assert png_bytes == PNG
+        self.summary_hp_calls += 1
         return None
 
 class MovesAwareQueueDetector(QueueDetector):
@@ -172,7 +282,17 @@ class InterruptingDetector:
         assert expected
         raise KeyboardInterrupt
 
+    def detect_returned_from_appraisal(self, png_bytes: bytes) -> PageDetection:
+        raise KeyboardInterrupt
+
     def read_summary_nickname(self, png_bytes: bytes) -> str:
+        raise KeyboardInterrupt
+
+    def read_summary_nickname_for_expected(
+        self,
+        png_bytes: bytes,
+        expected_nickname: str,
+    ) -> str:
         raise KeyboardInterrupt
 
     def read_summary_cp(self, png_bytes: bytes) -> int | None:
@@ -224,6 +344,9 @@ class ProgressiveSummaryReader:
 
     _best_cp = staticmethod(RecognitionService._best_cp)
     _best_text = staticmethod(RecognitionService._best_text)
+    _ordinary_cp_candidate_is_reliable = staticmethod(
+        RecognitionService._ordinary_cp_candidate_is_reliable
+    )
 
 
 class ProgressiveSummaryDetector(HuaweiMate30PageDetector):
@@ -250,25 +373,111 @@ class ProgressiveSummaryDetector(HuaweiMate30PageDetector):
         return self.hp_candidates
 
 
+class FakeReturnedReader:
+    def __init__(self, *, appraisal_bars_present: bool) -> None:
+        self.appraisal_bars_present = appraisal_bars_present
+
+    def _ivs(
+        self,
+        _image: object,
+    ) -> tuple[
+        tuple[BarDetection, BarDetection, BarDetection] | None,
+        object,
+        object,
+    ]:
+        bars = None
+        if self.appraisal_bars_present:
+            bar = BarDetection(y_start=2150, y_end=2180, endpoint=300, value=5)
+            bars = (bar, bar, bar)
+        return bars, object(), object()
+
+
+def returned_detector(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    appraisal_bars_present: bool,
+    button_metrics: tuple[dict[str, float], ...] = (),
+) -> tuple[HuaweiMate30PageDetector, list[Point]]:
+    detector = object.__new__(HuaweiMate30PageDetector)
+    detector._reader = FakeReturnedReader(  # type: ignore[assignment]
+        appraisal_bars_present=appraisal_bars_present
+    )
+    detector._config = HuaweiMate30AutomationConfig()
+    observed_centers: list[Point] = []
+    metrics = deque(button_metrics)
+    monkeypatch.setattr(detector, "_decode", lambda _png: object())
+
+    def detail_button_metrics(
+        _image: object,
+        center: Point,
+        _radius: int,
+    ) -> dict[str, float]:
+        observed_centers.append(center)
+        return metrics.popleft()
+
+    monkeypatch.setattr(detector, "_detail_button_metrics", detail_button_metrics)
+    return detector, observed_centers
+
+
 class FakeReader:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        pokemon_name: str = "妙蛙花",
+        cp: int = 1761,
+        attack_iv: int = 15,
+        defense_iv: int = 13,
+        hp_iv: int = 11,
+    ) -> None:
         self.calls: list[tuple[Path, bool]] = []
+        self.evidence_calls: list[tuple[Path, RecognitionEvidence, bool]] = []
+        self.accept_evidence = False
         self.ocr_seconds_total = 0.0
+        self.pokemon_name = pokemon_name
+        self.cp = cp
+        self.attack_iv = attack_iv
+        self.defense_iv = defense_iv
+        self.hp_iv = hp_iv
+
+    def _result(self, directory: Path) -> RecognitionResult:
+        result = RecognitionResult(
+            scan_id=directory.name,
+            pokemon_name=RecognizedText(
+                value=self.pokemon_name,
+                raw=self.pokemon_name,
+                confidence=0.99,
+            ),
+            cp=RecognizedInteger(value=self.cp, raw=f"CP{self.cp}", confidence=0.99),
+            fast_move=RecognizedText(value="藤鞭", raw="藤鞭", confidence=0.99),
+            charged_move_1=RecognizedText(value="污泥攻擊", raw="污泥攻擊", confidence=0.99),
+            charged_move_2=RecognizedText(value=None, raw=None, confidence=None),
+            attack_iv=self.attack_iv,
+            defense_iv=self.defense_iv,
+            hp_iv=self.hp_iv,
+        )
+        return result
 
     def read_scan(self, directory: Path, *, debug: bool = False) -> RecognitionResult:
         self.calls.append((directory, debug))
         self.ocr_seconds_total += 1.25
-        result = RecognitionResult(
-            scan_id=directory.name,
-            pokemon_name=RecognizedText(value="妙蛙花", raw="妙蛙花", confidence=0.99),
-            cp=RecognizedInteger(value=1761, raw="CP1761", confidence=0.99),
-            fast_move=RecognizedText(value="藤鞭", raw="藤鞭", confidence=0.99),
-            charged_move_1=RecognizedText(value="污泥攻擊", raw="污泥攻擊", confidence=0.99),
-            charged_move_2=RecognizedText(value=None, raw=None, confidence=None),
-            attack_iv=15,
-            defense_iv=13,
-            hp_iv=11,
+        result = self._result(directory)
+        atomic_write_text(
+            directory / "recognition.json",
+            result.model_dump_json(indent=2) + "\n",
         )
+        return result
+
+    def read_evidence(
+        self,
+        directory: Path,
+        evidence: RecognitionEvidence,
+        *,
+        debug: bool = False,
+    ) -> RecognitionResult | None:
+        self.evidence_calls.append((directory, evidence, debug))
+        if not self.accept_evidence:
+            return None
+        result = self._result(directory)
         atomic_write_text(
             directory / "recognition.json",
             result.model_dump_json(indent=2) + "\n",
@@ -284,6 +493,15 @@ class Clock:
         result = self.current
         self.current += timedelta(seconds=1)
         return result
+
+
+class AdvancingMonotonic:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        self.value += 1.0
+        return self.value
 
 
 def test_appraisal_target_rejects_transfer_proximity_and_forbidden_band() -> None:
@@ -370,6 +588,117 @@ def test_summary_nickname_reader_excludes_date_badge_and_small_row_noise(
     assert detector.read_summary_nickname(PNG) == "哈力栗"
 
 
+def progressive_wide_nickname_detector(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    sharpened: tuple[OcrCandidate, ...],
+    raw_color: tuple[OcrCandidate, ...],
+) -> tuple[HuaweiMate30PageDetector, list[str]]:
+    detector = object.__new__(HuaweiMate30PageDetector)
+    detector._config = HuaweiMate30AutomationConfig()
+    calls: list[str] = []
+    monkeypatch.setattr(detector, "_decode", lambda _png: object())
+
+    def ocr_rectangle(
+        _image: object,
+        rectangle: tuple[int, int, int, int],
+    ) -> tuple[OcrCandidate, ...]:
+        assert rectangle == detector._config.nickname_summary_rect
+        calls.append("sharpened")
+        return sharpened
+
+    def ocr_raw_color(_image: object) -> tuple[OcrCandidate, ...]:
+        calls.append("raw_color")
+        return raw_color
+
+    monkeypatch.setattr(detector, "_ocr_rectangle", ocr_rectangle)
+    monkeypatch.setattr(detector, "_ocr_wide_nickname_raw_color", ocr_raw_color)
+    return detector, calls
+
+
+def test_final_wide_nickname_skips_raw_fallback_after_sharpened_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = "一對鼠14/15/15"
+    detector, calls = progressive_wide_nickname_detector(
+        monkeypatch,
+        sharpened=(OcrCandidate(expected, 0.95, (419, 1373, 1105, 1541)),),
+        raw_color=(),
+    )
+
+    assert detector.read_summary_nickname_for_expected(PNG, expected) == expected
+    assert calls == ["sharpened"]
+
+
+def test_final_wide_nickname_uses_lower_confidence_raw_exact_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = "一對鼠14/15/15"
+    detector, calls = progressive_wide_nickname_detector(
+        monkeypatch,
+        sharpened=(OcrCandidate("-對鼠14/15/15", 0.999, (419, 1375, 1104, 1533)),),
+        raw_color=(OcrCandidate(expected, 0.80, (419, 1373, 1105, 1541)),),
+    )
+
+    assert detector.read_summary_nickname_for_expected(PNG, expected) == expected
+    assert calls == ["sharpened", "raw_color"]
+
+
+@pytest.mark.parametrize(
+    "raw_value",
+    ["錯誤14/15/15", "一對鼠14/15/1"],
+    ids=("both_wrong", "raw_prefix_only"),
+)
+def test_final_wide_nickname_fails_closed_when_raw_does_not_fully_match(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    raw_value: str,
+) -> None:
+    expected = "一對鼠14/15/15"
+    detector, calls = progressive_wide_nickname_detector(
+        monkeypatch,
+        sharpened=(OcrCandidate("-對鼠14/15/15", 0.99, (419, 1375, 1104, 1533)),),
+        raw_color=(OcrCandidate(raw_value, 0.98, (419, 1373, 1105, 1541)),),
+    )
+    service = AutoScanService(
+        AppConfig(data_dir=tmp_path),
+        FakeAutomationAdb(),
+        detector,
+        FakeReader(),
+    )
+
+    with pytest.raises(AutomationError, match="did not show the expected nickname"):
+        service._verify_final_summary_nickname(PNG, expected)
+
+    assert calls == ["sharpened", "raw_color"]
+
+
+@pytest.mark.skipif(
+    not REAL_MOUSE_RENAMED_SUMMARY.is_file(),
+    reason="local ignored 一對鼠 renamed summary is unavailable",
+)
+def test_real_mouse_final_wide_nickname_replays_through_raw_fallback() -> None:
+    detector = HuaweiMate30PageDetector(RecognitionService())
+    screenshot = REAL_MOUSE_RENAMED_SUMMARY.read_bytes()
+    expected = "一對鼠14/15/15"
+
+    assert detector.read_summary_nickname(screenshot) == "-對鼠14/15/15"
+    assert detector.read_summary_nickname_for_expected(screenshot, expected) == expected
+
+
+@pytest.mark.skipif(
+    not REAL_MOUSE_SECOND_RENAMED_SUMMARY.is_file(),
+    reason="local ignored second 一對鼠 renamed summary is unavailable",
+)
+def test_second_real_mouse_final_wide_nickname_replays_at_raw_two_times() -> None:
+    detector = HuaweiMate30PageDetector(RecognitionService())
+    screenshot = REAL_MOUSE_SECOND_RENAMED_SUMMARY.read_bytes()
+    expected = "一對鼠15/14/12"
+
+    assert detector.read_summary_nickname(screenshot) == "-對鼠15/14/12"
+    assert detector.read_summary_nickname_for_expected(screenshot, expected) == expected
+
+
 def test_appraisal_greeting_is_a_direct_dialogue_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -398,6 +727,25 @@ def test_appraisal_greeting_is_a_direct_dialogue_state(
         },
     )
     assert observed_rectangles == [(80, 2450, 420, 2615)]
+
+
+@pytest.mark.skipif(
+    not REAL_SHIFTED_APPRAISAL.is_file(),
+    reason="local ignored shifted 来悲茶 appraisal frame is unavailable",
+)
+def test_real_shifted_appraisal_has_priority_over_dialogue_ocr() -> None:
+    detector = HuaweiMate30PageDetector(RecognitionService())
+
+    result = detector.detect(
+        REAL_SHIFTED_APPRAISAL.read_bytes(),
+        expected=("appraisal_bars", "appraisal_dialogue"),
+    )
+
+    assert result.state == "appraisal_bars"
+    assert result.details == {
+        "iv_values": [14, 11, 14],
+        "iv_geometry_path": "upward_fallback",
+    }
 
 
 def test_appraisal_entry_checks_greeting_before_action_menu(
@@ -589,6 +937,114 @@ def test_summary_skips_cp_and_hp_fallback_when_name_is_missing() -> None:
     assert detector.hp_calls == 0
 
 
+def test_returned_from_appraisal_requires_absent_iv_bars_and_two_detail_buttons(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    detector, observed_centers = returned_detector(
+        monkeypatch,
+        appraisal_bars_present=False,
+        button_metrics=(
+            {
+                "disk_teal_ratio": 0.96,
+                "ring_teal_ratio": 0.09,
+                "ring_contrast": 0.87,
+            },
+            {
+                "disk_teal_ratio": 0.95,
+                "ring_teal_ratio": 0.39,
+                "ring_contrast": 0.56,
+            },
+        ),
+    )
+
+    result = detector.detect_returned_from_appraisal(PNG)
+
+    assert result.state == "detail_returned"
+    assert result.details["iv_appraisal_geometry_absent"] is True
+    assert result.details["appraisal_overlay_absent"] is True
+    assert observed_centers == [Point(720, 2772), Point(1244, 2772)]
+
+
+def test_returned_from_appraisal_rejects_visible_iv_bars_before_button_checks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    detector, observed_centers = returned_detector(
+        monkeypatch,
+        appraisal_bars_present=True,
+    )
+
+    result = detector.detect_returned_from_appraisal(PNG)
+
+    assert result.state == "unknown"
+    assert result.details == {
+        "returned_from_appraisal": False,
+        "appraisal_overlay_absent": False,
+        "iv_appraisal_geometry_absent": False,
+        "reason": "iv_bars_present",
+    }
+    assert observed_centers == []
+
+
+@pytest.mark.parametrize(
+    "button_metrics",
+    (
+        (
+            {
+                "disk_teal_ratio": 0.0,
+                "ring_teal_ratio": 0.0,
+                "ring_contrast": 0.0,
+            },
+            {
+                "disk_teal_ratio": 0.0,
+                "ring_teal_ratio": 0.0,
+                "ring_contrast": 0.0,
+            },
+        ),
+        (
+            {
+                "disk_teal_ratio": 1.0,
+                "ring_teal_ratio": 1.0,
+                "ring_contrast": 0.0,
+            },
+            {
+                "disk_teal_ratio": 0.99,
+                "ring_teal_ratio": 1.0,
+                "ring_contrast": -0.01,
+            },
+        ),
+        (
+            {
+                "disk_teal_ratio": 0.96,
+                "ring_teal_ratio": 0.09,
+                "ring_contrast": 0.87,
+            },
+            {
+                "disk_teal_ratio": 0.30,
+                "ring_teal_ratio": 0.05,
+                "ring_contrast": 0.25,
+            },
+        ),
+    ),
+    ids=("black_screen", "full_teal_action_menu", "one_button_animation_frame"),
+)
+def test_returned_from_appraisal_fails_closed_without_both_button_geometries(
+    monkeypatch: pytest.MonkeyPatch,
+    button_metrics: tuple[dict[str, float], dict[str, float]],
+) -> None:
+    detector, _ = returned_detector(
+        monkeypatch,
+        appraisal_bars_present=False,
+        button_metrics=button_metrics,
+    )
+
+    result = detector.detect_returned_from_appraisal(PNG)
+
+    assert result.state == "unknown"
+    assert result.details["returned_from_appraisal"] is False
+    assert result.details["appraisal_overlay_absent"] is False
+    assert result.details["reason"] == "detail_buttons_not_confirmed"
+
+
 def test_rename_plan_uses_fixed_name_row_center() -> None:
     actions = planned_actions(rename_with_iv=True)
     rename_actions = actions[-2:]
@@ -716,8 +1172,11 @@ def test_live_flow_sends_only_gated_single_scan_actions(tmp_path: Path) -> None:
     result = service.scan_one(debug=True)
 
     assert result.manifest.scan_status == "complete"
+    assert detector.returned_calls == 1
     assert not hasattr(service, "_stable_waiter")
     assert result.recognition is not None
+    assert reader.calls == [(result.scan_directory, True)]
+    assert reader.evidence_calls == []
     assert [action[0] for action in adb.inputs] == [
         "swipe",
         "tap",
@@ -757,6 +1216,113 @@ def test_live_flow_sends_only_gated_single_scan_actions(tmp_path: Path) -> None:
     assert not (debug_directory / "stability_scroll_to_moves.json").exists()
 
 
+@pytest.mark.parametrize(
+    ("accept_evidence", "expected_read_scan_calls"),
+    ((True, 0), (False, 1)),
+)
+def test_live_complete_evidence_skips_or_falls_back_to_read_scan(
+    tmp_path: Path,
+    accept_evidence: bool,
+    expected_read_scan_calls: int,
+) -> None:
+    menu = PageDetection(
+        "action_menu",
+        0.99,
+        matched_texts=("調查寶可夢",),
+        appraisal_target=Point(700, 2400),
+    )
+    detector = MovesAwareQueueDetector(
+        [
+            _summary_detection_with_recognition(),
+            _moves_detection_with_recognition(),
+            PageDetection("detail_moves", 0.99),
+            menu,
+            PageDetection("appraisal_dialogue", 0.95),
+            PageDetection("appraisal_dialogue", 0.95),
+            PageDetection("appraisal_bars", 1.0),
+            _appraisal_detection_with_recognition(),
+            _summary_detection(),
+        ]
+    )
+    reader = FakeReader()
+    reader.accept_evidence = accept_evidence
+    service = AutoScanService(
+        AppConfig(data_dir=tmp_path),
+        FakeAutomationAdb(),
+        detector,
+        reader,
+        clock=Clock(),
+        token_factory=lambda: "live-evidence",
+        monotonic=lambda: 0.0,
+        sleeper=lambda _: None,
+    )
+
+    result = service.scan_one(debug=True)
+
+    assert result.manifest.scan_status == "complete"
+    assert len(reader.calls) == expected_read_scan_calls
+    assert len(reader.evidence_calls) == 1
+    assert reader.evidence_calls[0][0] == result.scan_directory
+    assert reader.evidence_calls[0][2] is True
+
+
+def test_exit_appraisal_timeout_runs_one_full_diagnostic_without_more_input(
+    tmp_path: Path,
+) -> None:
+    menu = PageDetection(
+        "action_menu",
+        0.99,
+        matched_texts=("調查寶可夢",),
+        appraisal_target=Point(700, 2400),
+    )
+    detector = QueueDetector(
+        [
+            _summary_detection(),
+            PageDetection("detail_moves", 0.99),
+            PageDetection("detail_moves", 0.99),
+            menu,
+            PageDetection("appraisal_bars", 1.0),
+            PageDetection("appraisal_bars", 1.0),
+            PageDetection("action_menu", 0.99),
+        ],
+        returned_detections=tuple(
+            PageDetection("unknown", 0.0) for _ in range(20)
+        ),
+    )
+    adb = FakeAutomationAdb()
+    service = AutoScanService(
+        AppConfig(data_dir=tmp_path),
+        adb,
+        detector,
+        FakeReader(),
+        automation=HuaweiMate30AutomationConfig(total_timeout_seconds=1000.0),
+        clock=Clock(),
+        token_factory=lambda: "exit-timeout",
+        monotonic=AdvancingMonotonic(),
+        sleeper=lambda _seconds: None,
+    )
+
+    with pytest.raises(
+        AutomationError,
+        match="final full diagnostic state was action_menu",
+    ):
+        service.scan_one(debug=True)
+
+    assert detector.returned_calls > 1
+    assert adb.inputs[-1] == ("tap", 720, 1560)
+    assert adb.inputs.count(("tap", 720, 1560)) == 1
+    scan_directory = next((tmp_path / "scans" / "2026-07-29").iterdir())
+    assert (scan_directory / "exit_appraisal_timeout.png").is_file()
+    debug_directory = scan_directory / "debug" / "automation"
+    assert (debug_directory / "exit_appraisal_timeout.png").is_file()
+    diagnostic_states = tuple(
+        debug_directory.glob("state_*_exit_appraisal_timeout_diagnostic.json")
+    )
+    assert len(diagnostic_states) == 1
+    diagnostic = json.loads(diagnostic_states[0].read_text(encoding="utf-8"))
+    assert diagnostic["state"] == "action_menu"
+
+
 def test_rename_with_iv_resets_default_name_then_appends_suffix(tmp_path: Path) -> None:
     rename_dialog = PageDetection(
         "rename_dialog",
@@ -790,7 +1356,12 @@ def test_rename_with_iv_resets_default_name_then_appends_suffix(tmp_path: Path) 
                 matched_texts=("CP1761", "妙"),
                 details={"summary_evidence": "name_cp"},
             ),
-            _summary_detection(),
+            PageDetection(
+                "detail_summary",
+                0.99,
+                matched_texts=("CP1761", "妙蛙花"),
+                details={"cp": "CP1761", "summary_evidence": "name_cp"},
+            ),
             rename_dialog,
             rename_keyboard,
             rename_dialog,
@@ -826,6 +1397,7 @@ def test_rename_with_iv_resets_default_name_then_appends_suffix(tmp_path: Path) 
     assert result.manifest.scan_status == "complete"
     assert result.nickname_change is not None
     assert result.nickname_change.expected_nickname == "妙蛙花15/13/11"
+    assert detector.summary_cp_calls == 0
     assert (result.scan_directory / "renamed_summary.png").is_file()
     assert (result.scan_directory / "nickname_change.json").is_file()
     assert adb.inputs[-11:] == [
@@ -905,10 +1477,195 @@ def test_rename_with_iv_resets_default_name_then_appends_suffix(tmp_path: Path) 
     assert all(step["outcome"] == "completed" for step in timing_steps)
 
 
+def _cp_disagreement_rename_detections(
+    checkpoint_cp: int,
+    expected_nickname: str,
+) -> list[PageDetection]:
+    rename_dialog = PageDetection(
+        "rename_dialog",
+        0.99,
+        matched_texts=("取消", "確定"),
+        rename_confirm_target=Point(1120, 1860),
+    )
+    rename_keyboard = PageDetection(
+        "rename_keyboard",
+        0.99,
+        matched_texts=("設定暱稱", expected_nickname, "确定"),
+        rename_keyboard_target=Point(1248, 1712),
+        details={"nickname_text_candidates": [expected_nickname]},
+    )
+    return [
+        _summary_detection(),
+        PageDetection("detail_moves", 0.99),
+        PageDetection("detail_moves", 0.99),
+        PageDetection(
+            "action_menu",
+            0.99,
+            matched_texts=("調查寶可夢",),
+            appraisal_target=Point(700, 2400),
+        ),
+        PageDetection("appraisal_bars", 1.0),
+        PageDetection("appraisal_bars", 1.0),
+        _summary_detection(),
+        PageDetection(
+            "detail_summary",
+            0.99,
+            matched_texts=(f"CP{checkpoint_cp}", "湧躍鴨"),
+            details={"cp": f"CP{checkpoint_cp}", "summary_evidence": "name_cp"},
+        ),
+        rename_dialog,
+        rename_keyboard,
+        rename_dialog,
+        _summary_detection(),
+        _summary_detection(),
+        rename_dialog,
+        rename_keyboard,
+        rename_dialog,
+        _summary_detection(),
+    ]
+
+
+def test_rename_cp_disagreement_uses_bounded_cp_only_consensus(
+    tmp_path: Path,
+) -> None:
+    expected_nickname = "湧躍鴨12/15/15"
+    detector = QueueDetector(
+        _cp_disagreement_rename_detections(97, expected_nickname),
+        summary_nicknames=("湧躍鴨", expected_nickname),
+        summary_cps=(997, None, 997),
+    )
+    adb = FakeAutomationAdb()
+    service = AutoScanService(
+        AppConfig(data_dir=tmp_path),
+        adb,
+        detector,
+        FakeReader(
+            pokemon_name="湧躍鴨",
+            cp=67,
+            attack_iv=12,
+            defense_iv=15,
+            hp_iv=15,
+        ),
+        automation=HuaweiMate30AutomationConfig(
+            nickname_maximum_characters=1,
+            rename_cp_consensus_interval_seconds=0.0,
+        ),
+        clock=Clock(),
+        token_factory=lambda: "rename-cp-consensus",
+        monotonic=lambda: 0.0,
+        sleeper=lambda _: None,
+    )
+
+    result = service.scan_one(rename_with_iv=True, debug=True)
+
+    assert result.recognition is not None
+    assert result.recognition.cp.value == 997
+    assert result.recognition.cp.raw is None
+    assert detector.summary_cp_calls == 3
+    assert detector.summary_nickname_calls == 2
+    assert detector.summary_hp_calls == 0
+    persisted = json.loads(
+        (result.scan_directory / "recognition.json").read_text(encoding="utf-8")
+    )
+    assert persisted["cp"]["value"] == 997
+    consensus = json.loads(
+        (
+            result.scan_directory
+            / "debug"
+            / "automation"
+            / "rename_cp_consensus.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert consensus == {
+        "baseline_cp": 67,
+        "checkpoint_cp": 97,
+        "samples": [997, None, 997],
+        "required_matches": 2,
+        "trusted_cp": 997,
+    }
+
+
+def test_rename_cp_disagreement_without_consensus_stops_before_editor(
+    tmp_path: Path,
+) -> None:
+    expected_nickname = "湧躍鴨12/15/15"
+    detector = QueueDetector(
+        _cp_disagreement_rename_detections(97, expected_nickname),
+        summary_nicknames=("湧躍鴨", expected_nickname),
+        summary_cps=(997, None, 99),
+    )
+    adb = FakeAutomationAdb()
+    service = AutoScanService(
+        AppConfig(data_dir=tmp_path),
+        adb,
+        detector,
+        FakeReader(
+            pokemon_name="湧躍鴨",
+            cp=67,
+            attack_iv=12,
+            defense_iv=15,
+            hp_iv=15,
+        ),
+        automation=HuaweiMate30AutomationConfig(
+            rename_cp_consensus_interval_seconds=0.0,
+            rename_cp_consensus_max_frames=3,
+        ),
+        clock=Clock(),
+        token_factory=lambda: "rename-cp-no-consensus",
+        monotonic=lambda: 0.0,
+        sleeper=lambda _: None,
+    )
+
+    with pytest.raises(AutomationError, match="did not produce a repeated complete CP"):
+        service.scan_one(rename_with_iv=True, debug=True)
+
+    assert detector.summary_cp_calls == 3
+    assert detector.summary_nickname_calls == 0
+    assert detector.summary_hp_calls == 0
+    assert ("tap", 720, 1460) not in adb.inputs
+
+
 def test_editor_nickname_compaction_preserves_character_width() -> None:
     assert compact_editor_nickname_text("妙蛙花 15/13/11") == "妙蛙花15/13/11"
     full_width = "妙蛙花\uff11\uff15\uff0f\uff11\uff13\uff0f\uff11\uff11"
     assert compact_editor_nickname_text(full_width) != "妙蛙花15/13/11"
+
+
+def test_build_iv_nickname_keeps_pretty_format_within_limit() -> None:
+    result = build_iv_nickname("毛崖蟹", 11, 11, 15)
+
+    assert result.nickname == "毛崖蟹11/11/15"
+    assert result.format == "pretty"
+    assert len(result.nickname) <= 12
+
+
+def test_build_iv_nickname_compacts_five_character_name() -> None:
+    result = build_iv_nickname("赫拉克羅斯", 15, 14, 13)
+
+    assert result.nickname == "赫拉克羅斯151413"
+    assert result.format == "compact_iv"
+
+
+def test_compact_iv_suffix_zero_pads_each_value() -> None:
+    assert compact_iv_suffix(1, 11, 1) == "011101"
+    assert compact_iv_suffix(0, 0, 0) == "000000"
+    assert compact_iv_suffix(0, 0, 15) == "000015"
+
+
+@pytest.mark.parametrize("name", ["卡璞・鳴鳴", "屬性：空", "3D龍2"])
+def test_build_iv_nickname_uses_python_unicode_length(name: str) -> None:
+    result = build_iv_nickname(name, 15, 14, 13)
+
+    expected_pretty = f"{name}15/14/13"
+    expected_compact = f"{name}151413"
+    assert result.nickname == (
+        expected_pretty if len(expected_pretty) <= 12 else expected_compact
+    )
+
+
+def test_build_iv_nickname_rejects_compact_value_over_limit_without_truncation() -> None:
+    with pytest.raises(AutomationError, match="exceeds the 12-character game limit"):
+        build_iv_nickname("人工超長寶可夢名", 15, 14, 13)
 
 
 def test_fixed_nickname_row_tap_stops_before_text_when_editor_does_not_open(
@@ -975,9 +1732,9 @@ def test_rename_with_iv_rejects_wrong_editor_text_before_final_confirmation(
     wrong_keyboard = PageDetection(
         "rename_keyboard",
         0.99,
-        matched_texts=("設定暱稱", "妙蛙花15/13/10", "确定"),
+        matched_texts=("設定暱稱", "赫拉克羅斯15141", "确定"),
         rename_keyboard_target=Point(1248, 1712),
-        details={"nickname_text_candidates": ["妙蛙花15/13/10"]},
+        details={"nickname_text_candidates": ["赫拉克羅斯15141"]},
     )
     detector = QueueDetector(
         [
@@ -1007,14 +1764,19 @@ def test_rename_with_iv_rejects_wrong_editor_text_before_final_confirmation(
             rename_dialog,
             wrong_keyboard,
         ],
-        summary_nicknames=("妙蛙花",),
+        summary_nicknames=("赫拉克羅斯",),
     )
     adb = FakeAutomationAdb()
     service = AutoScanService(
         AppConfig(data_dir=tmp_path),
         adb,
         detector,
-        FakeReader(),
+        FakeReader(
+            pokemon_name="赫拉克羅斯",
+            attack_iv=15,
+            defense_iv=14,
+            hp_iv=13,
+        ),
         automation=HuaweiMate30AutomationConfig(nickname_maximum_characters=1),
         clock=Clock(),
         token_factory=lambda: "rename-mismatch",
@@ -1027,6 +1789,7 @@ def test_rename_with_iv_rejects_wrong_editor_text_before_final_confirmation(
 
     assert adb.inputs.count(("tap", 1248, 1712)) == 1
     assert adb.inputs.count(("tap", 1120, 1860)) == 1
+    assert ("text", "151413") in adb.inputs
 
 
 def test_menu_open_retries_once_only_after_detail_state_timeout(

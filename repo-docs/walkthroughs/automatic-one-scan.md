@@ -33,10 +33,19 @@ matching `number / number HP`; a single name, CP, or HP signal remains
 but keeps polling for CP, and the last such valid screenshot becomes
 `summary.png` if the full interval expires.
 
-Summary OCR is progressive. It first runs the three ordinary CP variants and the
-three ordinary name variants, retaining the same best-candidate rules. A valid
-name plus `CP`-prefixed value returns `detail_summary` immediately. Only when the
-name succeeds but the ordinary CP set has no valid prefixed value does it run one
+Summary OCR is progressive both within and after the ordinary preprocessing set.
+CP and name each start with the cheapest 2x color crop, then run sharpened 3x and
+CLAHE 4x OCR only while the accumulated result is still insufficient. CP may stop
+inside that set only when the best candidate retains the `CP` prefix, meets the
+unchanged confidence threshold, has a positive value, and is centered in the
+existing CP text band. Name may stop only when the current variant has one
+confident Chinese-bearing name token of at least two Chinese characters and that
+token is also the accumulated best candidate. A single `怒`, or one variant that
+splits `怒` and `鸚哥`, therefore continues to the next variant. If no ordinary
+variant reaches those early-stop conditions, all three still run and retain the
+same final best-candidate rules. A valid name plus `CP`-prefixed value returns
+`detail_summary` immediately. Only when the name succeeds but the ordinary CP set
+has no valid prefixed value does it run one
 HSV near-white mask. This preserves the white CP text while suppressing saturated
 gold/event artwork. A prefixed candidate in the expected CP band is preferred;
 bare digits are promoted to CP only with confidence at least 0.95 and the wide,
@@ -112,13 +121,49 @@ as `appraisal_dialogue`. After that tap, the
 service polls every 500 ms for up to 30 seconds without sending more input.
 `appraisal_dialogue` and `unknown` continue waiting; any other non-bar state stops
 safely. `appraisal.png` is saved only after the existing OpenCV geometry detector
-finds all three IV bars and classifies the screen as `appraisal_bars`.
+finds all three IV bars and classifies the screen as `appraisal_bars`. The normal
+geometry search remains `(171..665, 2150..2700)`. Only its miss retries the same
+row-height, 125–150 px spacing, HSV endpoint, and quantization rules with the top
+extended upward to y=2100; that fallback must yield exactly one legal three-row
+sequence. It does not loosen bar dimensions or use the visible attack/defense/HP
+labels as IV values. Debug state records `iv_geometry_path` as `standard` or
+`upward_fallback`.
+
+Saved scan `20260827_224510_336106_4d6062a9fed44d7eb678fa76bcea62f2`
+motivated this retry. Its 来悲茶 card is shifted upward: attack, defense, and HP
+start at y=2136/2269/2400. The old y=2150 top clipped attack to 17 pixels and
+discarded it below the unchanged 20-pixel minimum. Upward replay of all nine wait
+frames returns exact IV `14/11/14`; the user confirmed HP14. The action menu,
+pre-tap dialogue, and four entry frames from the same run remain negative.
 
 ## Step 5: Exit, recognize, optionally rename, or preserve an honest partial run
 
-The center tap `(720, 1560)` is sent only from `appraisal_bars`. The returned screen must be a recognized
-detail state before the existing calibrated reader runs and writes
-`recognition.json`. By default the phone is not renamed.
+The center tap `(720, 1560)` is sent only from `appraisal_bars`; its coordinate and
+single-tap behavior are unchanged. The return wait uses a dedicated lightweight
+detector instead of ordinary name/CP/moves OCR. Every 500 ms it first requires the
+existing IV-bar geometry to be absent, then inspects only small fixed ROIs around
+the detail page's close button `(720,2772)` and menu button `(1244,2772)`. Both
+ROIs must contain the calibrated teal disk and a sufficiently non-teal surrounding
+ring, proving two page-specific circular controls rather than a teal overlay.
+Visible IV bars, black frames, appraisal dialogue, a full-teal action menu, and an
+incomplete one-button animation frame remain `unknown`; polling continues and no
+input is sent. Normal polling calls no RapidOCR. If 15 seconds expires, the final
+PNG and state evidence are preserved and that last frame alone goes through the
+existing full detector once for diagnosis; the run still fails without another
+tap. A lightweight success only proves safe return from appraisal and does not
+change or replace any later identity comparison. The existing calibrated reader
+then writes `recognition.json`. In an automatic live scan only, the summary,
+moves, and appraisal detectors retain the exact candidates, warnings, IV bars,
+and debug crops they already produced, together with a SHA-256 of each captured
+PNG byte string. After all three PNGs are atomically saved, the reader hashes the
+final files again. Complete evidence with three matching hashes constructs the
+same `RecognitionResult` and debug images without decoding or recognizing those
+screens a second time. Missing name/CP, move, or IV evidence, a move-page row
+fallback that did not produce final move candidates, an unreliable ordinary CP,
+a missing file, or any hash mismatch declines this path and calls the unchanged
+`read_scan()` implementation. Historical, CLI, guided, manual, replay, and debug
+reading therefore retain their existing path and fail-closed behavior. By default
+the phone is not renamed.
 
 `scan-auto-one --rename-with-iv` is an explicit single-Pokémon extension. After
 all three IVs are recognized, it verifies `detail_summary` and taps the fixed
@@ -129,6 +174,17 @@ dialog controls, so the detector treats `設定暱稱` plus the right-side input
 center near `(1248,1712)` to close only the keyboard; it then requires both the
 real `取消` and `OK` controls and clicks the OCR-derived dialog `OK` center near
 `(719,1665)`.
+
+The first editor pre-state also exposes a conditional CP checkpoint. When both
+the persisted recognition CP and that checkpoint CP exist and agree, the normal
+path taps immediately and performs no CP-only retry. If they disagree, the page
+is left untouched and at most six additional screenshots are read through the
+existing prefixed CP-only reader at 500 ms intervals. A CP must appear completely
+and identically in at least two of those frames before it replaces the baseline
+in the in-memory result and atomically rewritten `recognition.json`. These retry
+frames deliberately do not repeat name/nickname, HP, static-fingerprint, or full
+page detection: the page identity/state was gated once immediately before the
+bounded no-input burst. No repeated CP means failure before the nickname-row tap.
 
 The first pass sends `MOVE_END` plus 32 bounded delete keys and confirms the empty
 nickname, which restores Pokémon GO's default Traditional Chinese species name.
@@ -154,19 +210,81 @@ returns only `哈力栗`. A separate completed `古月鳥15/15/13` screenshot re
 the full same-row IV suffix, confirming the filter does not solve the date badge
 by shrinking the ROI or deleting digits.
 
-The second pass sends `MOVE_END`, then passes the complete ASCII suffix such as
-`15/14/15` to the existing ADB `input text` wrapper. Individual digit and slash
-keyevents are not a half-width guarantee: the Huawei input method can turn those
-events into `１５／１４／１５`. Before dismissing the final keyboard, OCR must
-read one exact input candidate equal to the default name plus the requested
-suffix. This comparison removes whitespace but deliberately does not apply NFKC,
-so a wrong digit or any full-width digit/slash stops before the keyboard
-confirmation and real `OK`. After `OK`, a separate wide name ROI
+The second pass builds one nickname against Pokémon GO's 12-character limit using
+Python's actual Unicode string length. It keeps the readable
+`name + attack/defense/hp` form when that complete string fits. Otherwise it uses
+three fixed-width two-digit ASCII IV fields without slashes, so
+`赫拉克羅斯15/14/13` becomes `赫拉克羅斯151413`; values such as `1/11/1` encode
+as `011101`. If the default name plus all six compact IV digits still exceeds 12,
+the scan fails before reopening the editor or sending IV text. It never truncates
+the name or IVs and does not invent an abbreviation.
+
+The selected complete ASCII suffix is passed to the existing ADB `input text`
+wrapper. Individual digit and slash keyevents are not a half-width guarantee: the
+Huawei input method can turn pretty-format events into `１５／１４／１５`. Before
+dismissing the final keyboard, OCR must read one exact input candidate equal to
+the default name plus the selected suffix. This comparison removes whitespace but
+deliberately does not apply NFKC, so a wrong digit or any full-width digit/slash
+stops before the keyboard confirmation and real `OK`. After `OK`, a separate wide name ROI
 must reproduce the same character skeleton even when the rendered slashes are
 missed. Successful verification atomically stores `renamed_summary.png` and
 `nickname_change.json`. Both passes must return to `detail_summary` within 10
 seconds. Missing IVs, an unrecognized keyboard/dialog, an exact-name mismatch,
 or a failed return leaves the scan incomplete; no ungated input follows.
+
+Scan `20260827_173005_868327_3f08c68fc4aa4f36bb15cc06ed9e6e77`
+exposed the nickname-length boundary that led to the compact fallback. The five-character default name
+`赫拉克羅斯` plus the eight-character suffix `15/14/13` requires 13 characters,
+but the editor evidence contained only the first 12,
+`赫拉克羅斯15/14/1`. Exact verification therefore failed at
+`rename_confirm_iv` before either confirmation tap. The reset-to-default pass had
+already completed, but neither `nickname_change.json` nor `renamed_summary.png`
+was written, and the truncated candidate was not committed. The configured value
+`nickname_maximum_characters: 32` is only the bounded delete-key count; it is not
+a promise about the game's accepted nickname length. The implementation now
+selects the 11-character `赫拉克羅斯151413` before reopening the editor. The
+original exact editor check remains mandatory: a truncated candidate such as
+`赫拉克羅斯15141` is rejected before either confirmation tap.
+
+Physical scan `20260827_183050_601615_f2fd7e7d971f40409053a93b0619bf9c`
+confirmed the compact transaction itself: ADB sent `151413`, editor OCR returned
+the sole complete candidate `赫拉克羅斯151413`, both confirmations completed, and
+the final summary matched `CP1758` plus the same complete nickname. The scan
+manifest and nickname evidence are complete. Its initial summary had already been
+left with nickname `15/14/13` before this run, so `recognition.json.pokemon_name`
+records that pre-run nickname rather than the species name; that separate input
+state does not weaken the compact editor equality evidence.
+
+Scan `20260827_213607_150274_116b76f50f9f40e49bce607ab66a2a3f`
+motivated the conditional CP checkpoint. The visible value is CP997, while its
+saved summary/checkpoint/final frames OCR as CP67, CP97, CP997, and CP99 as bubbles
+cover different digits. The rename itself completed exactly as
+`湧躍鴨12/15/15`, but batch correctly rejected the 67-to-99 transition. That old
+run did not capture the new CP-only burst, so it is diagnostic evidence rather
+than a replay proof of two independent matching frames.
+
+Physical scan `20260827_185253_573760_81b3c80b7b094ff29dd3c90e31790069`
+confirmed a separate final-wide OCR false negative. The editor exactly verified
+`一對鼠14/15/15`, both confirmation taps completed, and the saved final frame
+visibly contains that nickname. Generic summary OCR on the same frame also returns
+the complete value, but the dedicated wide-row OCR reproducibly reads
+`-對鼠14/15/15`, confusing the first `一` with ASCII `-`. The final comparison
+originally failed closed and wrote no nickname evidence or CSV row and sent no
+switch. Final verification now keeps that sharpened 1.5x wide-row pass first and
+returns immediately on an existing skeleton match. Only a mismatch runs one raw
+color 2.0x OCR pass over the same ROI with the same geometry filter and token
+joining. Saved-real replay retains the sharpened `-對鼠14/15/15` result but the
+raw pass returns exact `一對鼠14/15/15`, so the unchanged final comparison succeeds.
+RapidOCR's nearby empty-detection warning was not itself the equality failure.
+
+A later animation frame in scan
+`20260827_211507_528118_e137f8b37b254daf8616110674bccb73`
+showed the limit of the original 1.5x fallback. The editor and final generic summary
+both contain `一對鼠15/14/12`, but sharpened 1.5x and raw color 1.5x each
+reproducibly return `-對鼠15/14/12`; progressive verification therefore still
+failed closed. The final-only raw fallback now uses 2.0x, which returns exact
+`一對鼠15/14/12` on this saved frame. Both saved 一對鼠 frames replay successfully;
+the sharpened first pass and all non-final-wide OCR scales remain unchanged.
 
 The first physical run after switching back to `input text`, scan
 `20260826_102152_537806_e166da7687744511bd0c9ef7d8534f99`, recognized `腕力`,
@@ -184,7 +302,11 @@ batch scan. The program does not change or restore the user's keyboard layout.
 
 `scan-batch --rename-with-iv` reuses this one-scan transaction, then adds its own
 unchanged-CP/HP/static-fingerprint transition check before persisting a CSV row
-or switching. The generic summary-name OCR remains unchanged.
+or switching. Its post-scan evidence check rebuilds the selected pretty or compact
+nickname from the saved default name and recognized IVs and requires the entire
+result to equal the verified nickname. Compact nicknames are therefore not
+required to end in the old slash suffix. The generic summary-name OCR, transition,
+resume, wrap, and switch rules remain unchanged.
 
 The first device run of this option on 2026-08-25 exposed a calibration defect
 before any text input: the configured `(932,1690)` tap landed roughly 230 pixels

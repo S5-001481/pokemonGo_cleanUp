@@ -17,6 +17,7 @@ from pokemon_go_cleanup.automation import (
     AutoScanResult,
     NicknameRenameResult,
     PageDetection,
+    build_iv_nickname,
 )
 from pokemon_go_cleanup.batch import (
     BATCH_CSV_COLUMNS,
@@ -165,11 +166,17 @@ class FakeScanner:
         )
         nickname_change: NicknameRenameResult | None = None
         if rename_with_iv:
-            values = (recognition.attack_iv, recognition.defense_iv, recognition.hp_iv)
-            assert all(value is not None for value in values)
-            suffix = "/".join(str(value) for value in values)
+            attack = recognition.attack_iv
+            defense = recognition.defense_iv
+            hp = recognition.hp_iv
+            assert attack is not None and defense is not None and hp is not None
             default_name = recognition.pokemon_name.value or ""
-            expected = f"{default_name}{suffix}"
+            expected = build_iv_nickname(
+                default_name,
+                attack,
+                defense,
+                hp,
+            ).nickname
             renamed_png = PNG_A if recognition.cp.value == 100 else PNG_B
             renamed_detection = PageDetection(
                 "detail_summary",
@@ -358,16 +365,19 @@ def test_batch_rename_verifies_transition_and_switches_from_post_identity(
 ) -> None:
     scanner = FakeScanner(
         tmp_path / "scans",
-        [_recognition("scan-a", "甲", 100), _recognition("scan-b", "乙", 200)],
+        [
+            _recognition("scan-a", "赫拉克羅斯", 100),
+            _recognition("scan-b", "乙", 200),
+        ],
     )
     adb = FakeBatchAdb([PNG_A, PNG_B])
     detector = QueueDetector(
         [
-            PageDetection("detail_summary", 0.99, ("CP100", "甲")),
-            PageDetection("detail_summary", 0.99, ("CP100", "甲15/14/13")),
+            PageDetection("detail_summary", 0.99, ("CP100", "赫拉克羅斯")),
+            PageDetection("detail_summary", 0.99, ("CP100", "赫拉克羅斯151413")),
             PageDetection("detail_summary", 0.99, ("CP200", "乙")),
             PageDetection("detail_summary", 0.99, ("CP200", "乙")),
-            PageDetection("detail_summary", 0.99, ("CP100", "甲")),
+            PageDetection("detail_summary", 0.99, ("CP100", "赫拉克羅斯")),
         ]
     )
     destination = tmp_path / "renamed.csv"
@@ -387,7 +397,7 @@ def test_batch_rename_verifies_transition_and_switches_from_post_identity(
     with destination.open(encoding="utf-8", newline="") as source:
         rows = list(csv.DictReader(source))
     assert [row["nickname_after"] for row in rows] == [
-        "甲15/14/13",
+        "赫拉克羅斯151413",
         "乙15/14/13",
     ]
     assert [row["rename_status"] for row in rows] == ["verified", "verified"]

@@ -30,7 +30,7 @@ to see that lifecycle end to end; use the
 | Install and use the CLI | [Set up Windows, ADB, and Huawei authorization](../README.md) | Native Windows commands, Platform-Tools setup, USB debugging, and troubleshooting. |
 | Audit a behavior claim | [Inspect the source evidence](references/source-evidence.md) | Evidence passes, confidence labels, source/test links, caveats, and falsifying checks. |
 | See what changed over time | [Review project-guide changes](change-log.md) | Meaningful requests, actions, verification, and sync state. |
-| Review the 2026-08-26 debugging session | [Read the Chinese problem/change summary](2026-08-26-debugging-summary.zh-CN.md) | Rename, OCR/performance, GUI, special layouts, resume, switching, verification, and remaining live checks. |
+| Review every automatic/batch issue through 2026-08-27 | [Read the cumulative Chinese problem/solution summary](2026-08-26-debugging-summary.zh-CN.md) | Twenty-four diagnosed problems, their causes, fixes or current status, safety boundaries, saved evidence, and remaining live checks. |
 
 ## The short model
 
@@ -128,6 +128,11 @@ Exact source and test links live in the
   one swipe. This applies to ordinary and renamed pages, rename transitions, saved
   row restoration, duplicate/resume baselines, switch polling, and retry
   confirmation; a different/new page still has to yield CP.
+  Before the first nickname-editor tap, a conflicting persisted/checkpoint CP now
+  triggers a bounded no-input CP-only burst. One complete prefixed CP must repeat
+  twice before the recognition baseline is atomically replaced; otherwise rename
+  stops before opening the editor. The burst does not repeat name/nickname, HP,
+  fingerprint, or full-page detection for every frame.
 - Final move recognition keeps the normal anchor crop first and adds explicit
   Shadow and Dynamax fallbacks only for an upper move-section anchor accompanied
   by `暗影獎勵` or `極巨招式`. Modifier and Max Move labels remain excluded from

@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Final, Literal, Protocol
 from uuid import uuid4
@@ -20,13 +21,19 @@ from pokemon_go_cleanup.config import AppConfig
 from pokemon_go_cleanup.exceptions import AutomationError, LocalStorageError, PokemonGoCleanupError
 from pokemon_go_cleanup.models import Device, ScanManifest, ScanStep, ScreenResolution
 from pokemon_go_cleanup.recognition import (
+    BAR_TOP,
     CP_RECT,
     HEIGHT,
     NAME_RECT,
     WIDTH,
+    AppraisalRecognitionEvidence,
+    MovesRecognitionEvidence,
     OcrCandidate,
+    RecognitionEvidence,
     RecognitionResult,
     RecognitionService,
+    RecognizedInteger,
+    SummaryRecognitionEvidence,
     normalize_cp_candidate,
     normalize_ocr_text,
     parse_cp_raw,
@@ -38,6 +45,7 @@ logger = logging.getLogger(__name__)
 PageState = Literal[
     "detail_summary",
     "detail_moves",
+    "detail_returned",
     "action_menu",
     "appraisal_dialogue",
     "appraisal_bars",
@@ -46,6 +54,7 @@ PageState = Literal[
     "unknown",
 ]
 ExpectedStates = tuple[PageState, ...]
+IvNicknameFormat = Literal["pretty", "compact_iv"]
 
 MOVE_PAGE_EVIDENCE_RECT: Final = (100, 900, 1360, 1800)
 SUMMARY_HP_RECT: Final = (500, 1520, 940, 1680)
@@ -63,6 +72,13 @@ _MOVE_PAGE_LABELS: Final = (
     "等級",
 )
 _MOVE_EVIDENCE_MIN_CONFIDENCE: Final = 0.80
+_RETURN_CLOSE_BUTTON: Final = (720, 2772, 85)
+_RETURN_MENU_BUTTON_RADIUS: Final = 105
+_RETURN_BUTTON_RING_WIDTH: Final = 35
+_RETURN_BUTTON_MIN_TEAL_RATIO: Final = 0.80
+_RETURN_BUTTON_MIN_RING_CONTRAST: Final = 0.45
+
+
 @dataclass(frozen=True, slots=True)
 class Point:
     """One fixed Huawei screen coordinate."""
@@ -113,6 +129,9 @@ class HuaweiMate30AutomationConfig:
     max_moves_swipe_attempts: int = 2
     rename_poll_interval_seconds: float = 0.5
     rename_wait_timeout_seconds: float = 10.0
+    rename_cp_consensus_interval_seconds: float = 0.5
+    rename_cp_consensus_max_frames: int = 6
+    rename_cp_consensus_required_matches: int = 2
     nickname_maximum_characters: int = 32
     total_timeout_seconds: float = 180.0
 
@@ -132,6 +151,12 @@ class PageDetection:
     rename_confirm_target: Point | None = None
     details: dict[str, object] = field(default_factory=dict)
     nickname_edit_target: Point | None = None
+    recognition_evidence: (
+        SummaryRecognitionEvidence
+        | MovesRecognitionEvidence
+        | AppraisalRecognitionEvidence
+        | None
+    ) = None
 
     def to_json_data(self) -> dict[str, object]:
         return {
@@ -235,6 +260,15 @@ class NicknameRenameResult:
     summary_detection: PageDetection
 
 
+@dataclass(frozen=True, slots=True)
+class IvNickname:
+    """One length-safe nickname and the IV text used to build it."""
+
+    nickname: str
+    format: IvNicknameFormat
+    iv_suffix: str
+
+
 class AutomationAdbGateway(Protocol):
     """ADB behavior used by the one-Pokémon automation state machine."""
 
@@ -266,7 +300,15 @@ class PageDetector(Protocol):
         expected: ExpectedStates,
     ) -> PageDetection: ...
 
+    def detect_returned_from_appraisal(self, png_bytes: bytes) -> PageDetection: ...
+
     def read_summary_nickname(self, png_bytes: bytes) -> str: ...
+
+    def read_summary_nickname_for_expected(
+        self,
+        png_bytes: bytes,
+        expected_nickname: str,
+    ) -> str: ...
 
     def read_summary_cp(self, png_bytes: bytes) -> int | None: ...
 
@@ -277,6 +319,14 @@ class ScanReader(Protocol):
     """Existing screenshot reader surface used after automation succeeds."""
 
     def read_scan(self, directory: Path, *, debug: bool = False) -> RecognitionResult: ...
+
+    def read_evidence(
+        self,
+        directory: Path,
+        evidence: RecognitionEvidence,
+        *,
+        debug: bool = False,
+    ) -> RecognitionResult | None: ...
 
 
 def _point_in_rect(point: Point, rectangle: tuple[int, int, int, int]) -> bool:
@@ -312,6 +362,40 @@ def compact_editor_nickname_text(value: str) -> str:
     """Remove OCR whitespace without folding full-width characters to ASCII."""
 
     return re.sub(r"\s+", "", value)
+
+
+def compact_iv_suffix(attack: int, defense: int, hp: int) -> str:
+    """Encode three IVs as unambiguous two-digit ASCII fields."""
+
+    values = (attack, defense, hp)
+    if any(type(value) is not int or not 0 <= value <= 15 for value in values):
+        raise AutomationError("IV values must be half-width ASCII integers from 0 through 15.")
+    return f"{attack:02d}{defense:02d}{hp:02d}"
+
+
+def build_iv_nickname(
+    name: str,
+    attack: int,
+    defense: int,
+    hp: int,
+    *,
+    max_length: int = 12,
+) -> IvNickname:
+    """Build a readable IV nickname, falling back to fixed-width compact IVs."""
+
+    compact_suffix = compact_iv_suffix(attack, defense, hp)
+    pretty_suffix = f"{attack}/{defense}/{hp}"
+    pretty = f"{name}{pretty_suffix}"
+    if len(pretty) <= max_length:
+        return IvNickname(pretty, "pretty", pretty_suffix)
+
+    compact = f"{name}{compact_suffix}"
+    if len(compact) > max_length:
+        raise AutomationError(
+            f"IV nickname exceeds the {max_length}-character game limit even in compact "
+            "format; no nickname text was sent."
+        )
+    return IvNickname(compact, "compact_iv", compact_suffix)
 
 
 def planned_actions(
@@ -386,15 +470,29 @@ class HuaweiMate30PageDetector:
         expected: ExpectedStates,
     ) -> PageDetection:
         image = self._decode(png_bytes)
+        png_sha256 = sha256(png_bytes).hexdigest()
         expected_set = set(expected)
 
         if "appraisal_bars" in expected_set:
-            bars, _, _ = self._reader._ivs(image)
+            bars, bars_debug, detection_debug = self._reader._ivs(image)
             if bars is not None:
                 return PageDetection(
                     state="appraisal_bars",
                     confidence=1.0,
-                    details={"iv_values": [bar.value for bar in bars]},
+                    details={
+                        "iv_values": [bar.value for bar in bars],
+                        "iv_geometry_path": (
+                            "upward_fallback"
+                            if bars[0].y_start < BAR_TOP
+                            else "standard"
+                        ),
+                    },
+                    recognition_evidence=AppraisalRecognitionEvidence(
+                        png_sha256=png_sha256,
+                        bars=bars,
+                        bars_debug=bars_debug,
+                        detection_debug=detection_debug,
+                    ),
                 )
 
         dialogue_has_priority_over_menu = (
@@ -416,12 +514,19 @@ class HuaweiMate30PageDetector:
 
         if "detail_moves" in expected_set:
             warnings: list[str] = []
-            moves, _, _ = self._reader._moves(image, warnings)
+            moves, move_debug, move_fallback = self._reader._moves(image, warnings)
             if len(moves) >= 2:
                 return PageDetection(
                     state="detail_moves",
                     confidence=min(move.confidence for move in moves[:2]),
                     matched_texts=tuple(move.raw for move in moves),
+                    recognition_evidence=MovesRecognitionEvidence(
+                        png_sha256=png_sha256,
+                        candidates=moves,
+                        warnings=tuple(warnings),
+                        debug=move_debug,
+                        fallback_debug=move_fallback,
+                    ),
                 )
             candidates = self._ocr_rectangle(image, MOVE_PAGE_EVIDENCE_RECT)
             move_rows = match_move_name_power_rows(candidates)
@@ -452,15 +557,25 @@ class HuaweiMate30PageDetector:
                 return rename_detection
 
         if "detail_summary" in expected_set:
-            cp_candidates, _ = self._reader._ocr_variants(image, CP_RECT)
+            cp_candidates, cp_debug = self._reader._ocr_variants(image, CP_RECT)
             cp = self._reader._best_cp(cp_candidates)
-            name_candidates, _ = self._reader._ocr_variants(image, NAME_RECT)
+            name_candidates, name_debug = self._reader._ocr_variants(image, NAME_RECT)
             name = self._reader._best_text(name_candidates)
             if name is not None and cp is not None:
+                evidence = None
+                if self._reader._ordinary_cp_candidate_is_reliable(cp):
+                    evidence = SummaryRecognitionEvidence(
+                        png_sha256=png_sha256,
+                        name_candidates=name_candidates,
+                        cp_candidates=cp_candidates,
+                        name_debug=name_debug,
+                        cp_debug=cp_debug,
+                    )
                 return self._summary_name_cp_detection(
                     name,
                     cp,
                     ocr_path="fast_name_cp",
+                    recognition_evidence=evidence,
                 )
 
             if name is not None and cp is None:
@@ -471,6 +586,13 @@ class HuaweiMate30PageDetector:
                         name,
                         cp,
                         ocr_path="hsv_cp_fallback",
+                        recognition_evidence=SummaryRecognitionEvidence(
+                            png_sha256=png_sha256,
+                            name_candidates=name_candidates,
+                            cp_candidates=(*cp_candidates, *hsv_candidates),
+                            name_debug=name_debug,
+                            cp_debug=cp_debug,
+                        ),
                     )
 
                 fallback_candidates = self._reader._ocr_cp_fallback_variants(image)
@@ -480,6 +602,17 @@ class HuaweiMate30PageDetector:
                         name,
                         cp,
                         ocr_path="enhanced_cp_fallback",
+                        recognition_evidence=SummaryRecognitionEvidence(
+                            png_sha256=png_sha256,
+                            name_candidates=name_candidates,
+                            cp_candidates=(
+                                *cp_candidates,
+                                *hsv_candidates,
+                                *fallback_candidates,
+                            ),
+                            name_debug=name_debug,
+                            cp_debug=cp_debug,
+                        ),
                     )
 
                 hp_candidates = self._ocr_rectangle(image, SUMMARY_HP_RECT)
@@ -577,12 +710,114 @@ class HuaweiMate30PageDetector:
             details={"expected": list(expected)},
         )
 
+    def detect_returned_from_appraisal(self, png_bytes: bytes) -> PageDetection:
+        """Confirm appraisal is gone and both fixed detail-page buttons are visible."""
+
+        image = self._decode(png_bytes)
+        bars, _, _ = self._reader._ivs(image)
+        if bars is not None:
+            return PageDetection(
+                state="unknown",
+                confidence=0.0,
+                details={
+                    "returned_from_appraisal": False,
+                    "appraisal_overlay_absent": False,
+                    "iv_appraisal_geometry_absent": False,
+                    "reason": "iv_bars_present",
+                },
+            )
+
+        close_x, close_y, close_radius = _RETURN_CLOSE_BUTTON
+        close = self._detail_button_metrics(
+            image,
+            Point(close_x, close_y),
+            close_radius,
+        )
+        menu = self._detail_button_metrics(
+            image,
+            self._config.menu_button,
+            _RETURN_MENU_BUTTON_RADIUS,
+        )
+        buttons_present = all(
+            metrics["disk_teal_ratio"] >= _RETURN_BUTTON_MIN_TEAL_RATIO
+            and metrics["ring_contrast"] >= _RETURN_BUTTON_MIN_RING_CONTRAST
+            for metrics in (close, menu)
+        )
+        details: dict[str, object] = {
+            "returned_from_appraisal": buttons_present,
+            "appraisal_overlay_absent": buttons_present,
+            "iv_appraisal_geometry_absent": True,
+            "detail_button_geometry": {
+                "close": close,
+                "menu": menu,
+            },
+        }
+        if not buttons_present:
+            details["reason"] = "detail_buttons_not_confirmed"
+            return PageDetection(
+                state="unknown",
+                confidence=0.0,
+                details=details,
+            )
+        return PageDetection(
+            state="detail_returned",
+            confidence=min(
+                close["disk_teal_ratio"],
+                menu["disk_teal_ratio"],
+            ),
+            details=details,
+        )
+
+    def _detail_button_metrics(
+        self,
+        image: object,
+        center: Point,
+        radius: int,
+    ) -> dict[str, float]:
+        extent = radius + _RETURN_BUTTON_RING_WIDTH
+        rectangle = (
+            center.x - extent,
+            center.y - extent,
+            center.x + extent + 1,
+            center.y + extent + 1,
+        )
+        crop = self._reader._crop(image, rectangle)
+        hsv = self._reader._cv2.cvtColor(crop, self._reader._cv2.COLOR_BGR2HSV)
+        teal = self._reader._cv2.inRange(
+            hsv,
+            self._reader._np.array((70, 70, 60), dtype=self._reader._np.uint8),
+            self._reader._np.array((105, 255, 255), dtype=self._reader._np.uint8),
+        )
+        y_coordinates, x_coordinates = self._reader._np.ogrid[
+            : teal.shape[0],
+            : teal.shape[1],
+        ]
+        local_center = extent
+        squared_distance = (
+            (x_coordinates - local_center) ** 2
+            + (y_coordinates - local_center) ** 2
+        )
+        disk = squared_distance <= radius**2
+        ring = (squared_distance <= extent**2) & ~disk
+        disk_ratio = float(self._reader._np.count_nonzero(teal[disk])) / float(
+            self._reader._np.count_nonzero(disk)
+        )
+        ring_ratio = float(self._reader._np.count_nonzero(teal[ring])) / float(
+            self._reader._np.count_nonzero(ring)
+        )
+        return {
+            "disk_teal_ratio": disk_ratio,
+            "ring_teal_ratio": ring_ratio,
+            "ring_contrast": disk_ratio - ring_ratio,
+        }
+
     @staticmethod
     def _summary_name_cp_detection(
         name: OcrCandidate,
         cp: OcrCandidate,
         *,
         ocr_path: str,
+        recognition_evidence: SummaryRecognitionEvidence | None = None,
     ) -> PageDetection:
         normalized_cp = normalize_cp_candidate(cp.raw)
         if normalized_cp is None:
@@ -596,6 +831,7 @@ class HuaweiMate30PageDetector:
                 "summary_evidence": "name_cp",
                 "summary_ocr_path": ocr_path,
             },
+            recognition_evidence=recognition_evidence,
         )
 
     def _decode(self, png_bytes: bytes) -> object:
@@ -636,12 +872,58 @@ class HuaweiMate30PageDetector:
         """Read a wide name row without changing generic page-identity OCR."""
 
         image = self._decode(png_bytes)
-        normalized = tuple(
-            (candidate, normalize_ocr_text(candidate.raw).replace(" ", ""))
-            for candidate in self._ocr_rectangle(
+        return self._join_summary_nickname_row(
+            self._ocr_rectangle(
                 image,
                 self._config.nickname_summary_rect,
             )
+        )
+
+    def read_summary_nickname_for_expected(
+        self,
+        png_bytes: bytes,
+        expected_nickname: str,
+    ) -> str:
+        """Retry the same wide row with raw color only after a strict mismatch."""
+
+        image = self._decode(png_bytes)
+        observed = self._join_summary_nickname_row(
+            self._ocr_rectangle(
+                image,
+                self._config.nickname_summary_rect,
+            )
+        )
+        if nickname_text_skeleton(observed) == nickname_text_skeleton(
+            expected_nickname
+        ):
+            return observed
+        return self._join_summary_nickname_row(
+            self._ocr_wide_nickname_raw_color(image)
+        )
+
+    def _ocr_wide_nickname_raw_color(
+        self,
+        image: object,
+    ) -> tuple[OcrCandidate, ...]:
+        rectangle = self._config.nickname_summary_rect
+        crop = self._reader._crop(image, rectangle)
+        scale = 2.0
+        prepared = self._reader._cv2.resize(
+            crop,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=self._reader._cv2.INTER_CUBIC,
+        )
+        return self._reader._run_ocr(prepared, rectangle, scale)
+
+    def _join_summary_nickname_row(
+        self,
+        candidates: Sequence[OcrCandidate],
+    ) -> str:
+        normalized = tuple(
+            (candidate, normalize_ocr_text(candidate.raw).replace(" ", ""))
+            for candidate in candidates
         )
         normalized = tuple((candidate, text) for candidate, text in normalized if text)
         if not normalized:
@@ -990,6 +1272,27 @@ class _DebugRecorder:
                 },
             )
 
+    def rename_cp_consensus(
+        self,
+        *,
+        baseline_cp: int,
+        checkpoint_cp: int,
+        samples: Sequence[int | None],
+        required_matches: int,
+        trusted_cp: int | None,
+    ) -> None:
+        if self._enabled:
+            self._write_json(
+                "rename_cp_consensus.json",
+                {
+                    "baseline_cp": baseline_cp,
+                    "checkpoint_cp": checkpoint_cp,
+                    "samples": list(samples),
+                    "required_matches": required_matches,
+                    "trusted_cp": trusted_cp,
+                },
+            )
+
     def _write_json(self, name: str, data: object) -> None:
         atomic_write_text(
             self._directory / name,
@@ -1250,7 +1553,7 @@ class AutoScanService:
         self._check_deadline(deadline)
         session.current_step = "scroll_to_moves"
         with session.profiler.step("scroll_to_moves"):
-            moves, _ = self._scroll_to_moves(
+            moves, moves_detection = self._scroll_to_moves(
                 session,
                 serial,
                 initial,
@@ -1380,12 +1683,27 @@ class AutoScanService:
         self._check_deadline(deadline)
         session.current_step = "recognize_scan"
         with session.profiler.step("recognize_scan"):
-            recognition = self._reader.read_scan(session.scan_directory, debug=debug)
+            evidence = self._complete_recognition_evidence(
+                summary_detection,
+                moves_detection,
+                appraisal_detection,
+            )
+            recognition = (
+                self._reader.read_evidence(
+                    session.scan_directory,
+                    evidence,
+                    debug=debug,
+                )
+                if evidence is not None
+                else None
+            )
+            if recognition is None:
+                recognition = self._reader.read_scan(session.scan_directory, debug=debug)
         nickname_change: NicknameRenameResult | None = None
         if rename_with_iv:
             self._check_deadline(deadline)
             session.current_step = "rename_with_iv"
-            nickname_change = self._rename_with_iv(
+            nickname_change, recognition = self._rename_with_iv(
                 session,
                 serial,
                 recognition,
@@ -1418,16 +1736,18 @@ class AutoScanService:
         serial: str,
         recognition: RecognitionResult,
         deadline: float,
-    ) -> NicknameRenameResult:
+    ) -> tuple[NicknameRenameResult, RecognitionResult]:
         """Restore the game-provided Chinese name, then append recognized IVs."""
 
         with session.profiler.step("rename_validate_iv_suffix"):
-            values = (recognition.attack_iv, recognition.defense_iv, recognition.hp_iv)
-            if any(value is None for value in values):
+            attack = recognition.attack_iv
+            defense = recognition.defense_iv
+            hp = recognition.hp_iv
+            if attack is None or defense is None or hp is None:
                 raise AutomationError(
                     "Cannot rename with IV because attack, defense, or HP IV was not recognized."
                 )
-            iv_suffix = "/".join(str(value) for value in values)
+            iv_suffix = f"{attack}/{defense}/{hp}"
             if (
                 re.fullmatch(
                     r"(?:[0-9]|1[0-5])/(?:[0-9]|1[0-5])/(?:[0-9]|1[0-5])",
@@ -1437,8 +1757,11 @@ class AutoScanService:
             ):
                 raise AutomationError("IV suffix was not a valid half-width ASCII value.")
         with session.profiler.step("rename_open_editor_reset"):
-            editor = self._open_nickname_editor(
-                session, serial, deadline, "open_nickname_editor_reset"
+            editor, recognition = self._open_nickname_editor_reset(
+                session,
+                serial,
+                deadline,
+                recognition,
             )
         with session.profiler.step("rename_clear_to_default"):
             self._clear_nickname(
@@ -1472,7 +1795,14 @@ class AutoScanService:
                     },
                 ),
             )
-            expected_nickname = f"{default_nickname}{iv_suffix}"
+            built_nickname = build_iv_nickname(
+                default_nickname,
+                attack,
+                defense,
+                hp,
+            )
+            expected_nickname = built_nickname.nickname
+            iv_suffix = built_nickname.iv_suffix
         with session.profiler.step("rename_open_editor_append_iv"):
             editor = self._open_nickname_editor(
                 session, serial, deadline, "open_nickname_editor_append_iv"
@@ -1494,16 +1824,10 @@ class AutoScanService:
                 session.scan_directory / "renamed_summary.png",
                 renamed_summary.png_bytes,
             )
-            summary_observed = self._detector.read_summary_nickname(
-                renamed_summary.png_bytes
+            summary_observed = self._verify_final_summary_nickname(
+                renamed_summary.png_bytes,
+                expected_nickname,
             )
-            if nickname_text_skeleton(summary_observed) != nickname_text_skeleton(
-                expected_nickname
-            ):
-                raise AutomationError(
-                    "The renamed summary did not show the expected nickname characters. "
-                    "No further input was sent."
-                )
             editor_candidates = renamed_summary.detection.details.get(
                 "verified_editor_nickname_candidates"
             )
@@ -1549,7 +1873,25 @@ class AutoScanService:
                 )
                 + "\n",
             )
-        return evidence
+        return evidence, recognition
+
+    def _verify_final_summary_nickname(
+        self,
+        png_bytes: bytes,
+        expected_nickname: str,
+    ) -> str:
+        summary_observed = self._detector.read_summary_nickname_for_expected(
+            png_bytes,
+            expected_nickname,
+        )
+        if nickname_text_skeleton(summary_observed) != nickname_text_skeleton(
+            expected_nickname
+        ):
+            raise AutomationError(
+                "The renamed summary did not show the expected nickname characters. "
+                "No further input was sent."
+            )
+        return summary_observed
 
     def _open_nickname_editor(
         self,
@@ -1558,10 +1900,74 @@ class AutoScanService:
         deadline: float,
         label: str,
     ) -> PageDetection:
+        screen, detection = self._capture_nickname_editor_prestate(
+            session,
+            serial,
+            deadline,
+            label,
+        )
+        return self._tap_nickname_editor(
+            session,
+            serial,
+            deadline,
+            label,
+            screen,
+            detection,
+        )
+
+    def _open_nickname_editor_reset(
+        self,
+        session: _Session,
+        serial: str,
+        deadline: float,
+        recognition: RecognitionResult,
+    ) -> tuple[PageDetection, RecognitionResult]:
+        label = "open_nickname_editor_reset"
+        screen, detection = self._capture_nickname_editor_prestate(
+            session,
+            serial,
+            deadline,
+            label,
+        )
+        recognition = self._resolve_rename_cp_disagreement(
+            session,
+            serial,
+            deadline,
+            recognition,
+            detection,
+        )
+        editor = self._tap_nickname_editor(
+            session,
+            serial,
+            deadline,
+            label,
+            screen,
+            detection,
+        )
+        return editor, recognition
+
+    def _capture_nickname_editor_prestate(
+        self,
+        session: _Session,
+        serial: str,
+        deadline: float,
+        label: str,
+    ) -> tuple[bytes, PageDetection]:
         self._check_deadline(deadline)
         screen = self._adb.capture_screen(serial)
         detection = self._detect(session, f"{label}_before", screen, ("detail_summary",))
         self._require_state(detection, ("detail_summary",))
+        return screen, detection
+
+    def _tap_nickname_editor(
+        self,
+        session: _Session,
+        serial: str,
+        deadline: float,
+        label: str,
+        screen: bytes,
+        detection: PageDetection,
+    ) -> PageDetection:
         target = self._automation.nickname_edit
         detection = replace(detection, nickname_edit_target=target)
         session.recorder.detection(f"{label}_target", detection)
@@ -1585,6 +1991,94 @@ class AutoScanService:
                 "No text input was sent."
             )
         return result.detection
+
+    def _resolve_rename_cp_disagreement(
+        self,
+        session: _Session,
+        serial: str,
+        deadline: float,
+        recognition: RecognitionResult,
+        checkpoint: PageDetection,
+    ) -> RecognitionResult:
+        baseline_cp = recognition.cp.value
+        checkpoint_cp = self._cp_from_summary_detection(checkpoint)
+        if (
+            baseline_cp is None
+            or checkpoint_cp is None
+            or baseline_cp == checkpoint_cp
+        ):
+            return recognition
+
+        maximum_frames = self._automation.rename_cp_consensus_max_frames
+        required_matches = self._automation.rename_cp_consensus_required_matches
+        if maximum_frames < 1 or required_matches < 2:
+            raise AutomationError(
+                "Rename CP consensus configuration is unsafe. No nickname editor tap "
+                "was sent."
+            )
+
+        samples: list[int | None] = []
+        counts: dict[int, int] = {}
+        trusted_cp: int | None = None
+        for sample_index in range(1, maximum_frames + 1):
+            self._check_deadline(deadline)
+            if sample_index > 1:
+                self._sleeper(self._automation.rename_cp_consensus_interval_seconds)
+                self._check_deadline(deadline)
+            screenshot = self._adb.capture_screen(serial)
+            session.recorder.screen(
+                f"rename_cp_consensus_{sample_index:02d}",
+                screenshot,
+            )
+            cp = self._detector.read_summary_cp(screenshot)
+            samples.append(cp)
+            if cp is None or cp < 10:
+                continue
+            counts[cp] = counts.get(cp, 0) + 1
+            if counts[cp] >= required_matches:
+                trusted_cp = cp
+                break
+
+        session.recorder.rename_cp_consensus(
+            baseline_cp=baseline_cp,
+            checkpoint_cp=checkpoint_cp,
+            samples=samples,
+            required_matches=required_matches,
+            trusted_cp=trusted_cp,
+        )
+        if trusted_cp is None:
+            raise AutomationError(
+                "Conflicting CP checkpoints did not produce a repeated complete CP "
+                "within the bounded CP-only retry. The nickname editor was not tapped."
+            )
+
+        warning = (
+            f"cp changed from {baseline_cp} to {trusted_cp} after bounded pre-rename "
+            f"CP-only consensus ({required_matches} matching frames)."
+        )
+        updated = recognition.model_copy(
+            update={
+                "cp": RecognizedInteger(
+                    value=trusted_cp,
+                    raw=None,
+                    confidence=None,
+                ),
+                "warnings": (*recognition.warnings, warning),
+            }
+        )
+        atomic_write_text(
+            session.scan_directory / "recognition.json",
+            updated.model_dump_json(indent=2) + "\n",
+        )
+        return updated
+
+    @staticmethod
+    def _cp_from_summary_detection(detection: PageDetection) -> int | None:
+        raw = detection.details.get("cp")
+        if not isinstance(raw, str):
+            return None
+        normalized = normalize_cp_candidate(raw)
+        return int(normalized[2:]) if normalized is not None else None
 
     def _clear_nickname(
         self,
@@ -2415,22 +2909,12 @@ class AutoScanService:
             label = f"exit_appraisal_wait_{sample_index:02d}"
 
             session.recorder.screen(label, screen)
-            detection = self._detect(
-                session,
-                label,
-                screen,
-                ("detail_summary", "detail_moves"),
-            )
+            detection = self._detector.detect_returned_from_appraisal(screen)
+            session.recorder.detection(label, detection)
 
-            if detection.state in ("detail_summary", "detail_moves"):
+            if detection.state == "detail_returned":
                 session.recorder.screen("after_exit_appraisal", screen)
                 return
-
-            if detection.state != "unknown":
-                raise AutomationError(
-                    "Unexpected page state while exiting appraisal: "
-                    f"{detection.state}. No additional input was sent."
-                )
 
         if last_screen is None:
             last_screen = self._adb.capture_screen(serial)
@@ -2440,10 +2924,23 @@ class AutoScanService:
             last_screen,
         )
         session.recorder.screen("exit_appraisal_timeout", last_screen)
+        diagnostic = self._detect(
+            session,
+            "exit_appraisal_timeout_diagnostic",
+            last_screen,
+            (
+                "appraisal_bars",
+                "appraisal_dialogue",
+                "action_menu",
+                "detail_moves",
+                "detail_summary",
+            ),
+        )
 
         raise AutomationError(
-            "detail_summary or detail_moves was not detected within "
-            "15 seconds after exiting appraisal. No additional input was sent."
+            "The lightweight detector did not confirm return to a detail page within "
+            "15 seconds after exiting appraisal. The final full diagnostic state was "
+            f"{diagnostic.state}. No additional input was sent."
         )
 
     def _detect(
@@ -2460,6 +2957,27 @@ class AutoScanService:
     def _ocr_seconds_total(self) -> float:
         value = getattr(self._reader, "ocr_seconds_total", 0.0)
         return float(value) if isinstance(value, int | float) else 0.0
+
+    @staticmethod
+    def _complete_recognition_evidence(
+        summary: PageDetection,
+        moves: PageDetection,
+        appraisal: PageDetection,
+    ) -> RecognitionEvidence | None:
+        summary_evidence = summary.recognition_evidence
+        moves_evidence = moves.recognition_evidence
+        appraisal_evidence = appraisal.recognition_evidence
+        if not isinstance(summary_evidence, SummaryRecognitionEvidence):
+            return None
+        if not isinstance(moves_evidence, MovesRecognitionEvidence):
+            return None
+        if not isinstance(appraisal_evidence, AppraisalRecognitionEvidence):
+            return None
+        return RecognitionEvidence(
+            summary=summary_evidence,
+            moves=moves_evidence,
+            appraisal=appraisal_evidence,
+        )
 
     @staticmethod
     def _require_state(

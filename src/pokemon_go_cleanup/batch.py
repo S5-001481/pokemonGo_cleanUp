@@ -23,10 +23,11 @@ from pokemon_go_cleanup.automation import (
     PageDetection,
     Point,
     Swipe,
+    build_iv_nickname,
     compact_editor_nickname_text,
     nickname_text_skeleton,
 )
-from pokemon_go_cleanup.exceptions import BatchAutomationError, LocalStorageError
+from pokemon_go_cleanup.exceptions import AutomationError, BatchAutomationError, LocalStorageError
 from pokemon_go_cleanup.models import Device, ScanManifest
 from pokemon_go_cleanup.recognition import (
     RecognitionResult,
@@ -1075,13 +1076,26 @@ class BatchScanService:
             raise BatchAutomationError(
                 "Verified nickname artifacts do not match the in-memory result."
             )
-        values = (recognition.attack_iv, recognition.defense_iv, recognition.hp_iv)
-        if any(value is None for value in values):
+        attack = recognition.attack_iv
+        defense = recognition.defense_iv
+        hp = recognition.hp_iv
+        if attack is None or defense is None or hp is None:
             raise BatchAutomationError("Verified nickname evidence is missing an IV value.")
-        suffix = "/".join(str(value) for value in values)
-        if not change.expected_nickname.endswith(suffix):
+        try:
+            expected_nickname = build_iv_nickname(
+                change.default_nickname,
+                attack,
+                defense,
+                hp,
+            ).nickname
+        except AutomationError as error:
             raise BatchAutomationError(
-                "Verified nickname evidence does not contain the recognized half-width IV suffix."
+                f"Verified nickname evidence cannot produce a valid nickname: {error}"
+            ) from error
+        if change.expected_nickname != expected_nickname:
+            raise BatchAutomationError(
+                "Verified nickname evidence does not match the nickname generated from the "
+                "default name and recognized IVs."
             )
         recorder = _BatchDebugRecorder(scan.scan_directory, debug)
         cp_source = "summary_ocr"

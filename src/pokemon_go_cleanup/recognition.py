@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import importlib
 import io
 import logging
@@ -31,6 +32,7 @@ SPECIAL_MOVE_ANCHOR_RECT: Final = (100, 800, 1340, 1800)
 BAR_START_X: Final = 171
 BAR_END_X: Final = 665
 BAR_TOP: Final = 2150
+BAR_UPWARD_FALLBACK_TOP: Final = 2100
 BAR_BOTTOM: Final = 2700
 IV_ENDPOINTS: Final = (
     202,
@@ -136,6 +138,47 @@ class BarDetection:
     y_end: int
     endpoint: int | None
     value: int
+
+
+@dataclass(frozen=True, slots=True)
+class SummaryRecognitionEvidence:
+    """Summary OCR outputs bound to one captured PNG."""
+
+    png_sha256: str
+    name_candidates: tuple[OcrCandidate, ...]
+    cp_candidates: tuple[OcrCandidate, ...]
+    name_debug: Any
+    cp_debug: Any
+
+
+@dataclass(frozen=True, slots=True)
+class MovesRecognitionEvidence:
+    """Move OCR outputs and remarks bound to one captured PNG."""
+
+    png_sha256: str
+    candidates: tuple[OcrCandidate, ...]
+    warnings: tuple[str, ...]
+    debug: tuple[Any, ...]
+    fallback_debug: Any
+
+
+@dataclass(frozen=True, slots=True)
+class AppraisalRecognitionEvidence:
+    """Detected IV bars bound to one captured PNG."""
+
+    png_sha256: str
+    bars: tuple[BarDetection, BarDetection, BarDetection]
+    bars_debug: Any
+    detection_debug: Any
+
+
+@dataclass(frozen=True, slots=True)
+class RecognitionEvidence:
+    """Complete automatic-live evidence for the three persisted frames."""
+
+    summary: SummaryRecognitionEvidence
+    moves: MovesRecognitionEvidence
+    appraisal: AppraisalRecognitionEvidence
 
 
 def normalize_ocr_text(value: str) -> str:
@@ -307,6 +350,91 @@ class RecognitionService:
             )
         return result
 
+    def read_evidence(
+        self,
+        directory: Path,
+        evidence: RecognitionEvidence,
+        *,
+        debug: bool = False,
+    ) -> RecognitionResult | None:
+        """Persist complete live evidence, or decline when a saved frame differs."""
+
+        directory = directory.expanduser().resolve()
+        expected_hashes = (
+            (directory / "summary.png", evidence.summary.png_sha256),
+            (directory / "moves.png", evidence.moves.png_sha256),
+            (directory / "appraisal.png", evidence.appraisal.png_sha256),
+        )
+        if not all(self._file_matches_hash(path, expected) for path, expected in expected_hashes):
+            return None
+
+        name_candidate = self._best_text(evidence.summary.name_candidates)
+        cp_candidate = self._best_cp(evidence.summary.cp_candidates)
+        if name_candidate is None or cp_candidate is None or len(evidence.moves.candidates) < 2:
+            return None
+
+        manifest = self._manifest(directory / "manifest.json")
+        warnings: list[str] = []
+        name = self._text("pokemon_name", name_candidate, warnings)
+        cp = self._cp(cp_candidate, warnings)
+        warnings.extend(evidence.moves.warnings)
+        move_candidates = evidence.moves.candidates
+        fast_move = self._text("fast_move", move_candidates[0], warnings)
+        charged_move_1 = self._text("charged_move_1", move_candidates[1], warnings)
+        charged_move_2 = self._text(
+            "charged_move_2",
+            move_candidates[2] if len(move_candidates) > 2 else None,
+            warnings,
+            nullable=True,
+        )
+        bars = evidence.appraisal.bars
+        result = RecognitionResult(
+            scan_id=manifest.scan_id,
+            pokemon_name=name,
+            cp=cp,
+            fast_move=fast_move,
+            charged_move_1=charged_move_1,
+            charged_move_2=charged_move_2,
+            attack_iv=bars[0].value,
+            defense_iv=bars[1].value,
+            hp_iv=bars[2].value,
+            warnings=tuple(warnings),
+        )
+        atomic_write_text(
+            directory / "recognition.json",
+            result.model_dump_json(indent=2) + "\n",
+        )
+        if debug:
+            debug_directory = directory / "debug"
+            debug_directory.mkdir(parents=True, exist_ok=True)
+            self._write(debug_directory / "summary_name.png", evidence.summary.name_debug)
+            self._write(debug_directory / "summary_cp.png", evidence.summary.cp_debug)
+            debug_names = (
+                "moves_fast.png",
+                "moves_charged_1.png",
+                "moves_charged_2.png",
+            )
+            for index, name_path in enumerate(debug_names):
+                image = (
+                    evidence.moves.debug[index]
+                    if index < len(evidence.moves.debug)
+                    else evidence.moves.fallback_debug
+                )
+                self._write(debug_directory / name_path, image)
+            self._write(debug_directory / "appraisal_bars.png", evidence.appraisal.bars_debug)
+            self._write(
+                debug_directory / "appraisal_detection.png",
+                evidence.appraisal.detection_debug,
+            )
+        return result
+
+    @staticmethod
+    def _file_matches_hash(path: Path, expected: str) -> bool:
+        try:
+            return hashlib.sha256(path.read_bytes()).hexdigest() == expected
+        except OSError:
+            return False
+
     def _manifest(self, path: Path) -> ScanManifest:
         try:
             return ScanManifest.model_validate_json(path.read_text(encoding="utf-8"))
@@ -340,26 +468,88 @@ class RecognitionService:
             (self._sharpen(crop), 3.0),
             (self._cv2.cvtColor(contrast, self._cv2.COLOR_GRAY2BGR), 4.0),
         )
-        candidates: list[OcrCandidate] = []
-        debug_image: Any = crop
-        for source, scale in variants:
-            prepared = self._cv2.resize(
-                source,
-                None,
-                fx=scale,
-                fy=scale,
-                interpolation=self._cv2.INTER_CUBIC,
+        prepared_variants = tuple(
+            (
+                self._cv2.resize(
+                    source,
+                    None,
+                    fx=scale,
+                    fy=scale,
+                    interpolation=self._cv2.INTER_CUBIC,
+                ),
+                scale,
             )
-            candidates.extend(self._run_ocr(prepared, rectangle, scale))
-            if scale == 3.0:
-                debug_image = prepared
+            for source, scale in variants
+        )
+        candidates: list[OcrCandidate] = []
+        debug_image = prepared_variants[1][0]
+        for prepared, scale in prepared_variants:
+            current = self._run_ocr(prepared, rectangle, scale)
+            candidates.extend(current)
+            if self._ordinary_variants_can_stop(rectangle, candidates, current):
+                break
         return tuple(candidates), debug_image
+
+    @classmethod
+    def _ordinary_variants_can_stop(
+        cls,
+        rectangle: tuple[int, int, int, int],
+        candidates: Sequence[OcrCandidate],
+        current: Sequence[OcrCandidate],
+    ) -> bool:
+        """Stop only on evidence that is already safe without another variant."""
+
+        if rectangle == CP_RECT:
+            return cls._ordinary_cp_candidate_is_reliable(cls._best_cp(candidates))
+        if rectangle != NAME_RECT:
+            return False
+
+        best = cls._best_text(candidates)
+        if best is None or best not in current or best.confidence < LOW_CONFIDENCE:
+            return False
+        chinese_candidates = tuple(
+            candidate
+            for candidate in current
+            if any(
+                "\u4e00" <= character <= "\u9fff"
+                for character in normalize_ocr_text(candidate.raw)
+            )
+        )
+        if len(chinese_candidates) != 1 or chinese_candidates[0] != best:
+            return False
+        chinese_count = sum(
+            "\u4e00" <= character <= "\u9fff"
+            for character in normalize_ocr_text(best.raw)
+        )
+        return chinese_count >= 2
+
+    @staticmethod
+    def _ordinary_cp_candidate_is_reliable(
+        candidate: OcrCandidate | None,
+    ) -> bool:
+        """Apply the existing prefix, confidence, value, and CP-band requirements."""
+
+        if candidate is None or candidate.confidence < LOW_CONFIDENCE:
+            return False
+        normalized = normalize_cp_candidate(candidate.raw)
+        if normalized is None or int(normalized[2:]) <= 0:
+            return False
+        left, top, right, bottom = candidate.box
+        if left >= right or top >= bottom:
+            return False
+        band_left, band_top, band_right, band_bottom = CP_TEXT_BAND
+        center_x = (left + right) // 2
+        center_y = (top + bottom) // 2
+        return (
+            band_left <= center_x <= band_right
+            and band_top <= center_y <= band_bottom
+        )
 
     def _ocr_cp_variants(self, image: Any) -> tuple[tuple[OcrCandidate, ...], Any]:
         """Run ordinary, color-preserving, then expensive threshold CP OCR."""
 
         existing, debug_image = self._ocr_variants(image, CP_RECT)
-        if self._best_cp(existing) is not None:
+        if self._ordinary_cp_candidate_is_reliable(self._best_cp(existing)):
             return existing, debug_image
         hsv_candidates = self._ocr_cp_hsv_variants(image)
         if self._best_cp(hsv_candidates) is not None:
@@ -610,12 +800,13 @@ class RecognitionService:
         Any,
         Any,
     ]:
-        roi = image[BAR_TOP:BAR_BOTTOM, BAR_START_X : BAR_END_X + 1]
-        counts = self._np.any(roi < 245, axis=2).sum(axis=1)
-        intervals = self._intervals(counts > 350)
-        rows = self._bar_sequence(intervals)
+        rows = self._bar_rows(image, top=BAR_TOP, require_unique=False)
+        debug_top = BAR_TOP
         if rows is None:
-            fallback = image[BAR_TOP:BAR_BOTTOM, 120:710].copy()
+            debug_top = BAR_UPWARD_FALLBACK_TOP
+            rows = self._bar_rows(image, top=debug_top, require_unique=True)
+        if rows is None:
+            fallback = image[debug_top:BAR_BOTTOM, 120:710].copy()
             return None, fallback, fallback.copy()
 
         hsv = self._cv2.cvtColor(image, self._cv2.COLOR_BGR2HSV)
@@ -682,8 +873,27 @@ class RecognitionService:
         )
         return typed, raw_debug, detected_debug
 
+    def _bar_rows(
+        self,
+        image: Any,
+        *,
+        top: int,
+        require_unique: bool,
+    ) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]] | None:
+        roi = image[top:BAR_BOTTOM, BAR_START_X : BAR_END_X + 1]
+        counts = self._np.any(roi < 245, axis=2).sum(axis=1)
+        intervals = self._intervals(counts > 350, top=top)
+        sequences = self._bar_sequences(intervals)
+        if not sequences or (require_unique and len(sequences) != 1):
+            return None
+        return sequences[0]
+
     @staticmethod
-    def _intervals(active_rows: Any) -> tuple[tuple[int, int], ...]:
+    def _intervals(
+        active_rows: Any,
+        *,
+        top: int = BAR_TOP,
+    ) -> tuple[tuple[int, int], ...]:
         output: list[tuple[int, int]] = []
         start: int | None = None
         for offset, active in enumerate(active_rows):
@@ -691,20 +901,32 @@ class RecognitionService:
                 start = offset
             elif not bool(active) and start is not None:
                 if 20 <= offset - start <= 40:
-                    output.append((BAR_TOP + start, BAR_TOP + offset - 1))
+                    output.append((top + start, top + offset - 1))
                 start = None
         return tuple(output)
 
-    @staticmethod
+    @classmethod
     def _bar_sequence(
+        cls,
         intervals: Sequence[tuple[int, int]],
     ) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]] | None:
+        sequences = cls._bar_sequences(intervals)
+        return sequences[0] if sequences else None
+
+    @staticmethod
+    def _bar_sequences(
+        intervals: Sequence[tuple[int, int]],
+    ) -> tuple[
+        tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
+        ...,
+    ]:
+        output: list[tuple[tuple[int, int], tuple[int, int], tuple[int, int]]] = []
         for index in range(len(intervals) - 2):
             rows = intervals[index : index + 3]
             gaps = (rows[1][0] - rows[0][0], rows[2][0] - rows[1][0])
             if all(125 <= gap <= 150 for gap in gaps):
-                return rows[0], rows[1], rows[2]
-        return None
+                output.append((rows[0], rows[1], rows[2]))
+        return tuple(output)
 
     @staticmethod
     def _best_text(candidates: Sequence[OcrCandidate]) -> OcrCandidate | None:
