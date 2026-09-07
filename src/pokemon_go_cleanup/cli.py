@@ -270,6 +270,34 @@ def scan_one(
     typer.echo(result.model_dump_json(indent=2))
 
 
+@app.command("rename-iv-one")
+def rename_iv_one(
+    context: typer.Context,
+    serial_number: Annotated[
+        str | None,
+        typer.Option("--serial", "-s", help="ADB serial number to select."),
+    ] = None,
+) -> None:
+    """Read IVs and rename the current Pokemon; no moves, CSV, or saved scans."""
+
+    typer.echo("扫描当前一只的 IV 并命名。不扫描技能，不保存 CSV 或截图。")
+    try:
+        client = _build_client(context)
+        reader = RecognitionService()
+        result = AutoScanService(
+            _get_context(context).config,
+            client,
+            HuaweiMate30PageDetector(reader),
+            reader,
+        ).rename_iv_one(serial_number=serial_number)
+    except KeyboardInterrupt:
+        typer.echo("已停止 IV 命名。未保存文件。", err=True)
+        raise typer.Exit(code=130) from None
+    except PokemonGoCleanupError as error:
+        _abort(error)
+    typer.echo(f"命名完成：{result.expected_nickname}")
+
+
 @app.command("scan-auto-one")
 def scan_auto_one(
     context: typer.Context,

@@ -210,27 +210,65 @@ returns only `哈力栗`. A separate completed `古月鳥15/15/13` screenshot re
 the full same-row IV suffix, confirming the filter does not solve the date badge
 by shrinking the ROI or deleting digits.
 
-The second pass builds one nickname against Pokémon GO's 12-character limit using
-Python's actual Unicode string length. It keeps the readable
-`name + attack/defense/hp` form when that complete string fits. Otherwise it uses
-three fixed-width two-digit ASCII IV fields without slashes, so
-`赫拉克羅斯15/14/13` becomes `赫拉克羅斯151413`; values such as `1/11/1` encode
-as `011101`. If the default name plus all six compact IV digits still exceeds 12,
-the scan fails before reopening the editor or sending IV text. It never truncates
-the name or IVs and does not invent an abbreviation.
+The second pass appends three circled IV values in attack/defense/HP order,
+for example `超梦⑭⑭⑮` and `赫拉克羅斯⑮⑭⑬`. Zero is `⓪`. Each IV
+occupies one Unicode character, and the complete name must fit the game's
+12-character limit. Overlong results fail before reopening the editor without
+truncating the name or falling back to slash/compact ASCII.
 
-The selected complete ASCII suffix is passed to the existing ADB `input text`
-wrapper. Individual digit and slash keyevents are not a half-width guarantee: the
-Huawei input method can turn pretty-format events into `１５／１４／１５`. Before
-dismissing the final keyboard, OCR must read one exact input candidate equal to
-the default name plus the selected suffix. This comparison removes whitespace but
-deliberately does not apply NFKC, so a wrong digit or any full-width digit/slash
-stops before the keyboard confirmation and real `OK`. After `OK`, a separate wide name ROI
-must reproduce the same character skeleton even when the rendered slashes are
-missed. Successful verification atomically stores `renamed_summary.png` and
-`nickname_change.json`. Both passes must return to `detail_summary` within 10
-seconds. Missing IVs, an unrecognized keyboard/dialog, an exact-name mismatch,
-or a failed return leaves the scan incomplete; no ungated input follows.
+The new Unicode input route requires an installed, enabled
+[ADB Keyboard](https://github.com/senzhk/ADBKeyBoard). Before any rename-enabled
+live scan captures or changes the phone, the ADB client checks this prerequisite.
+It never installs or enables an input method itself. When the suffix is ready,
+it records the current IME, temporarily selects ADB Keyboard, confirms that
+selection, waits for matching `mCurId`, `mBoundToMethod=true` and
+`mInputShown=true` (at most ten state polls), and sends one package-targeted
+`ADB_INPUT_B64` broadcast carrying UTF-8/Base64. A `finally` block restores and
+checks the original IME even if broadcasting fails or is interrupted. The restored
+IME must also be bound and shown before control returns to confirmation OCR. The original
+keyboard is therefore active for the existing confirmation OCR; no manual English
+layout switch is needed for the suffix.
+
+Broadcast completion only proves delivery, so editor OCR must still read the
+exact expected nickname before either confirmation. The final wide-name reader,
+generic name recognition and batch name comparisons preserve circles instead of
+NFKC-folding them to ASCII. An OCR reading such as `超梦141415` cannot prove
+`超梦⑭⑭⑮`. Successful full scans persist their usual rename evidence;
+IV-only naming retains the no-file contract. New format and input recovery are
+covered by synthetic tests. A complete live run on 2026-09-07 verified
+`向日種子⑮⑭⑩` (CP164), restored Gboard, created zero scan files and left
+CSV files unchanged; arbitrary other names/devices are not implied by this sample.
+
+### Reading circled IVs from the screen
+
+A physical `向日種子⑮⑭⑩` page exposed a separate OCR problem: whole-row
+recognition produced `向日種子151410` or `向日種子⑤14⑩`, and the editor
+produced `向日種子1⑤14⑩`. The circles were already correctly rendered on the
+phone. UI Automator exposed only the Unity surface, without a native editable
+text node, so no system-text shortcut was available on this device.
+
+The dedicated nickname reader now first finds exactly three adjacent closed
+circular outlines inside the calibrated nickname rectangle. It checks circularity,
+inner-hole area, ring size, alignment and spacing. Each interior is read at 4x
+scale with two different insets; both readings must agree on one integer from
+0 through 15 with at least 0.90 confidence. The name to their left is read
+separately. Only that measured ring-and-number evidence constructs the three
+Unicode circle characters. No expected nickname is used to infer missing digits.
+Missing rings, inconsistent crops, low confidence, or out-of-range values decline
+this branch. Existing exact editor/final-name comparisons remain mandatory.
+
+Both editor and wide-summary readers use this path, including batch's wide-name
+checks. Debug editor state identifies `nickname_evidence: circled_geometry_ocr`.
+Synthetic tests cover every IV value, ordinary digits without rings, missing or
+extra rings, misalignment, conflicting interior readings and low confidence.
+Replaying the physical editor and summary recovered exact `向日種子⑮⑭⑩`.
+The first subsequent live run passed the circle text check but exposed a Gboard
+restore/confirmation race. Waiting for the selected IME to bind and show resolved
+it; the next complete live run passed editor and final-summary verification.
+
+The following incidents describe the historical slash/compact formats and explain
+the retained length, editor and summary guards; they are not the current suffix
+selection rule.
 
 Scan `20260827_173005_868327_3f08c68fc4aa4f36bb15cc06ed9e6e77`
 exposed the nickname-length boundary that led to the compact fallback. The five-character default name
@@ -296,17 +334,16 @@ implementation for `cmd clipboard` or `cmd input`, so neither ordinary keyevents
 nor the existing text wrapper bypass that layout's slash conversion. The
 width-sensitive gate correctly sent neither the keyboard confirmation nor the
 game `OK`; a verified English-layout transition and restoration path is still
-needed for automatic layout handling. The chosen operating procedure is instead
-to switch Gboard to English manually before starting any rename-enabled single or
-batch scan. The program does not change or restore the user's keyboard layout.
+needed for automatic layout handling. The historical operating procedure was to switch Gboard to English manually.
+The current circled-number route above replaces that workaround with temporary
+Unicode IME selection and restoration.
 
 `scan-batch --rename-with-iv` reuses this one-scan transaction, then adds its own
 unchanged-CP/HP/static-fingerprint transition check before persisting a CSV row
-or switching. Its post-scan evidence check rebuilds the selected pretty or compact
-nickname from the saved default name and recognized IVs and requires the entire
-result to equal the verified nickname. Compact nicknames are therefore not
-required to end in the old slash suffix. The generic summary-name OCR, transition,
-resume, wrap, and switch rules remain unchanged.
+or switching. Its post-scan evidence check rebuilds the circled nickname from the
+saved default name and recognized IVs and requires exact equality. Existing CSV
+rows retain their recorded nickname and are not rewritten into the new format.
+Name normalization now preserves circles; the CP/HP/fingerprint gates remain.
 
 The first device run of this option on 2026-08-25 exposed a calibration defect
 before any text input: the configured `(932,1690)` tap landed roughly 230 pixels
@@ -452,3 +489,34 @@ Continue to the [claim ledger and falsifying checks](../references/source-eviden
 for exact source, test, and runtime evidence.
 
 Evidence status: The one-Pokémon path is source-, test-, and device-confirmed; the no-anchor detail-moves fallback is real-image-confirmed.
+
+
+## IV naming without a saved scan
+
+The GUI's **扫描 IV 并命名** button launches `rename-iv-one` for the currently
+open detail-summary page. It uses the same device/resolution checks, OCR-targeted
+appraisal menu, appraisal dialogue/exit gates, default-name restoration, CP
+consensus, and exact editor/final nickname checks as the full scan. Enabled
+ADB Keyboard is now a prerequisite for circled IV input. No next-Pokemon swipe runs.
+
+The dedicated [service entry](../../src/pokemon_go_cleanup/automation.py) skips
+move scrolling, move capture, and the three-view recognition reader. It builds an
+in-memory result from summary OCR and appraisal bar evidence whose hashes must
+match the captured frames; missing or mismatched evidence stops before the first
+nickname-editor tap. The default name plus three circled IVs must fit 12 characters.
+
+This session disables persistence from initialization through success, failure,
+and interruption. It creates no scan directory or manifest and saves no PNG,
+recognition JSON, nickname evidence, debug profile, or CSV. Screenshots and rename
+evidence are held in memory. Therefore it cannot be resumed from a CSV or used as
+a complete three-view dataset scan. The CLI prints the verified final nickname;
+failures use exit 15 and Ctrl+C uses 130 without claiming files were saved.
+
+The GUI ignores all batch/CSV/debug settings for this button. A run resets the
+counter and timer, successful exit 0 counts one, and failure/Stop freezes the
+elapsed duration without counting success. The button is disabled while any task
+runs. [Automation tests](../../tests/test_automation.py) forbid all file writes
+and full-reader calls, check no swipe occurs, reject missing/mismatched IV evidence
+and incorrect/full-width editor text, and cover interruption. CLI and GUI tests
+verify routing, exit handling, counting, and timer completion. Physical execution
+passed on 2026-09-07 for `向日種子⑮⑭⑩`, including the no-file contract.

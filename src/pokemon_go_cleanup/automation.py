@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from hashlib import sha256
+from itertools import pairwise
 from pathlib import Path
 from typing import Final, Literal, Protocol
 from uuid import uuid4
@@ -22,6 +23,7 @@ from pokemon_go_cleanup.exceptions import AutomationError, LocalStorageError, Po
 from pokemon_go_cleanup.models import Device, ScanManifest, ScanStep, ScreenResolution
 from pokemon_go_cleanup.recognition import (
     BAR_TOP,
+    CIRCLED_IV_DIGITS,
     CP_RECT,
     HEIGHT,
     NAME_RECT,
@@ -33,8 +35,10 @@ from pokemon_go_cleanup.recognition import (
     RecognitionResult,
     RecognitionService,
     RecognizedInteger,
+    RecognizedText,
     SummaryRecognitionEvidence,
     normalize_cp_candidate,
+    normalize_nickname_text,
     normalize_ocr_text,
     parse_cp_raw,
 )
@@ -54,7 +58,7 @@ PageState = Literal[
     "unknown",
 ]
 ExpectedStates = tuple[PageState, ...]
-IvNicknameFormat = Literal["pretty", "compact_iv"]
+IvNicknameFormat = Literal["circled_iv"]
 
 MOVE_PAGE_EVIDENCE_RECT: Final = (100, 900, 1360, 1800)
 SUMMARY_HP_RECT: Final = (500, 1520, 940, 1680)
@@ -288,6 +292,7 @@ class AutomationAdbGateway(Protocol):
     def press_back(self, serial_number: str) -> None: ...
     def press_key(self, serial_number: str, keycode: int) -> None: ...
     def input_text(self, serial_number: str, value: str) -> None: ...
+    def ensure_unicode_input_available(self, serial_number: str) -> None: ...
 
 
 class PageDetector(Protocol):
@@ -355,7 +360,7 @@ def appraisal_target_is_safe(
 def nickname_text_skeleton(value: str) -> str:
     """Return OCR-comparable nickname text while ignoring rendered slash loss."""
 
-    return normalize_ocr_text(value).replace(" ", "").replace("/", "")
+    return normalize_nickname_text(value).replace(" ", "").replace("/", "")
 
 
 def compact_editor_nickname_text(value: str) -> str:
@@ -364,13 +369,13 @@ def compact_editor_nickname_text(value: str) -> str:
     return re.sub(r"\s+", "", value)
 
 
-def compact_iv_suffix(attack: int, defense: int, hp: int) -> str:
-    """Encode three IVs as unambiguous two-digit ASCII fields."""
+def circled_iv_suffix(attack: int, defense: int, hp: int) -> str:
+    """Encode attack, defense and HP as three circled numbers, including zero."""
 
     values = (attack, defense, hp)
     if any(type(value) is not int or not 0 <= value <= 15 for value in values):
-        raise AutomationError("IV values must be half-width ASCII integers from 0 through 15.")
-    return f"{attack:02d}{defense:02d}{hp:02d}"
+        raise AutomationError("IV values must be integers from 0 through 15.")
+    return "".join(CIRCLED_IV_DIGITS[value] for value in values)
 
 
 def build_iv_nickname(
@@ -381,21 +386,16 @@ def build_iv_nickname(
     *,
     max_length: int = 12,
 ) -> IvNickname:
-    """Build a readable IV nickname, falling back to fixed-width compact IVs."""
+    """Append exactly three circled IVs without truncating the default name."""
 
-    compact_suffix = compact_iv_suffix(attack, defense, hp)
-    pretty_suffix = f"{attack}/{defense}/{hp}"
-    pretty = f"{name}{pretty_suffix}"
-    if len(pretty) <= max_length:
-        return IvNickname(pretty, "pretty", pretty_suffix)
-
-    compact = f"{name}{compact_suffix}"
-    if len(compact) > max_length:
+    suffix = circled_iv_suffix(attack, defense, hp)
+    nickname = f"{name}{suffix}"
+    if len(nickname) > max_length:
         raise AutomationError(
-            f"IV nickname exceeds the {max_length}-character game limit even in compact "
-            "format; no nickname text was sent."
+            f"IV nickname exceeds the {max_length}-character game limit; "
+            "no nickname text was sent."
         )
-    return IvNickname(compact, "compact_iv", compact_suffix)
+    return IvNickname(nickname, "circled_iv", suffix)
 
 
 def planned_actions(
@@ -444,7 +444,7 @@ def planned_actions(
         "kind": "tap/keyevent/text/OCR-confirmed-tap",
         "coordinates": {
             "edit": asdict(config.nickname_edit),
-            "text": "attack_iv/defense_iv/hp_iv",
+            "text": "circled attack, defense, HP (e.g. ⑭⑭⑮)",
             "confirm": "OCR center of 確定, 完成, or OK; no fixed fallback",
         },
     })
@@ -868,10 +868,103 @@ class HuaweiMate30PageDetector:
             },
         )
 
+    def _circled_iv_regions(
+        self, image: object, rectangle: tuple[int, int, int, int],
+    ) -> tuple[tuple[int, int, int, int], ...]:
+        """Find exactly three adjacent closed rings in the fixed nickname row."""
+
+        cv2 = self._reader._cv2
+        crop = self._reader._crop(image, rectangle)
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+        contours, hierarchy = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        if hierarchy is None:
+            return ()
+        rings: list[tuple[int, int, int, int]] = []
+        left, top, _, _ = rectangle
+        for index, contour in enumerate(contours):
+            x, y, width, height = cv2.boundingRect(contour)
+            area = cv2.contourArea(contour)
+            perimeter = cv2.arcLength(contour, True)
+            child = int(hierarchy[0][index][2])
+            if (
+                not 35 <= height <= 130
+                or not 0.88 <= width / height <= 1.12
+                or perimeter <= 0
+                or 4 * math.pi * area / perimeter**2 < 0.82
+                or child < 0
+            ):
+                continue
+            hole = contours[child]
+            if not 0.65 <= cv2.contourArea(hole) / area <= 0.96:
+                continue
+            rings.append((left + x, top + y, left + x + width, top + y + height))
+        if len(rings) != 3:
+            return ()
+        rings.sort()
+        heights = [bottom - top for _, top, _, bottom in rings]
+        typical = sum(heights) / 3
+        if max(heights) - min(heights) > typical * 0.15:
+            return ()
+        for first, second in pairwise(rings):
+            if (
+                abs((first[1] + first[3]) - (second[1] + second[3])) > typical * 0.25
+                or not typical * 0.9 <= second[0] - first[0] <= typical * 1.4
+            ):
+                return ()
+        return tuple(rings)
+
+    def _read_circled_nickname(
+        self, image: object, rectangle: tuple[int, int, int, int],
+    ) -> str | None:
+        """Recognize ring interiors independently; never infer values from the expected name."""
+
+        rings = self._circled_iv_regions(image, rectangle)
+        if not rings:
+            return None
+        values: list[int] = []
+        for left, top, right, bottom in rings:
+            readings: list[int] = []
+            for fraction in (0.18, 0.23):
+                inset = round((right - left) * fraction)
+                inner = (left + inset, top + inset, right - inset, bottom - inset)
+                crop = self._reader._crop(image, inner)
+                prepared = self._reader._cv2.resize(
+                    crop, None, fx=4, fy=4, interpolation=self._reader._cv2.INTER_CUBIC,
+                )
+                candidates = self._reader._run_ocr(prepared, inner, 4)
+                if len(candidates) != 1 or candidates[0].confidence < 0.90:
+                    return None
+                digits = normalize_ocr_text(candidates[0].raw)
+                if re.fullmatch(r"(?:[0-9]|1[0-5])", digits) is None:
+                    return None
+                readings.append(int(digits))
+            if readings[0] != readings[1]:
+                return None
+            values.append(readings[0])
+        first = rings[0]
+        height = first[3] - first[1]
+        name_rect = (
+            rectangle[0], max(rectangle[1], first[1] - height // 3),
+            first[0] - 3, min(rectangle[3], first[3] + height // 3),
+        )
+        if name_rect[2] <= name_rect[0]:
+            return None
+        candidates = self._ocr_rectangle(image, name_rect)
+        if not candidates or any(candidate.confidence < 0.90 for candidate in candidates):
+            return None
+        name = self._join_summary_nickname_row(candidates)
+        if not name:
+            return None
+        return name + circled_iv_suffix(*values)
+
     def read_summary_nickname(self, png_bytes: bytes) -> str:
         """Read a wide name row without changing generic page-identity OCR."""
 
         image = self._decode(png_bytes)
+        circled = self._read_circled_nickname(image, self._config.nickname_summary_rect)
+        if circled is not None:
+            return circled
         return self._join_summary_nickname_row(
             self._ocr_rectangle(
                 image,
@@ -887,6 +980,9 @@ class HuaweiMate30PageDetector:
         """Retry the same wide row with raw color only after a strict mismatch."""
 
         image = self._decode(png_bytes)
+        circled = self._read_circled_nickname(image, self._config.nickname_summary_rect)
+        if circled is not None:
+            return circled
         observed = self._join_summary_nickname_row(
             self._ocr_rectangle(
                 image,
@@ -922,7 +1018,7 @@ class HuaweiMate30PageDetector:
         candidates: Sequence[OcrCandidate],
     ) -> str:
         normalized = tuple(
-            (candidate, normalize_ocr_text(candidate.raw).replace(" ", ""))
+            (candidate, normalize_nickname_text(candidate.raw).replace(" ", ""))
             for candidate in candidates
         )
         normalized = tuple((candidate, text) for candidate, text in normalized if text)
@@ -1069,8 +1165,12 @@ class HuaweiMate30PageDetector:
             if input_left <= (candidate.box[0] + candidate.box[2]) // 2 <= input_right
             and input_top <= (candidate.box[1] + candidate.box[3]) // 2 <= input_bottom
         )
+        circled = self._read_circled_nickname(image, self._config.nickname_input_rect)
+        if circled is not None:
+            nickname_candidates = (circled,)
         nickname_details: dict[str, object] = {
-            "nickname_text_candidates": list(nickname_candidates)
+            "nickname_text_candidates": list(nickname_candidates),
+            "nickname_evidence": "circled_geometry_ocr" if circled is not None else "row_ocr",
         }
         normalized = tuple(
             (candidate, normalize_ocr_text(candidate.raw).replace(" ", "").upper())
@@ -1396,6 +1496,15 @@ class _Session:
     recorder: _DebugRecorder
     profiler: _StepProfiler
     current_step: str = "initialize"
+    persist: bool = True
+
+    def write_bytes(self, path: Path, data: bytes) -> None:
+        if self.persist:
+            atomic_write_bytes(path, data)
+
+    def write_text(self, path: Path, data: str) -> None:
+        if self.persist:
+            atomic_write_text(path, data)
 
 
 class AutoScanService:
@@ -1437,6 +1546,36 @@ class AutoScanService:
     ) -> AutoScanResult:
         """Capture, navigate, recognize, and safely return from one detail page."""
 
+        return self._scan_one(
+            debug=debug,
+            dry_run=dry_run,
+            rename_with_iv=rename_with_iv,
+            serial_number=serial_number,
+            notes=notes,
+        )
+
+    def rename_iv_one(self, *, serial_number: str | None = None) -> NicknameRenameResult:
+        """Read appraisal IVs and rename the current Pokemon without saving files."""
+
+        result = self._scan_one(
+            rename_with_iv=True,
+            serial_number=serial_number,
+            iv_only=True,
+        )
+        if result.nickname_change is None:
+            raise AutomationError("IV naming completed without a verified nickname.")
+        return result.nickname_change
+
+    def _scan_one(
+        self,
+        *,
+        debug: bool = False,
+        dry_run: bool = False,
+        rename_with_iv: bool = False,
+        serial_number: str | None = None,
+        notes: str | None = None,
+        iv_only: bool = False,
+    ) -> AutoScanResult:
         scan_started_monotonic = self._monotonic()
         device = self._adb.resolve_device(serial_number)
         resolution = self._adb.get_resolution(device.serial_number)
@@ -1448,13 +1587,16 @@ class AutoScanService:
                 f"scan-auto-one requires {self._automation.width}x{self._automation.height}; "
                 f"device reported {resolution}."
             )
+        if rename_with_iv and not dry_run:
+            self._adb.ensure_unicode_input_available(device.serial_number)
         started_at = self._clock()
         if started_at.tzinfo is None:
             started_at = started_at.astimezone()
         scan_id = f"{started_at.strftime('%Y%m%d_%H%M%S_%f')}_{self._token_factory()}"
         scan_directory = self._config.scan_root / started_at.strftime("%Y-%m-%d") / scan_id
         try:
-            scan_directory.mkdir(parents=True, exist_ok=False)
+            if not iv_only:
+                scan_directory.mkdir(parents=True, exist_ok=False)
         except OSError as error:
             raise LocalStorageError(
                 f"Could not create automatic scan directory '{scan_directory}': {error}"
@@ -1471,8 +1613,9 @@ class AutoScanService:
             scan_status="in_progress",
             notes=notes,
         )
-        self._write_manifest(manifest_path, manifest)
-        recorder = _DebugRecorder(scan_directory, debug)
+        if not iv_only:
+            self._write_manifest(manifest_path, manifest)
+        recorder = _DebugRecorder(scan_directory, debug and not iv_only)
         profiler = _StepProfiler(
             recorder,
             self._monotonic,
@@ -1485,6 +1628,7 @@ class AutoScanService:
             manifest=manifest,
             recorder=recorder,
             profiler=profiler,
+            persist=not iv_only,
         )
         actions = planned_actions(self._automation, rename_with_iv=rename_with_iv)
         session.recorder.write_plan(actions)
@@ -1503,6 +1647,7 @@ class AutoScanService:
                 debug=debug,
                 dry_run=dry_run,
                 rename_with_iv=rename_with_iv,
+                iv_only=iv_only,
             )
         except KeyboardInterrupt:
             session.profiler.finish("interrupted")
@@ -1528,6 +1673,7 @@ class AutoScanService:
         debug: bool,
         dry_run: bool,
         rename_with_iv: bool,
+        iv_only: bool = False,
     ) -> AutoScanResult:
         session.current_step = "verify_detail_summary"
         with session.profiler.step("verify_detail_summary"):
@@ -1546,23 +1692,25 @@ class AutoScanService:
                 session.manifest = session.manifest.model_copy(
                     update={"scan_status": "incomplete", "failed_step": "dry_run"}
                 )
-                self._write_manifest(session.manifest_path, session.manifest)
+                self._persist_manifest(session)
                 result = self._result(session, None, True, actions)
             return result
 
-        self._check_deadline(deadline)
-        session.current_step = "scroll_to_moves"
-        with session.profiler.step("scroll_to_moves"):
-            moves, moves_detection = self._scroll_to_moves(
-                session,
-                serial,
-                initial,
-                summary_detection,
-                deadline,
-            )
-        session.current_step = "capture_moves"
-        with session.profiler.step("capture_moves"):
-            self._save_capture(session, "moves", moves)
+        moves_detection = PageDetection("unknown", 0.0)
+        if not iv_only:
+            self._check_deadline(deadline)
+            session.current_step = "scroll_to_moves"
+            with session.profiler.step("scroll_to_moves"):
+                moves, moves_detection = self._scroll_to_moves(
+                    session,
+                    serial,
+                    initial,
+                    summary_detection,
+                    deadline,
+                )
+            session.current_step = "capture_moves"
+            with session.profiler.step("capture_moves"):
+                self._save_capture(session, "moves", moves)
 
         self._check_deadline(deadline)
         session.current_step = "open_action_menu"
@@ -1603,7 +1751,7 @@ class AutoScanService:
         appraisal_detection = entry_result.detection
 
         if entry_result.outcome != "reached":
-            atomic_write_bytes(
+            session.write_bytes(
                 session.scan_directory / "appraisal_entry_timeout.png",
                 appraisal_screen,
             )
@@ -1649,7 +1797,7 @@ class AutoScanService:
                     f"{appraisal_detection.state}. No additional tap was sent."
                 )
             if wait_result.outcome != "reached":
-                atomic_write_bytes(
+                session.write_bytes(
                     session.scan_directory / "appraisal_wait_timeout.png",
                     appraisal_screen,
                 )
@@ -1682,23 +1830,33 @@ class AutoScanService:
 
         self._check_deadline(deadline)
         session.current_step = "recognize_scan"
+        recognition: RecognitionResult | None
         with session.profiler.step("recognize_scan"):
-            evidence = self._complete_recognition_evidence(
-                summary_detection,
-                moves_detection,
-                appraisal_detection,
-            )
-            recognition = (
-                self._reader.read_evidence(
-                    session.scan_directory,
-                    evidence,
-                    debug=debug,
+            if iv_only:
+                recognition = self._iv_only_recognition(
+                    session.manifest.scan_id,
+                    initial,
+                    summary_detection,
+                    appraisal,
+                    appraisal_detection,
                 )
-                if evidence is not None
-                else None
-            )
-            if recognition is None:
-                recognition = self._reader.read_scan(session.scan_directory, debug=debug)
+            else:
+                evidence = self._complete_recognition_evidence(
+                    summary_detection,
+                    moves_detection,
+                    appraisal_detection,
+                )
+                recognition = (
+                    self._reader.read_evidence(
+                        session.scan_directory,
+                        evidence,
+                        debug=debug,
+                    )
+                    if evidence is not None
+                    else None
+                )
+                if recognition is None:
+                    recognition = self._reader.read_scan(session.scan_directory, debug=debug)
         nickname_change: NicknameRenameResult | None = None
         if rename_with_iv:
             self._check_deadline(deadline)
@@ -1709,11 +1867,15 @@ class AutoScanService:
                 recognition,
                 deadline,
             )
+        if iv_only:
+            return self._result(
+                session, recognition, False, actions, nickname_change=nickname_change
+            )
         with session.profiler.step("finalize_scan"):
             session.manifest = session.manifest.model_copy(
                 update={"scan_status": "complete", "failed_step": None}
             )
-            self._write_manifest(session.manifest_path, session.manifest)
+            self._persist_manifest(session)
             logger.info(
                 "automatic_scan_completed",
                 extra={
@@ -1747,15 +1909,7 @@ class AutoScanService:
                 raise AutomationError(
                     "Cannot rename with IV because attack, defense, or HP IV was not recognized."
                 )
-            iv_suffix = f"{attack}/{defense}/{hp}"
-            if (
-                re.fullmatch(
-                    r"(?:[0-9]|1[0-5])/(?:[0-9]|1[0-5])/(?:[0-9]|1[0-5])",
-                    iv_suffix,
-                )
-                is None
-            ):
-                raise AutomationError("IV suffix was not a valid half-width ASCII value.")
+            circled_iv_suffix(attack, defense, hp)
         with session.profiler.step("rename_open_editor_reset"):
             editor, recognition = self._open_nickname_editor_reset(
                 session,
@@ -1820,7 +1974,7 @@ class AutoScanService:
                 expected_nickname=expected_nickname,
             )
         with session.profiler.step("rename_verify_final_summary"):
-            atomic_write_bytes(
+            session.write_bytes(
                 session.scan_directory / "renamed_summary.png",
                 renamed_summary.png_bytes,
             )
@@ -1856,7 +2010,7 @@ class AutoScanService:
                 summary_png=renamed_summary.png_bytes,
                 summary_detection=renamed_summary.detection,
             )
-            atomic_write_text(
+            session.write_text(
                 session.scan_directory / "nickname_change.json",
                 json.dumps(
                     {
@@ -2066,7 +2220,7 @@ class AutoScanService:
                 "warnings": (*recognition.warnings, warning),
             }
         )
-        atomic_write_text(
+        session.write_text(
             session.scan_directory / "recognition.json",
             updated.model_dump_json(indent=2) + "\n",
         )
@@ -2113,7 +2267,7 @@ class AutoScanService:
         session.recorder.action(
             name=label,
             kind="text",
-            coordinates={"end": 123, "ascii_text": value},
+            coordinates={"end": 123, "unicode_text": value},
             executed=True,
             before_state=before_state,
         )
@@ -2919,7 +3073,7 @@ class AutoScanService:
         if last_screen is None:
             last_screen = self._adb.capture_screen(serial)
 
-        atomic_write_bytes(
+        session.write_bytes(
             session.scan_directory / "exit_appraisal_timeout.png",
             last_screen,
         )
@@ -2959,6 +3113,45 @@ class AutoScanService:
         return float(value) if isinstance(value, int | float) else 0.0
 
     @staticmethod
+    def _iv_only_recognition(
+        scan_id: str,
+        summary_png: bytes,
+        summary: PageDetection,
+        appraisal_png: bytes,
+        appraisal: PageDetection,
+    ) -> RecognitionResult:
+        """Use the exact detected frames; never invoke the three-view reader."""
+
+        summary_evidence = summary.recognition_evidence
+        appraisal_evidence = appraisal.recognition_evidence
+        if (
+            not isinstance(summary_evidence, SummaryRecognitionEvidence)
+            or not isinstance(appraisal_evidence, AppraisalRecognitionEvidence)
+            or summary_evidence.png_sha256 != sha256(summary_png).hexdigest()
+            or appraisal_evidence.png_sha256 != sha256(appraisal_png).hexdigest()
+        ):
+            raise AutomationError("Verified summary and IV evidence is required before naming.")
+        name = RecognitionService._best_text(summary_evidence.name_candidates)
+        cp = RecognitionService._best_cp(summary_evidence.cp_candidates)
+        if name is None or cp is None:
+            raise AutomationError("The current name and CP must be recognized before naming.")
+        bars = appraisal_evidence.bars
+        empty_move = RecognizedText(value=None, raw=None)
+        return RecognitionResult(
+            scan_id=scan_id,
+            pokemon_name=RecognizedText(
+                value=normalize_nickname_text(name.raw), raw=name.raw, confidence=name.confidence
+            ),
+            cp=RecognizedInteger(value=parse_cp_raw(cp.raw), raw=cp.raw, confidence=cp.confidence),
+            fast_move=empty_move,
+            charged_move_1=empty_move,
+            charged_move_2=empty_move,
+            attack_iv=bars[0].value,
+            defense_iv=bars[1].value,
+            hp_iv=bars[2].value,
+        )
+
+    @staticmethod
     def _complete_recognition_evidence(
         summary: PageDetection,
         moves: PageDetection,
@@ -2996,8 +3189,10 @@ class AutoScanService:
         step: ScanStep,
         png_bytes: bytes,
     ) -> None:
+        if not session.persist:
+            return
         destination = session.scan_directory / f"{step}.png"
-        atomic_write_bytes(destination, png_bytes)
+        session.write_bytes(destination, png_bytes)
         captured_at = self._clock()
         if captured_at.tzinfo is None:
             captured_at = captured_at.astimezone()
@@ -3011,7 +3206,11 @@ class AutoScanService:
                 "screenshot_filenames": filenames,
             }
         )
-        self._write_manifest(session.manifest_path, session.manifest)
+        self._persist_manifest(session)
+
+    def _persist_manifest(self, session: _Session) -> None:
+        if session.persist:
+            self._write_manifest(session.manifest_path, session.manifest)
 
     @staticmethod
     def _write_manifest(path: Path, manifest: ScanManifest) -> None:
@@ -3031,7 +3230,7 @@ class AutoScanService:
                     "failed_step": session.current_step,
                 }
             )
-            self._write_manifest(session.manifest_path, session.manifest)
+            self._persist_manifest(session)
         except PokemonGoCleanupError as error:
             logger.error(
                 "automatic_scan_interrupt_manifest_failed",
@@ -3043,6 +3242,10 @@ class AutoScanService:
         session: _Session,
         cause: PokemonGoCleanupError,
     ) -> AutomationError:
+        if not session.persist:
+            return AutomationError(
+                f"IV naming failed at '{session.current_step}': {cause} No files were saved."
+            )
         manifest_error: PokemonGoCleanupError | None = None
         try:
             session.manifest = session.manifest.model_copy(
@@ -3051,7 +3254,7 @@ class AutoScanService:
                     "failed_step": session.current_step,
                 }
             )
-            self._write_manifest(session.manifest_path, session.manifest)
+            self._persist_manifest(session)
         except PokemonGoCleanupError as error:
             manifest_error = error
         detail = (

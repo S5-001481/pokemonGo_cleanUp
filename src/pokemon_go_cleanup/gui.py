@@ -65,8 +65,8 @@ class PokemonGoCleanupGui(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Pokémon GO Cleanup")
-        self.geometry("860x690")
-        self.minsize(720, 560)
+        self.geometry("860x760")
+        self.minsize(720, 690)
 
         self._process: subprocess.Popen[str] | None = None
         self._worker: threading.Thread | None = None
@@ -208,22 +208,24 @@ class PokemonGoCleanupGui(tk.Tk):
         ).grid(row=0, column=1, padx=(8, 0))
 
         options = ttk.Frame(settings)
-        options.grid(row=3, column=1, sticky=tk.W, pady=(6, 2))
+        options.grid(row=3, column=0, columnspan=3, sticky=tk.W, pady=(6, 2))
+        scan_options = ttk.Frame(options)
+        scan_options.pack(anchor=tk.W)
         ttk.Checkbutton(
-            options,
+            scan_options,
             text="保存调试截图和状态记录",
             variable=self._debug_var,
         ).pack(side=tk.LEFT)
         ttk.Checkbutton(
-            options,
+            scan_options,
             text="续接已有 CSV",
             variable=self._resume_var,
         ).pack(side=tk.LEFT, padx=(18, 0))
         ttk.Checkbutton(
             options,
-            text="重置中文名后追加 IV（例如 呆火鱷15/15/15）",
+            text="重置中文名后追加 IV（例如 呆火鱷⑮⑮⑮）",
             variable=self._rename_with_iv_var,
-        ).pack(side=tk.LEFT, padx=(18, 0))
+        ).pack(anchor=tk.W, pady=(6, 0))
 
         actions = ttk.LabelFrame(
             outer,
@@ -265,6 +267,18 @@ class PokemonGoCleanupGui(tk.Tk):
         )
         self._stop_button.pack(side=tk.LEFT, padx=(8, 0))
 
+        iv_row = ttk.Frame(actions)
+        iv_row.pack(fill=tk.X, pady=(10, 0))
+        self._iv_name_button = ttk.Button(
+            iv_row,
+            text="扫描 IV 并命名",
+            command=self._rename_iv_one,
+        )
+        self._iv_name_button.pack(side=tk.LEFT)
+        ttk.Label(iv_row, text="当前一只 · 不扫描技能 · 不保存文件").pack(
+            side=tk.LEFT, padx=(10, 0)
+        )
+
         open_row = ttk.Frame(actions)
         open_row.pack(fill=tk.X, pady=(10, 0))
         ttk.Button(
@@ -302,6 +316,8 @@ class PokemonGoCleanupGui(tk.Tk):
 
         self._log = scrolledtext.ScrolledText(
             log_frame,
+            width=1,
+            height=8,
             wrap=tk.WORD,
             state=tk.DISABLED,
             font=("TkFixedFont", 10),
@@ -354,6 +370,13 @@ class PokemonGoCleanupGui(tk.Tk):
         if self._rename_with_iv_var.get():
             command.append("--rename-with-iv")
         self._start_command(command, task="scan-one", heading="自动扫描一只宝可梦")
+
+    def _rename_iv_one(self) -> None:
+        self._start_command(
+            [sys.executable, "-m", "pokemon_go_cleanup", "rename-iv-one"],
+            task="rename-iv-one",
+            heading="扫描当前一只的 IV 并命名（不保存文件）",
+        )
 
     def _scan_batch(self) -> None:
         try:
@@ -434,7 +457,7 @@ class PokemonGoCleanupGui(tk.Tk):
             return
 
         self._current_task = task
-        if task in ("scan-one", "scan-batch"):
+        if task in ("scan-one", "scan-batch", "rename-iv-one"):
             self._successful_scans_var.set("0")
             self._elapsed_time_var.set("00:00:00")
         self._batch_progress_csv = progress_csv
@@ -470,7 +493,7 @@ class PokemonGoCleanupGui(tk.Tk):
             messagebox.showerror("启动失败", str(error))
             return
 
-        if task in ("scan-one", "scan-batch"):
+        if task in ("scan-one", "scan-batch", "rename-iv-one"):
             self._scan_started_at = time.monotonic()
 
         process = self._process
@@ -516,9 +539,9 @@ class PokemonGoCleanupGui(tk.Tk):
         task = self._current_task
         self._refresh_batch_success_count()
         self._refresh_scan_elapsed_time()
-        if task in ("scan-one", "scan-batch"):
+        if task in ("scan-one", "scan-batch", "rename-iv-one"):
             self._scan_started_at = None
-        if task == "scan-one" and return_code == 0:
+        if task in ("scan-one", "rename-iv-one") and return_code == 0:
             self._successful_scans_var.set("1")
         self._process = None
         self._worker = None
@@ -580,6 +603,7 @@ class PokemonGoCleanupGui(tk.Tk):
         self._check_button.configure(state=state)
         self._dry_run_button.configure(state=state)
         self._one_button.configure(state=state)
+        self._iv_name_button.configure(state=state)
         self._batch_button.configure(state=state)
         self._stop_button.configure(
             state=tk.NORMAL if running else tk.DISABLED

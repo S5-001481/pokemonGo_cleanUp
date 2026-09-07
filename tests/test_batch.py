@@ -374,7 +374,7 @@ def test_batch_rename_verifies_transition_and_switches_from_post_identity(
     detector = QueueDetector(
         [
             PageDetection("detail_summary", 0.99, ("CP100", "赫拉克羅斯")),
-            PageDetection("detail_summary", 0.99, ("CP100", "赫拉克羅斯151413")),
+            PageDetection("detail_summary", 0.99, ("CP100", "赫拉克羅斯⑮⑭⑬")),
             PageDetection("detail_summary", 0.99, ("CP200", "乙")),
             PageDetection("detail_summary", 0.99, ("CP200", "乙")),
             PageDetection("detail_summary", 0.99, ("CP100", "赫拉克羅斯")),
@@ -397,8 +397,8 @@ def test_batch_rename_verifies_transition_and_switches_from_post_identity(
     with destination.open(encoding="utf-8", newline="") as source:
         rows = list(csv.DictReader(source))
     assert [row["nickname_after"] for row in rows] == [
-        "赫拉克羅斯151413",
-        "乙15/14/13",
+        "赫拉克羅斯⑮⑭⑬",
+        "乙⑮⑭⑬",
     ]
     assert [row["rename_status"] for row in rows] == ["verified", "verified"]
 
@@ -459,7 +459,7 @@ def test_rename_transition_uses_exact_nickname_hp_fingerprint_without_cp(
     )
 
     assert result.stop_reason == "limit_reached"
-    assert result.rows[0].nickname_after == "甲15/14/13"
+    assert result.rows[0].nickname_after == "甲⑮⑭⑬"
     state = json.loads(
         (
             tmp_path
@@ -526,7 +526,7 @@ def test_completed_renamed_row_restores_with_saved_cp_fallback(
         rename_with_iv=True,
     )
     row = written.rows[0]
-    expected = "甲15/14/13"
+    expected = "甲⑮⑭⑬"
     restore_detector = QueueDetector(
         [
             PageDetection("detail_summary", 0.99, ("CP100", "甲")),
@@ -899,7 +899,7 @@ def test_renamed_batch_wraps_on_exact_wide_nickname_and_immutable_identity(
         [_recognition("scan-a", "甲", 100), _recognition("scan-b", "乙", 200)],
     )
     adb = FakeBatchAdb([PNG_A, PNG_B, PNG_B, PNG_A])
-    expected_first = "甲15/14/13"
+    expected_first = "甲⑮⑭⑬"
     detector = QueueDetector(
         [
             PageDetection("detail_summary", 0.99, ("CP100", "甲")),
@@ -907,7 +907,7 @@ def test_renamed_batch_wraps_on_exact_wide_nickname_and_immutable_identity(
             PageDetection("detail_summary", 0.99, ("CP200", "乙")),
             PageDetection("detail_summary", 0.99, ("CP200", "乙")),
             PageDetection("detail_summary", 0.99, ("CP100", "甲")),
-            PageDetection("detail_summary", 0.99, ("CP200", "乙15/14/13")),
+            PageDetection("detail_summary", 0.99, ("CP200", "乙⑮⑭⑬")),
             PageDetection("detail_summary", 0.99, ("CP100", "不同OCR碎片")),
         ],
         summary_nicknames=["乙", expected_first],
@@ -1547,7 +1547,7 @@ def test_renamed_resume_switches_only_after_expected_nickname_matches(
         tmp_path / "renamed-scans",
         [_recognition("scan-next", "下一隻", 100)],
     )
-    expected = "睡睡菇15/14/13"
+    expected = "睡睡菇⑮⑭⑬"
     detector = QueueDetector(
         [
             PageDetection("detail_summary", 0.99, ("CP431", "睡睡菇")),
@@ -1584,7 +1584,7 @@ def test_renamed_resume_ambiguous_nickname_stops_without_input(
     _seed_renamed_resume_csv(tmp_path, destination)
     adb = FakeBatchAdb([PNG_B])
     scanner = FakeScanner(tmp_path / "renamed-scans", [])
-    expected = "睡睡菇15/14/13"
+    expected = "睡睡菇⑮⑭⑬"
     detector = QueueDetector(
         [
             PageDetection("detail_summary", 0.99, ("CP431", "睡睡菇")),
@@ -1618,7 +1618,7 @@ def test_renamed_resume_no_cp_fallback_requires_saved_wide_nickname(
     clock = FakeTime()
     adb = FakeBatchAdb([PNG_B, PNG_B, PNG_B])
     scanner = FakeScanner(tmp_path / "renamed-scans", [])
-    expected = "睡睡菇15/14/13"
+    expected = "睡睡菇⑮⑭⑬"
     detector = QueueDetector(
         [
             PageDetection("detail_summary", 0.99, ("CP431", "睡睡菇")),

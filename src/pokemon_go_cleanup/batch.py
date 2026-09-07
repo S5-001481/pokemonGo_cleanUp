@@ -32,7 +32,7 @@ from pokemon_go_cleanup.models import Device, ScanManifest
 from pokemon_go_cleanup.recognition import (
     RecognitionResult,
     normalize_cp_candidate,
-    normalize_ocr_text,
+    normalize_nickname_text,
     parse_cp_raw,
 )
 from pokemon_go_cleanup.storage import atomic_write_bytes, atomic_write_text
@@ -408,7 +408,7 @@ def summary_identity(
         if parsed_cp is not None and cp is None:
             cp = parsed_cp
             continue
-        normalized = normalize_ocr_text(raw)
+        normalized = normalize_nickname_text(raw)
         if normalized and name is None:
             name = normalized
     if name is None or cp is None:
@@ -438,7 +438,7 @@ def partial_summary_observation(
     for raw in detection.matched_texts:
         if normalize_cp_candidate(raw) is not None:
             continue
-        normalized = normalize_ocr_text(raw)
+        normalized = normalize_nickname_text(raw)
         if normalized:
             name = normalized
             break
@@ -472,7 +472,7 @@ def resume_observation(
         if normalized_cp is not None and cp is None:
             cp = int(normalized_cp[2:])
             continue
-        normalized = normalize_ocr_text(raw)
+        normalized = normalize_nickname_text(raw)
         if normalized and name is None:
             name = normalized
     if name is None:
@@ -503,7 +503,7 @@ def _recognition_identity(
     if result.pokemon_name.value is None or result.cp.value is None:
         return None
     return SummaryIdentity(
-        pokemon_name=normalize_ocr_text(result.pokemon_name.value),
+        pokemon_name=normalize_nickname_text(result.pokemon_name.value),
         cp=result.cp.value,
         page_fingerprint=page_fingerprint(summary_png, config),
     )

@@ -60,3 +60,26 @@ pokemon-go-cleanup dataset status
 
 Real screenshots, manifests, and annotations remain below `data/` and must not
 be committed.
+
+
+## Unicode IV nickname input (2026-09-06)
+
+The circled IV suffix requires the phone-side
+[ADB Keyboard component](https://github.com/senzhk/ADBKeyBoard),
+`com.android.adbkeyboard/.AdbIME`. This is independent of Python dependencies.
+After user-approved installation, enable it in the phone's input-method settings
+(or with `adb shell ime enable com.android.adbkeyboard/.AdbIME` from Ubuntu / WSL).
+Keep the normal keyboard selected: the ADB client temporarily switches only while
+sending the UTF-8/Base64 suffix and restores the recorded original IME afterward.
+
+The application checks enabled IMEs before any rename-enabled live scan and fails
+without capturing/editing if the component is absent. Dry runs and scans without
+renaming do not require it. No automatic APK installation or IME enabling occurs.
+ADB Keyboard v2.4-dev is now installed and enabled on the authorized test phone.
+The previous keyboard configuration was backed up before installation. Gboard is
+the normal selected keyboard. The input wrapper checks the target IME binding and
+shown state after switching and after restoration, so confirmation does not use
+coordinates while the keyboard is still changing layout.
+
+A complete live IV-only run on 2026-09-07 verified `向日種子⑮⑭⑩` and
+restored Gboard. The run created zero scan files and did not change any CSV.

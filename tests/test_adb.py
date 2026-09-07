@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -15,7 +16,9 @@ from pokemon_go_cleanup.adb import (
     select_device,
 )
 from pokemon_go_cleanup.exceptions import (
+    AdbCommandError,
     AdbNotInstalledError,
+    AutomationError,
     MultipleConnectedDevicesError,
     NoConnectedDeviceError,
     ScreenshotCaptureError,
@@ -170,3 +173,117 @@ def test_adb_input_wrappers_build_explicit_commands() -> None:
         ["adb.exe", "-s", "ABC123", "shell", "input", "keyevent", "123"],
         ["adb.exe", "-s", "ABC123", "shell", "input", "text", "15/15/15"],
     ]
+
+
+class UnicodeInputRunner:
+    def __init__(self) -> None:
+        self.commands: list[list[str]] = []
+        self.current = "com.google.android.inputmethod.latin/.LatinIME"
+        self.enabled = True
+        self.fail_broadcast = False
+        self.interrupt = False
+        self.reject_switch = False
+
+    def run_text(self, command: list[str], *, timeout_seconds: float) -> str:
+        self.commands.append(command)
+        args = command[4:]
+        if args == ["ime", "list", "-s"]:
+            return "com.android.adbkeyboard/.AdbIME" if self.enabled else self.current
+        if args == ["settings", "get", "secure", "default_input_method"]:
+            return self.current
+        if args == ["dumpsys", "input_method"]:
+            return f"mCurId={self.current} mBoundToMethod=true mInputShown=true"
+        if args[:2] == ["ime", "set"]:
+            if not self.reject_switch:
+                self.current = args[2]
+            return ""
+        if args[:2] == ["am", "broadcast"]:
+            if self.interrupt:
+                raise KeyboardInterrupt
+            if self.fail_broadcast:
+                raise AdbCommandError("broadcast failed")
+            return "Broadcast completed: result=0"
+        raise AssertionError(command)
+
+    def run_bytes(self, command: list[str], *, timeout_seconds: float) -> bytes:
+        raise AssertionError(command)
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "interrupt"])
+def test_unicode_input_sends_utf8_base64_and_restores_previous_keyboard(
+    monkeypatch: pytest.MonkeyPatch, outcome: str,
+) -> None:
+    runner = UnicodeInputRunner()
+    previous = runner.current
+    runner.fail_broadcast = outcome == "failure"
+    runner.interrupt = outcome == "interrupt"
+    client = AdbClient(Path("adb.exe"), runner=runner)
+    monkeypatch.setattr("pokemon_go_cleanup.adb.time.sleep", lambda _: None)
+
+    if outcome == "success":
+        client.input_text("ABC123", "⑭⑭⑮")
+    else:
+        with pytest.raises(KeyboardInterrupt if runner.interrupt else AdbCommandError):
+            client.input_text("ABC123", "⑭⑭⑮")
+
+    broadcasts = [command for command in runner.commands if "broadcast" in command]
+    assert len(broadcasts) == 1
+    assert base64.b64decode(broadcasts[0][-1]).decode("utf-8") == "⑭⑭⑮"
+    assert "com.android.adbkeyboard" in broadcasts[0]
+    assert runner.current == previous
+    assert ["ime", "set", previous] == runner.commands[-3][4:]
+    assert not any("text" in command for command in runner.commands)
+
+
+def test_unicode_input_rejects_missing_bridge_before_any_change() -> None:
+    runner = UnicodeInputRunner()
+    runner.enabled = False
+    client = AdbClient(Path("adb.exe"), runner=runner)
+
+    with pytest.raises(AutomationError, match="ADB Keyboard"):
+        client.input_text("ABC123", "⑭⑭⑮")
+
+    assert len(runner.commands) == 1
+    assert runner.commands[0][4:] == ["ime", "list", "-s"]
+
+
+def test_unicode_input_rejects_unconfirmed_switch_before_broadcast() -> None:
+    runner = UnicodeInputRunner()
+    runner.reject_switch = True
+    client = AdbClient(Path("adb.exe"), runner=runner)
+
+    with pytest.raises(AutomationError, match="Could not confirm input method switch"):
+        client.input_text("ABC123", "⑭⑭⑮")
+
+    assert not any("broadcast" in command for command in runner.commands)
+
+
+def test_unicode_input_waits_for_selected_keyboard_to_bind_and_show(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = UnicodeInputRunner()
+    client = AdbClient(Path("adb.exe"), runner=runner)
+    states = iter([
+        "mCurId=com.old/.IME mBoundToMethod=true mInputShown=true",
+        "mCurId=com.android.adbkeyboard/.AdbIME mBoundToMethod=true mInputShown=false",
+        "mCurId=com.android.adbkeyboard/.AdbIME mBoundToMethod=true mInputShown=true",
+    ])
+    monkeypatch.setattr(client, "_run_text", lambda _: next(states))
+    sleeps: list[float] = []
+    monkeypatch.setattr("pokemon_go_cleanup.adb.time.sleep", sleeps.append)
+
+    client._wait_for_input_method_editor("ABC123", "com.android.adbkeyboard/.AdbIME")
+
+    assert sleeps == [0.2, 0.2]
+
+
+def test_unicode_input_editor_wait_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = AdbClient(Path("adb.exe"), runner=UnicodeInputRunner())
+    monkeypatch.setattr(client, "_run_text", lambda _: "mInputShown=false")
+    sleeps: list[float] = []
+    monkeypatch.setattr("pokemon_go_cleanup.adb.time.sleep", sleeps.append)
+
+    with pytest.raises(AutomationError, match="no confirmation was sent"):
+        client._wait_for_input_method_editor("ABC123", "com.android.adbkeyboard/.AdbIME")
+
+    assert len(sleeps) == 10

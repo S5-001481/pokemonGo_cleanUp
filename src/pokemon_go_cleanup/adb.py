@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import re
 import shutil
+import time
 from pathlib import Path
 from typing import Final
 
@@ -14,6 +16,7 @@ from pokemon_go_cleanup.config import AppConfig
 from pokemon_go_cleanup.exceptions import (
     AdbCommandError,
     AdbNotInstalledError,
+    AutomationError,
     DeviceNotFoundError,
     DeviceProtocolError,
     DeviceUnavailableError,
@@ -25,6 +28,8 @@ from pokemon_go_cleanup.exceptions import (
 from pokemon_go_cleanup.models import Device, DeviceInfo, ScreenResolution
 
 logger = logging.getLogger(__name__)
+
+_UNICODE_IME: Final = "com.android.adbkeyboard/.AdbIME"
 
 _PNG_SIGNATURE: Final = b"\x89PNG\r\n\x1a\n"
 _SIZE_PATTERN: Final = re.compile(r"(\d+)\s*x\s*(\d+)")
@@ -245,12 +250,76 @@ class AdbClient:
             ["-s", serial_number, "shell", "input", "keyevent", str(keycode)]
         )
 
-    def input_text(self, serial_number: str, value: str) -> None:
-        """Request ASCII text input for the currently focused Android text field."""
+    def ensure_unicode_input_available(self, serial_number: str) -> None:
+        """Fail before any nickname changes if the Unicode input bridge is unavailable."""
 
-        self._run_text(
-            ["-s", serial_number, "shell", "input", "text", value]
+        enabled = self._run_text(["-s", serial_number, "shell", "ime", "list", "-s"])
+        if _UNICODE_IME not in enabled.split():
+            raise AutomationError(
+                "圈号 IV 命名需要在手机上安装并启用 ADB Keyboard "
+                "(com.android.adbkeyboard/.AdbIME)。当前未启用，尚未修改昵称。"
+                "请参阅 README 的圈号输入设置。"
+            )
+
+    def _current_input_method(self, serial_number: str) -> str:
+        return self._run_text(
+            ["-s", serial_number, "shell", "settings", "get", "secure", "default_input_method"]
+        ).strip()
+
+    def _set_input_method(self, serial_number: str, component: str) -> None:
+        self._run_text(["-s", serial_number, "shell", "ime", "set", component])
+        if self._current_input_method(serial_number) != component:
+            raise AutomationError(f"Could not confirm input method switch to {component}.")
+
+    def _wait_for_input_method_editor(self, serial_number: str, component: str) -> None:
+        """Wait for the selected IME to bind and show before using editor coordinates."""
+
+        package, service = component.split("/", 1)
+        expanded = package + "/" + (package + service if service.startswith(".") else service)
+        for _ in range(10):
+            state = self._run_text(["-s", serial_number, "shell", "dumpsys", "input_method"])
+            current = re.search(r"\bmCurId=([A-Za-z0-9_.$/]+)", state)
+            if (
+                current is not None
+                and current[1] in (component, expanded)
+                and "mBoundToMethod=true" in state
+                and "mInputShown=true" in state
+            ):
+                return
+            time.sleep(0.2)
+        raise AutomationError(
+            f"Input method {component} did not bind and show its editor; no confirmation was sent."
         )
+
+    def input_text(self, serial_number: str, value: str) -> None:
+        """Input ASCII normally, or inject UTF-8 with a temporary Unicode IME."""
+
+        if value.isascii():
+            self._run_text(["-s", serial_number, "shell", "input", "text", value])
+            return
+        self.ensure_unicode_input_available(serial_number)
+        previous = self._current_input_method(serial_number)
+        if re.fullmatch(r"[A-Za-z0-9_.]+/[A-Za-z0-9_.$]+", previous) is None:
+            raise AutomationError("Cannot identify the current keyboard; no text was sent.")
+        payload = base64.b64encode(value.encode("utf-8")).decode("ascii")
+        switched = previous != _UNICODE_IME
+        try:
+            if switched:
+                self._set_input_method(serial_number, _UNICODE_IME)
+                self._wait_for_input_method_editor(serial_number, _UNICODE_IME)
+            output = self._run_text(
+                [
+                    "-s", serial_number, "shell", "am", "broadcast", "--receiver-foreground",
+                    "-a", "ADB_INPUT_B64", "-p", "com.android.adbkeyboard", "--es", "msg", payload,
+                ]
+            )
+            if "Broadcast completed:" not in output:
+                raise AutomationError("Unicode input broadcast did not complete.")
+            # Completion acknowledges delivery, not the edited text: OCR still verifies it.
+        finally:
+            if switched:
+                self._set_input_method(serial_number, previous)
+                self._wait_for_input_method_editor(serial_number, previous)
 
     def _command(self, arguments: list[str]) -> list[str]:
         return [str(self._adb_path), *arguments]

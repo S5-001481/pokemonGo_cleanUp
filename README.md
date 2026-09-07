@@ -29,6 +29,38 @@ Pokémon GO Cleanup.bat
 
 After that, double-click `Pokémon GO Cleanup.bat` on the Windows desktop to launch the graphical interface.
 
+## IV naming only
+
+Open the current Pokemon's detail page at the top,
+then click **扫描 IV 并命名** in the GUI. This reads appraisal IVs and restores the
+game's default Chinese name before appending IVs, for example `超梦⑭⑭⑮`.
+Attack, defense and HP each use one circled number; zero is `⓪`. The complete
+name must fit 12 characters; overlong names stop without truncation or ASCII fallback.
+
+The button handles the current Pokemon once, skips moves and next-item switching,
+and saves no CSV, screenshots, recognition JSON, or debug files. Batch limits,
+CSV/resume, and debug settings do not apply. The success counter, timer, and Stop
+button work for this action. Recognition or nickname verification failures stop
+with a message in the log.
+
+Ubuntu / WSL CLI: `pokemon-go-cleanup rename-iv-one`.
+
+### Circled-number input setup
+
+Install and enable [ADB Keyboard](https://github.com/senzhk/ADBKeyBoard) on the
+phone first. Ordinary `adb input text` cannot send these Unicode characters;
+selecting an English keyboard alone is insufficient. A missing bridge stops
+before capture or nickname changes. This also applies to full-scan IV naming.
+The project never installs or enables a keyboard automatically.
+
+Keep your usual keyboard selected. During suffix input, the program temporarily
+selects ADB Keyboard, sends UTF-8/Base64, and restores the original input method,
+including on failure or interruption. Exact editor and final-name checks still
+run afterward and do not accept ordinary digits in place of circles. A physical run on 2026-09-07 verified
+`向日種子⑮⑭⑩` in both editor and final summary, restored Gboard, and created
+no scan files or CSV changes. A dedicated ring/interior reader avoids whole-row
+OCR confusing circled and ordinary digits.
+
 ## Interface Example
 
 ![Pokémon GO Cleanup interface](docs/images/interface-example.png)

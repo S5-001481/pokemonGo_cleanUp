@@ -71,7 +71,8 @@ Exact source and test links live in the
 - PNG and JSON are separate writes. A local failure during the JSON write can
   leave the PNG without its sidecar.
 - Automatic input remains limited to one fixed Huawei layout. `--rename-with-iv`
-  on `scan-auto-one` or `scan-batch` is the sole opt-in mutation: it resets the
+  on `scan-auto-one` or `scan-batch`, and the dedicated `rename-iv-one` action,
+  opt into nickname mutation: each resets the
   nickname to the game's default Chinese species name, then appends recognized
   IVs. Its first live run stopped safely because the original pencil coordinate
   missed the real control. The current flow no longer targets the pencil: after
@@ -79,15 +80,16 @@ Exact source and test links live in the
   nickname row at `(720,1460)` and then require an OCR-confirmed keyboard/dialog
   state before any delete or text input. The
   flow OCR-clicks the input method's right-side confirmation before the real
-  dialog `OK`, and sends the complete ASCII IV suffix through the existing ADB
-  `input text` wrapper. Editor OCR is compared without NFKC width folding, so an
-  input method result such as `１２／２／５` cannot pass as `12/2/5`; the flow
-  stops before either confirmation if the requested half-width text is not
-  visible. Live scan `20260826_102152_537806_e166da7687744511bd0c9ef7d8534f99`
-  confirmed that the active Gboard Pinyin layout also converts the `/` characters
-  from `input text` to `／`; the guard stopped before both confirmation taps.
-  Operators must manually switch Gboard to English before enabling rename mode;
-  the program deliberately does not change or restore the user's keyboard layout.
+  dialog `OK`. New names append three circled IVs such as `超梦⑭⑭⑮`, with
+  `⓪` for zero; a complete name over 12 characters is rejected. The phone must
+  have ADB Keyboard enabled. UTF-8/Base64 input temporarily selects that IME and
+  restores the prior keyboard, including after failure or interruption. Missing
+  support stops before capture or editing; installation/enabling is never automatic.
+  Editor, wide-summary and batch-name comparisons preserve circle characters.
+  The former slash/compact-digit formats remain historical scan evidence; the
+  new circle input passed a complete physical run for `向日種子⑮⑭⑩`.
+  A dedicated three-ring/two-interior-crop reader handles OCR circle loss, and
+  IME binding/display checks prevent confirmation from racing keyboard restoration.
   Batch mode additionally requires that width-sensitive editor evidence,
   a wide final-name ROI, unchanged CP/HP/static fingerprint, and durable rename
   evidence before a row or switch. The first live batch rename saved the
@@ -103,9 +105,15 @@ Exact source and test links live in the
   success is counted only on exit 0; batch progress reads complete records from
   the atomically replaced CSV and subtracts the resume baseline, so historical
   rows and failed partial scans are not counted. A monotonic `HH:MM:SS` timer sits
-  directly below the count, resets only for single/batch scan starts, updates
+  directly below the count, resets for single/batch scan or IV-only naming starts, updates
   during the child process, and freezes at the final complete, failed, or stopped
   duration.
+- The GUI also offers **扫描 IV 并命名** for the current Pokemon. It opens appraisal
+  directly, uses summary/IV evidence in memory, and reuses the existing guarded
+  rename flow. It skips moves and all scan/CSV/debug file persistence, including
+  failure paths. Batch/CSV/debug settings are ignored, successful exit counts one,
+  and Stop/timing follow the existing task lifecycle. See the
+  [IV-only path and its limits](walkthroughs/automatic-one-scan.md#iv-naming-without-a-saved-scan).
 - Debug-enabled automatic scans write one monotonic `debug/automation/timings.json`
   per scan directory. Ordered navigation, capture, recognition, finalization,
   and rename substeps retain durations and completed/failed outcomes; the file is

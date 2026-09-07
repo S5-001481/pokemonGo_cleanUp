@@ -34,10 +34,33 @@ console command is `pokemon-go-cleanup`.
   non-interactive JSON input.
 - Emit structured JSON or text logs.
 
-Explicitly excluded: transfer, power-up/evolution/rename/unlock/battle actions,
+Explicitly excluded: transfer, power-up/evolution/unlock/battle actions,
 account access, private APIs,
 credential handling, and network traffic inspection. No copyrighted Pokémon
 media belongs in the repository.
+
+## IV naming shortcut (2026-09-06)
+
+The GUI has a separate “扫描 IV 并命名” button backed by `rename-iv-one`.
+It handles only the currently open Pokemon, navigates directly to appraisal,
+reads IVs from verified in-memory frame evidence, and restores the default Chinese
+name before appending IVs with the existing length/width checks. It skips move
+scanning and next-item switching, creates no scan directory, and saves no CSV,
+PNG, manifest, recognition/nickname JSON, or debug artifacts even on failure or
+Ctrl+C. Batch/CSV/debug settings do not apply. Existing full-scan rename remains
+available with `--rename-with-iv`. All IV naming now uses three circled numbers
+(0 maps to ⓪), such as `超梦⑭⑭⑮`; names over 12 characters fail without
+truncation. An installed/enabled ADB Keyboard is required. Input temporarily
+selects that IME, sends UTF-8/Base64, and restores the previous keyboard. Missing
+support stops before capture/editing; installation/enabling requires user approval.
+Nickname OCR and batch comparisons preserve circles rather than fold them to ASCII.
+The GUI timer/counter and Stop button support the shortcut. Tests verify the new
+route without a device. On 2026-09-07 the full shortcut successfully named
+`向日種子⑮⑭⑩` (CP164), verified editor and final summary, restored Gboard,
+and created no scan artifacts or CSV changes. Whole-row OCR had lost circles or
+misread ⑮ as ⑤; the fixed reader verifies three closed rings and two agreeing
+interior OCR crops per ring. Input-method binding/display checks prevent
+confirmation from racing Gboard restoration.
 
 ## Architecture
 

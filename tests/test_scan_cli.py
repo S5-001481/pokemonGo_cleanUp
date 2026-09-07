@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -102,3 +103,40 @@ def test_scan_one_guides_user_and_honors_options(
     manifest: dict[str, Any] = json.loads(manifest_paths[0].read_text(encoding="utf-8"))
     assert manifest["notes"] == "社区日保留"
     assert manifest["scan_status"] == "complete"
+
+
+@pytest.mark.parametrize("outcome,exit_code", [("success", 0), ("failure", 15), ("stop", 130)])
+def test_rename_iv_cli_routes_to_no_file_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str, exit_code: int,
+) -> None:
+    from pokemon_go_cleanup.exceptions import AutomationError
+
+    selected: list[str | None] = []
+
+    class NamingService:
+        def __init__(self, *args: object) -> None:
+            pass
+
+        def rename_iv_one(self, *, serial_number: str | None = None) -> SimpleNamespace:
+            selected.append(serial_number)
+            if outcome == "failure":
+                raise AutomationError("Naming failed")
+            if outcome == "stop":
+                raise KeyboardInterrupt
+            return SimpleNamespace(expected_nickname="妙蛙花⑮⑬⑪")
+
+    monkeypatch.setattr(cli, "_build_client", lambda _: object())
+    monkeypatch.setattr(cli, "RecognitionService", lambda: object())
+    monkeypatch.setattr(cli, "HuaweiMate30PageDetector", lambda _: object())
+    monkeypatch.setattr(cli, "AutoScanService", NamingService)
+
+    result = runner.invoke(
+        cli.app, ["--data-dir", str(tmp_path), "rename-iv-one", "--serial", "ABC123"]
+    )
+
+    assert result.exit_code == exit_code, result.output
+    assert selected == ["ABC123"]
+    if outcome == "success":
+        assert "命名完成：妙蛙花⑮⑬⑪" in result.output
+    assert "recognition.json" not in result.output
+    assert list(tmp_path.iterdir()) == []

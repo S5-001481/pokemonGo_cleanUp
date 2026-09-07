@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 from collections import deque
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
@@ -20,9 +21,10 @@ from pokemon_go_cleanup.automation import (
     Point,
     appraisal_target_is_safe,
     build_iv_nickname,
+    circled_iv_suffix,
     compact_editor_nickname_text,
-    compact_iv_suffix,
     match_move_name_power_rows,
+    nickname_text_skeleton,
     planned_actions,
 )
 from pokemon_go_cleanup.config import AppConfig
@@ -184,6 +186,9 @@ class FakeAutomationAdb:
 
     def input_text(self, serial_number: str, value: str) -> None:
         self.inputs.append(("text", value))
+
+    def ensure_unicode_input_available(self, serial_number: str) -> None:
+        pass
 
 
 class QueueDetector:
@@ -406,6 +411,7 @@ def returned_detector(
     observed_centers: list[Point] = []
     metrics = deque(button_metrics)
     monkeypatch.setattr(detector, "_decode", lambda _png: object())
+    monkeypatch.setattr(detector, "_circled_iv_regions", lambda _image, _rect: ())
 
     def detail_button_metrics(
         _image: object,
@@ -553,6 +559,7 @@ def test_summary_nickname_reader_uses_tight_row_and_combines_split_tokens(
     )
 
     monkeypatch.setattr(detector, "_decode", lambda _png: object())
+    monkeypatch.setattr(detector, "_circled_iv_regions", lambda _image, _rect: ())
 
     def ocr_rectangle(
         _image: object,
@@ -579,6 +586,7 @@ def test_summary_nickname_reader_excludes_date_badge_and_small_row_noise(
     )
 
     monkeypatch.setattr(detector, "_decode", lambda _png: object())
+    monkeypatch.setattr(detector, "_circled_iv_regions", lambda _image, _rect: ())
     monkeypatch.setattr(
         detector,
         "_ocr_rectangle",
@@ -598,6 +606,7 @@ def progressive_wide_nickname_detector(
     detector._config = HuaweiMate30AutomationConfig()
     calls: list[str] = []
     monkeypatch.setattr(detector, "_decode", lambda _png: object())
+    monkeypatch.setattr(detector, "_circled_iv_regions", lambda _image, _rect: ())
 
     def ocr_rectangle(
         _image: object,
@@ -765,6 +774,7 @@ def test_appraisal_entry_checks_greeting_before_action_menu(
         matched_texts=("你好",),
     )
     monkeypatch.setattr(detector, "_decode", lambda _png: object())
+    monkeypatch.setattr(detector, "_circled_iv_regions", lambda _image, _rect: ())
     monkeypatch.setattr(detector, "_detect_appraisal_greeting", lambda _image: greeting)
 
     def unexpected_menu_check(_image: object) -> None:
@@ -785,6 +795,7 @@ def test_action_menu_polling_does_not_pay_for_greeting_ocr(
     detector._config = HuaweiMate30AutomationConfig()
     menu = PageDetection("action_menu", 0.99)
     monkeypatch.setattr(detector, "_decode", lambda _png: object())
+    monkeypatch.setattr(detector, "_circled_iv_regions", lambda _image, _rect: ())
 
     def unexpected_greeting_check(_image: object) -> None:
         raise AssertionError("ordinary menu polling must not run greeting OCR")
@@ -1335,7 +1346,7 @@ def test_rename_with_iv_resets_default_name_then_appends_suffix(tmp_path: Path) 
         0.99,
         matched_texts=("設定暱稱", "确定", "GIF", "1", "2", "3", "4"),
         rename_keyboard_target=Point(1248, 1712),
-        details={"nickname_text_candidates": ["妙蛙花15/13/11"]},
+        details={"nickname_text_candidates": ["妙蛙花⑮⑬⑪"]},
     )
     detector = QueueDetector(
         [
@@ -1377,7 +1388,7 @@ def test_rename_with_iv_resets_default_name_then_appends_suffix(tmp_path: Path) 
             rename_dialog,
             _summary_detection(),
         ],
-        summary_nicknames=("妙蛙花", "妙蛙花15/13/11"),
+        summary_nicknames=("妙蛙花", "妙蛙花⑮⑬⑪"),
     )
     adb = FakeAutomationAdb()
     service = AutoScanService(
@@ -1396,7 +1407,7 @@ def test_rename_with_iv_resets_default_name_then_appends_suffix(tmp_path: Path) 
 
     assert result.manifest.scan_status == "complete"
     assert result.nickname_change is not None
-    assert result.nickname_change.expected_nickname == "妙蛙花15/13/11"
+    assert result.nickname_change.expected_nickname == "妙蛙花⑮⑬⑪"
     assert detector.summary_cp_calls == 0
     assert (result.scan_directory / "renamed_summary.png").is_file()
     assert (result.scan_directory / "nickname_change.json").is_file()
@@ -1409,7 +1420,7 @@ def test_rename_with_iv_resets_default_name_then_appends_suffix(tmp_path: Path) 
         ("tap", 1120, 1860),
         ("tap", 720, 1460),
         ("keyevent", 123),
-        ("text", "15/13/11"),
+        ("text", "⑮⑬⑪"),
         ("tap", 1248, 1712),
         ("tap", 1120, 1860),
     ]
@@ -1434,7 +1445,7 @@ def test_rename_with_iv_resets_default_name_then_appends_suffix(tmp_path: Path) 
     assert append_action["kind"] == "text"
     assert append_action["coordinates"] == {
         "end": 123,
-        "ascii_text": "15/13/11",
+        "unicode_text": "⑮⑬⑪",
     }
     default_name_state = json.loads(
         next(
@@ -1528,7 +1539,7 @@ def _cp_disagreement_rename_detections(
 def test_rename_cp_disagreement_uses_bounded_cp_only_consensus(
     tmp_path: Path,
 ) -> None:
-    expected_nickname = "湧躍鴨12/15/15"
+    expected_nickname = "湧躍鴨⑫⑮⑮"
     detector = QueueDetector(
         _cp_disagreement_rename_detections(97, expected_nickname),
         summary_nicknames=("湧躍鴨", expected_nickname),
@@ -1588,7 +1599,7 @@ def test_rename_cp_disagreement_uses_bounded_cp_only_consensus(
 def test_rename_cp_disagreement_without_consensus_stops_before_editor(
     tmp_path: Path,
 ) -> None:
-    expected_nickname = "湧躍鴨12/15/15"
+    expected_nickname = "湧躍鴨⑫⑮⑮"
     detector = QueueDetector(
         _cp_disagreement_rename_detections(97, expected_nickname),
         summary_nicknames=("湧躍鴨", expected_nickname),
@@ -1625,47 +1636,45 @@ def test_rename_cp_disagreement_without_consensus_stops_before_editor(
     assert ("tap", 720, 1460) not in adb.inputs
 
 
-def test_editor_nickname_compaction_preserves_character_width() -> None:
-    assert compact_editor_nickname_text("妙蛙花 15/13/11") == "妙蛙花15/13/11"
-    full_width = "妙蛙花\uff11\uff15\uff0f\uff11\uff13\uff0f\uff11\uff11"
-    assert compact_editor_nickname_text(full_width) != "妙蛙花15/13/11"
+def test_editor_and_summary_comparisons_preserve_circles() -> None:
+    assert compact_editor_nickname_text("超梦 ⑭ ⑭ ⑮") == "超梦⑭⑭⑮"
+    assert nickname_text_skeleton("超梦 ⑭⑭⑮") == "超梦⑭⑭⑮"
+    assert nickname_text_skeleton("超梦141415") != nickname_text_skeleton("超梦⑭⑭⑮")
+    assert nickname_text_skeleton("超梦14/14/15") != nickname_text_skeleton("超梦⑭⑭⑮")
+    # Historical slash-loss comparison stays valid for pre-change scan evidence.
+    assert nickname_text_skeleton("超梦14/14/15") == nickname_text_skeleton("超梦141415")
 
 
-def test_build_iv_nickname_keeps_pretty_format_within_limit() -> None:
-    result = build_iv_nickname("毛崖蟹", 11, 11, 15)
+def test_build_iv_nickname_uses_three_circled_values() -> None:
+    result = build_iv_nickname("超梦", 14, 14, 15)
+    assert result.nickname == "超梦⑭⑭⑮"
+    assert result.iv_suffix == "⑭⑭⑮"
+    assert result.format == "circled_iv"
+    assert build_iv_nickname("赫拉克羅斯", 15, 14, 13).nickname == "赫拉克羅斯⑮⑭⑬"
 
-    assert result.nickname == "毛崖蟹11/11/15"
-    assert result.format == "pretty"
+
+@pytest.mark.parametrize("value", range(16))
+def test_circled_iv_suffix_includes_every_iv_value(value: int) -> None:
+    expected = "⓪①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮"[value]
+    assert circled_iv_suffix(value, value, value) == expected * 3
+
+
+@pytest.mark.parametrize("invalid", [-1, 16, True, 1.5, "14", None])
+def test_circled_iv_suffix_rejects_invalid_values(invalid: object) -> None:
+    with pytest.raises(AutomationError, match="integers from 0 through 15"):
+        circled_iv_suffix(invalid, 14, 15)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("name", ["卡璞・鳴鳴", "屬性：空", "3D龍2", "寶" * 9])
+def test_build_iv_nickname_uses_python_unicode_length(name: str) -> None:
+    result = build_iv_nickname(name, 15, 14, 13)
+    assert result.nickname == f"{name}⑮⑭⑬"
     assert len(result.nickname) <= 12
 
 
-def test_build_iv_nickname_compacts_five_character_name() -> None:
-    result = build_iv_nickname("赫拉克羅斯", 15, 14, 13)
-
-    assert result.nickname == "赫拉克羅斯151413"
-    assert result.format == "compact_iv"
-
-
-def test_compact_iv_suffix_zero_pads_each_value() -> None:
-    assert compact_iv_suffix(1, 11, 1) == "011101"
-    assert compact_iv_suffix(0, 0, 0) == "000000"
-    assert compact_iv_suffix(0, 0, 15) == "000015"
-
-
-@pytest.mark.parametrize("name", ["卡璞・鳴鳴", "屬性：空", "3D龍2"])
-def test_build_iv_nickname_uses_python_unicode_length(name: str) -> None:
-    result = build_iv_nickname(name, 15, 14, 13)
-
-    expected_pretty = f"{name}15/14/13"
-    expected_compact = f"{name}151413"
-    assert result.nickname == (
-        expected_pretty if len(expected_pretty) <= 12 else expected_compact
-    )
-
-
-def test_build_iv_nickname_rejects_compact_value_over_limit_without_truncation() -> None:
+def test_build_iv_nickname_rejects_over_limit_without_truncation() -> None:
     with pytest.raises(AutomationError, match="exceeds the 12-character game limit"):
-        build_iv_nickname("人工超長寶可夢名", 15, 14, 13)
+        build_iv_nickname("寶" * 10, 15, 14, 13)
 
 
 def test_fixed_nickname_row_tap_stops_before_text_when_editor_does_not_open(
@@ -1789,7 +1798,7 @@ def test_rename_with_iv_rejects_wrong_editor_text_before_final_confirmation(
 
     assert adb.inputs.count(("tap", 1248, 1712)) == 1
     assert adb.inputs.count(("tap", 1120, 1860)) == 1
-    assert ("text", "151413") in adb.inputs
+    assert ("text", "⑮⑭⑬") in adb.inputs
 
 
 def test_menu_open_retries_once_only_after_detail_state_timeout(
@@ -1916,3 +1925,219 @@ def test_scroll_to_moves_unknown_timeout_never_blindly_retries(
     debug_directory = manifest_path.parent / "debug" / "automation"
     assert (debug_directory / "scroll_to_moves_attempt_1_poll_01.png").is_file()
     assert (debug_directory / "scroll_to_moves_attempt_1_states.json").is_file()
+
+
+def _iv_naming_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    editor_name: str = "妙蛙花⑮⑬⑪",
+    appraisal_detection: PageDetection | None = None,
+) -> tuple[AutoScanService, FakeAutomationAdb, QueueDetector]:
+    # Reuse the complete real rename sequence, but start from summary and skip moves.
+    detections = _cp_disagreement_rename_detections(1761, editor_name)
+    detections[0] = _summary_detection_with_recognition()
+    del detections[1]
+    detections[1] = _summary_detection_with_recognition()
+    detections[4] = (
+        appraisal_detection
+        if appraisal_detection is not None
+        else _appraisal_detection_with_recognition()
+    )
+    detector = QueueDetector(
+        detections,
+        summary_nicknames=("妙蛙花", "妙蛙花⑮⑬⑪"),
+    )
+    adb = FakeAutomationAdb()
+    reader = FakeReader()
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        pytest.fail("IV naming must not write files or run the full scan reader")
+
+    monkeypatch.setattr(reader, "read_scan", forbidden)
+    monkeypatch.setattr(reader, "read_evidence", forbidden)
+    monkeypatch.setattr("pokemon_go_cleanup.automation.atomic_write_bytes", forbidden)
+    monkeypatch.setattr("pokemon_go_cleanup.automation.atomic_write_text", forbidden)
+    service = AutoScanService(
+        AppConfig(data_dir=tmp_path),
+        adb,
+        detector,
+        reader,
+        automation=HuaweiMate30AutomationConfig(nickname_maximum_characters=2),
+        clock=Clock(),
+        monotonic=lambda: 0.0,
+        sleeper=lambda _: None,
+    )
+    return service, adb, detector
+
+
+def test_iv_naming_skips_moves_and_all_file_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, adb, _ = _iv_naming_service(tmp_path, monkeypatch)
+
+    result = service.rename_iv_one()
+
+    assert result.expected_nickname == "妙蛙花⑮⑬⑪"
+    assert result.editor_observed_nickname == "妙蛙花⑮⑬⑪"
+    assert result.summary_observed_nickname == "妙蛙花⑮⑬⑪"
+    assert ("text", "⑮⑬⑪") in adb.inputs
+    assert not any(action[0] == "swipe" for action in adb.inputs)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "editor_name", ["妙蛙花151311", "妙蛙花１５／１３／１１"]  # noqa: RUF001
+)
+def test_iv_naming_rejects_incorrect_editor_before_confirmation_without_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, editor_name: str,
+) -> None:
+    service, adb, _ = _iv_naming_service(tmp_path, monkeypatch, editor_name=editor_name)
+
+    with pytest.raises(AutomationError, match="did not exactly match") as failure:
+        service.rename_iv_one()
+
+    assert "No files were saved" in str(failure.value)
+    assert "Manifest" not in str(failure.value)
+    assert adb.inputs.count(("tap", 1248, 1712)) == 1
+    assert adb.inputs.count(("tap", 1120, 1860)) == 1
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("bad_hash", [False, True])
+def test_iv_naming_requires_iv_evidence_from_the_actual_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad_hash: bool,
+) -> None:
+    appraisal = _appraisal_detection_with_recognition()
+    evidence = appraisal.recognition_evidence
+    assert isinstance(evidence, AppraisalRecognitionEvidence)
+    appraisal = replace(
+        appraisal,
+        recognition_evidence=replace(evidence, png_sha256="wrong") if bad_hash else None,
+    )
+    service, adb, _ = _iv_naming_service(
+        tmp_path, monkeypatch, appraisal_detection=appraisal
+    )
+
+    with pytest.raises(AutomationError, match="Verified summary and IV evidence"):
+        service.rename_iv_one()
+
+    assert not any(action[0] in ("text", "keyevent", "swipe") for action in adb.inputs)
+    assert ("tap", 720, 1460) not in adb.inputs
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_iv_naming_interrupt_does_not_create_scan_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, adb, detector = _iv_naming_service(tmp_path, monkeypatch)
+
+    def interrupt(*args: object, **kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(detector, "detect", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        service.rename_iv_one()
+
+    assert adb.inputs == []
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_missing_unicode_input_stops_before_capture_or_nickname_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, adb, _ = _iv_naming_service(tmp_path, monkeypatch)
+
+    def unavailable(serial: str) -> None:
+        raise AutomationError("Unicode input unavailable")
+
+    monkeypatch.setattr(adb, "ensure_unicode_input_available", unavailable)
+    with pytest.raises(AutomationError, match="Unicode input unavailable"):
+        service.rename_iv_one()
+
+    assert adb.inputs == []
+    assert adb.capture_count == 0
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_summary_nickname_row_preserves_circled_characters() -> None:
+    detector = object.__new__(HuaweiMate30PageDetector)
+    detector._config = HuaweiMate30AutomationConfig()
+    assert detector._join_summary_nickname_row((
+        OcrCandidate("超梦", 0.99, (400, 1400, 600, 1450)),
+        OcrCandidate("⑭⑭⑮", 0.99, (610, 1400, 730, 1450)),
+    )) == "超梦⑭⑭⑮"
+
+
+@pytest.mark.parametrize("value", range(16))
+def test_circled_nickname_uses_ring_geometry_and_agreeing_inner_digits(
+    monkeypatch: pytest.MonkeyPatch, value: int,
+) -> None:
+    cv2 = pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+    image = np.full((3120, 1440, 3), 255, dtype=np.uint8)
+    for x in (520, 592, 664):
+        cv2.circle(image, (x, 1385), 33, (0, 0, 0), 3)
+    reader = object.__new__(RecognitionService)
+    reader._cv2 = cv2
+    detector = HuaweiMate30PageDetector(reader)
+    monkeypatch.setattr(
+        reader, "_run_ocr",
+        lambda _image, rect, _scale: (OcrCandidate(str(value), 0.99, rect),),
+    )
+    monkeypatch.setattr(
+        detector, "_ocr_rectangle",
+        lambda _image, _rect: (OcrCandidate("超梦", 0.99, (200, 1350, 450, 1420)),),
+    )
+
+    assert detector._read_circled_nickname(
+        image, detector._config.nickname_input_rect,
+    ) == "超梦" + circled_iv_suffix(value, value, value)
+
+    # Plain digits must never acquire circle semantics without three visible rings.
+    image[:] = 255
+    cv2.putText(image, "151410", (500, 1400), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 0), 3)
+    assert detector._read_circled_nickname(image, detector._config.nickname_input_rect) is None
+
+
+@pytest.mark.parametrize("failure", ["disagree", "low_confidence", "out_of_range", "no_text"])
+def test_circled_nickname_rejects_uncertain_ring_interiors(
+    monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    cv2 = pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+    image = np.full((3120, 1440, 3), 255, dtype=np.uint8)
+    for x in (520, 592, 664):
+        cv2.circle(image, (x, 1385), 33, (0, 0, 0), 3)
+    reader = object.__new__(RecognitionService)
+    reader._cv2 = cv2
+    detector = HuaweiMate30PageDetector(reader)
+    readings = deque(["15", "5"])
+
+    def read_inner(
+        _image: object, rect: tuple[int, int, int, int], _scale: float,
+    ) -> tuple[OcrCandidate, ...]:
+        if failure == "no_text":
+            return ()
+        text = readings.popleft() if failure == "disagree" else "16"
+        confidence = 0.5 if failure == "low_confidence" else 0.99
+        return (OcrCandidate(text, confidence, rect),)
+
+    monkeypatch.setattr(reader, "_run_ocr", read_inner)
+    assert detector._read_circled_nickname(image, detector._config.nickname_input_rect) is None
+
+
+@pytest.mark.parametrize("count,misaligned", [(2, False), (4, False), (3, True)])
+def test_circle_geometry_rejects_missing_extra_or_misaligned_rings(
+    count: int, misaligned: bool,
+) -> None:
+    cv2 = pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+    image = np.full((3120, 1440, 3), 255, dtype=np.uint8)
+    for index in range(count):
+        y = 1385 + (30 if misaligned and index == 1 else 0)
+        cv2.circle(image, (520 + 72 * index, y), 33, (0, 0, 0), 3)
+    reader = object.__new__(RecognitionService)
+    reader._cv2 = cv2
+    detector = HuaweiMate30PageDetector(reader)
+    assert detector._circled_iv_regions(image, detector._config.nickname_input_rect) == ()

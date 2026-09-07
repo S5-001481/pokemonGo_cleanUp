@@ -181,11 +181,24 @@ class RecognitionEvidence:
     appraisal: AppraisalRecognitionEvidence
 
 
+CIRCLED_IV_DIGITS: Final = "⓪①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮"
+
+
 def normalize_ocr_text(value: str) -> str:
     """Normalize only whitespace and compatibility punctuation."""
 
     value = unicodedata.normalize("NFKC", value)
     return re.sub(r"\s+", " ", value).strip(" \t\r\n,." + chr(0x3002))
+
+
+def normalize_nickname_text(value: str) -> str:
+    """Keep circled IV characters distinct while normalizing other OCR text."""
+
+    parts = re.split(r"([⓪①-⑮])", value)
+    return "".join(
+        part if len(part) == 1 and part in CIRCLED_IV_DIGITS else normalize_ocr_text(part)
+        for part in parts
+    )
 
 
 def parse_cp_raw(raw: str) -> int | None:
@@ -954,7 +967,11 @@ class RecognitionService:
         if candidate.confidence < LOW_CONFIDENCE:
             warnings.append(f"{field} OCR confidence is low ({candidate.confidence:.3f}).")
         return RecognizedText(
-            value=normalize_ocr_text(candidate.raw),
+            value=(
+                normalize_nickname_text(candidate.raw)
+                if field == "pokemon_name"
+                else normalize_ocr_text(candidate.raw)
+            ),
             raw=candidate.raw,
             confidence=candidate.confidence,
         )
