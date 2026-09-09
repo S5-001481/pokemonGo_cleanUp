@@ -108,12 +108,14 @@ Exact source and test links live in the
   directly below the count, resets for single/batch scan or IV-only naming starts, updates
   during the child process, and freezes at the final complete, failed, or stopped
   duration.
-- The GUI also offers **扫描 IV 并命名** for the current Pokemon. It opens appraisal
-  directly, uses summary/IV evidence in memory, and reuses the existing guarded
-  rename flow. It skips moves and all scan/CSV/debug file persistence, including
-  failure paths. Batch/CSV/debug settings are ignored, successful exit counts one,
-  and Stop/timing follow the existing task lifecycle. See the
-  [IV-only path and its limits](walkthroughs/automatic-one-scan.md#iv-naming-without-a-saved-scan).
+- The GUI offers **扫描 IV 并命名** and **批量扫描 IV 并命名**. Both reuse one
+  no-file current-Pokemon core: lightweight detail geometry, three IV bars,
+  reset-to-default confirmation, suffix append without default-name/full-editor OCR,
+  final confirm, then lightweight detail return before success is counted. The
+  batch reuses the
+  maximum count, delay, standard left-swipe pair, and static fingerprint change
+  check. Any item or switch failure stops before another Pokemon is processed.
+  See the [IV-only flow](walkthroughs/automatic-one-scan.md#iv-only-fast-naming).
 - Debug-enabled automatic scans write one monotonic `debug/automation/timings.json`
   per scan directory. Ordered navigation, capture, recognition, finalization,
   and rename substeps retain durations and completed/failed outcomes; the file is

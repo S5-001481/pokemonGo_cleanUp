@@ -59,6 +59,22 @@ def format_elapsed_time(elapsed_seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+def parse_iv_only_progress(line: str) -> int | None:
+    """Read the completed count from one stable IV-only CLI progress line."""
+
+    if not line.startswith("IV_ONLY_PROGRESS "):
+        return None
+    fields = line.split(maxsplit=2)
+    if len(fields) < 2 or "/" not in fields[1]:
+        return None
+    completed_text, _ = fields[1].split("/", maxsplit=1)
+    try:
+        completed = int(completed_text)
+    except ValueError:
+        return None
+    return completed if completed >= 0 else None
+
+
 class PokemonGoCleanupGui(tk.Tk):
     """Small WSL GUI that launches the existing command-line application."""
 
@@ -141,7 +157,7 @@ class PokemonGoCleanupGui(tk.Tk):
         settings.pack(fill=tk.X, pady=(12, 0))
         settings.columnconfigure(1, weight=1)
 
-        ttk.Label(settings, text="最多扫描数量").grid(
+        ttk.Label(settings, text="最多处理数量").grid(
             row=0, column=0, sticky=tk.W, padx=(0, 10), pady=5
         )
         ttk.Spinbox(
@@ -163,7 +179,7 @@ class PokemonGoCleanupGui(tk.Tk):
         )
         scan_count = ttk.Frame(scan_progress)
         scan_count.pack(anchor=tk.E)
-        ttk.Label(scan_count, text="本次已成功扫描").pack(side=tk.LEFT)
+        ttk.Label(scan_count, text="本次已成功处理").pack(side=tk.LEFT)
         ttk.Label(
             scan_count,
             textvariable=self._successful_scans_var,
@@ -275,7 +291,13 @@ class PokemonGoCleanupGui(tk.Tk):
             command=self._rename_iv_one,
         )
         self._iv_name_button.pack(side=tk.LEFT)
-        ttk.Label(iv_row, text="当前一只 · 不扫描技能 · 不保存文件").pack(
+        self._iv_batch_button = ttk.Button(
+            iv_row,
+            text="批量扫描 IV 并命名",
+            command=self._rename_iv_batch,
+        )
+        self._iv_batch_button.pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(iv_row, text="不扫描技能 · 不保存 CSV 或扫描文件").pack(
             side=tk.LEFT, padx=(10, 0)
         )
 
@@ -378,24 +400,51 @@ class PokemonGoCleanupGui(tk.Tk):
             heading="扫描当前一只的 IV 并命名（不保存文件）",
         )
 
-    def _scan_batch(self) -> None:
+    def _rename_iv_batch(self) -> None:
+        bounds = self._read_batch_bounds()
+        if bounds is None:
+            return
+        limit, delay = bounds
+        self._start_command(
+            [
+                sys.executable,
+                "-m",
+                "pokemon_go_cleanup",
+                "rename-iv-batch",
+                "--limit",
+                str(limit),
+                "--delay",
+                str(delay),
+            ],
+            task="rename-iv-batch",
+            heading="批量扫描 IV 并命名（不保存文件）",
+        )
+
+    def _read_batch_bounds(self) -> tuple[int, float] | None:
         try:
             limit = int(self._limit_var.get())
         except ValueError:
-            messagebox.showerror("输入错误", "最多扫描数量必须是整数。")
-            return
+            messagebox.showerror("输入错误", "最多处理数量必须是整数。")
+            return None
         if limit <= 0:
-            messagebox.showerror("输入错误", "最多扫描数量必须大于 0。")
-            return
+            messagebox.showerror("输入错误", "最多处理数量必须大于 0。")
+            return None
 
         try:
             delay = float(self._delay_var.get())
         except ValueError:
             messagebox.showerror("输入错误", "等待秒数必须是数字。")
-            return
+            return None
         if not 0 <= delay <= 120:
             messagebox.showerror("输入错误", "等待秒数必须在 0 到 120 之间。")
+            return None
+        return limit, delay
+
+    def _scan_batch(self) -> None:
+        bounds = self._read_batch_bounds()
+        if bounds is None:
             return
+        limit, delay = bounds
 
         raw_csv = self._csv_var.get().strip()
         if not raw_csv:
@@ -457,7 +506,7 @@ class PokemonGoCleanupGui(tk.Tk):
             return
 
         self._current_task = task
-        if task in ("scan-one", "scan-batch", "rename-iv-one"):
+        if task in ("scan-one", "scan-batch", "rename-iv-one", "rename-iv-batch"):
             self._successful_scans_var.set("0")
             self._elapsed_time_var.set("00:00:00")
         self._batch_progress_csv = progress_csv
@@ -493,7 +542,7 @@ class PokemonGoCleanupGui(tk.Tk):
             messagebox.showerror("启动失败", str(error))
             return
 
-        if task in ("scan-one", "scan-batch", "rename-iv-one"):
+        if task in ("scan-one", "scan-batch", "rename-iv-one", "rename-iv-batch"):
             self._scan_started_at = time.monotonic()
 
         process = self._process
@@ -519,7 +568,7 @@ class PokemonGoCleanupGui(tk.Tk):
             while True:
                 kind, payload = self._messages.get_nowait()
                 if kind == "line":
-                    self._append_log(str(payload))
+                    self._handle_process_line(str(payload))
                 elif kind == "done":
                     if not isinstance(payload, int):
                         self._handle_worker_error(
@@ -535,11 +584,19 @@ class PokemonGoCleanupGui(tk.Tk):
         self._refresh_scan_elapsed_time()
         self.after(100, self._poll_messages)
 
+    def _handle_process_line(self, line: str) -> None:
+        self._append_log(line)
+        if self._current_task != "rename-iv-batch":
+            return
+        completed = parse_iv_only_progress(line)
+        if completed is not None:
+            self._successful_scans_var.set(str(completed))
+
     def _handle_process_done(self, return_code: int) -> None:
         task = self._current_task
         self._refresh_batch_success_count()
         self._refresh_scan_elapsed_time()
-        if task in ("scan-one", "scan-batch", "rename-iv-one"):
+        if task in ("scan-one", "scan-batch", "rename-iv-one", "rename-iv-batch"):
             self._scan_started_at = None
         if task in ("scan-one", "rename-iv-one") and return_code == 0:
             self._successful_scans_var.set("1")
@@ -604,6 +661,7 @@ class PokemonGoCleanupGui(tk.Tk):
         self._dry_run_button.configure(state=state)
         self._one_button.configure(state=state)
         self._iv_name_button.configure(state=state)
+        self._iv_batch_button.configure(state=state)
         self._batch_button.configure(state=state)
         self._stop_button.configure(
             state=tk.NORMAL if running else tk.DISABLED

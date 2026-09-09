@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pokemon_go_cleanup.automation import (
     AutoScanResult,
     ExpectedStates,
+    IvOnlyRenameResult,
     NicknameRenameResult,
     PageDetection,
     Point,
@@ -27,7 +28,12 @@ from pokemon_go_cleanup.automation import (
     compact_editor_nickname_text,
     nickname_text_skeleton,
 )
-from pokemon_go_cleanup.exceptions import AutomationError, BatchAutomationError, LocalStorageError
+from pokemon_go_cleanup.exceptions import (
+    AutomationError,
+    BatchAutomationError,
+    LocalStorageError,
+    PokemonGoCleanupError,
+)
 from pokemon_go_cleanup.models import Device, ScanManifest
 from pokemon_go_cleanup.recognition import (
     RecognitionResult,
@@ -61,6 +67,7 @@ BATCH_CSV_COLUMNS: Final = (
     "rename_status",
 )
 BatchStopReason = Literal["limit_reached", "wrapped_to_first"]
+IvOnlyBatchStopReason = Literal["limit_reached"]
 RenameStatus = Literal["not_requested", "verified"]
 
 
@@ -218,6 +225,23 @@ class BatchScanResult:
 
 
 @dataclass(frozen=True, slots=True)
+class IvOnlyBatchResult:
+    """In-memory outcome of a bounded IV-only rename batch."""
+
+    completed_count: int
+    limit: int
+    results: tuple[IvOnlyRenameResult, ...]
+    stop_reason: IvOnlyBatchStopReason
+
+
+@dataclass(frozen=True, slots=True)
+class _IvOnlySwitchResult:
+    screenshot: bytes
+    fingerprint: str
+    attempt: int
+
+
+@dataclass(frozen=True, slots=True)
 class _SwitchWaitResult:
     screenshot: bytes
     detection: PageDetection
@@ -257,6 +281,14 @@ class SingleScanRunner(Protocol):
     ) -> AutoScanResult: ...
 
 
+class IvOnlyRenameRunner(Protocol):
+    """Shared current-Pokemon IV-only workflow used by one and batch modes."""
+
+    def prepare_iv_only_device(self, serial_number: str | None = None) -> Device: ...
+
+    def process_current_iv_only(self, device: Device) -> IvOnlyRenameResult: ...
+
+
 class BatchPageDetector(Protocol):
     """Existing page detector used to gate horizontal switching."""
 
@@ -272,6 +304,8 @@ class BatchPageDetector(Protocol):
     def read_summary_cp(self, png_bytes: bytes) -> int | None: ...
 
     def read_summary_hp(self, png_bytes: bytes) -> str | None: ...
+
+    def detect_detail_page_lightweight(self, png_bytes: bytes) -> PageDetection: ...
 
 
 def _static_summary_image(
@@ -535,6 +569,31 @@ def _rename_status(value: str | None) -> RenameStatus:
     if value == "verified":
         return "verified"
     raise ValueError(f"unsupported rename_status: {value}")
+
+
+def next_pokemon_gestures(
+    config: HuaweiMate30BatchConfig = HUAWEI_MATE_30_BATCH,
+) -> tuple[Swipe, Swipe]:
+    """Return the shared bounded first and retry gestures in execution order."""
+
+    return config.next_pokemon, config.retry_next_pokemon
+
+
+def send_next_pokemon_gesture(
+    adb: BatchAdbGateway,
+    serial: str,
+    gesture: Swipe,
+) -> None:
+    """Send one configured horizontal switch gesture."""
+
+    adb.swipe(
+        serial,
+        gesture.start.x,
+        gesture.start.y,
+        gesture.end.x,
+        gesture.end.y,
+        gesture.duration_ms,
+    )
 
 
 class _BatchCsvStore:
@@ -1724,10 +1783,7 @@ class BatchScanService:
         if current is None:
             raise AssertionError("A strict switch precheck returned no identity.")
 
-        gestures = (
-            self._config.next_pokemon,
-            self._config.retry_next_pokemon,
-        )
+        gestures = next_pokemon_gestures(self._config)
         for attempt, gesture in enumerate(gestures, start=1):
             recorder.json(
                 f"switch_attempt_{attempt}_action.json",
@@ -1737,14 +1793,7 @@ class BatchScanService:
                     "before": asdict(current),
                 },
             )
-            self._adb.swipe(
-                serial,
-                gesture.start.x,
-                gesture.start.y,
-                gesture.end.x,
-                gesture.end.y,
-                gesture.duration_ms,
-            )
+            send_next_pokemon_gesture(self._adb, serial, gesture)
             result = self._wait_for_next_summary(
                 serial,
                 previous,
@@ -2281,3 +2330,178 @@ class BatchScanService:
             nickname_after=(change.expected_nickname if change is not None else None),
             rename_status=("verified" if change is not None else "not_requested"),
         )
+
+
+class IvOnlyBatchRenameService:
+    """Rename a bounded sequence in memory through one shared IV-only core."""
+
+    def __init__(
+        self,
+        adb: BatchAdbGateway,
+        scanner: IvOnlyRenameRunner,
+        detector: BatchPageDetector,
+        *,
+        config: HuaweiMate30BatchConfig = HUAWEI_MATE_30_BATCH,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._adb = adb
+        self._scanner = scanner
+        self._detector = detector
+        self._config = config
+        self._monotonic = monotonic
+        self._sleeper = sleeper
+
+    def rename(
+        self,
+        *,
+        limit: int,
+        delay_seconds: float,
+        serial_number: str | None = None,
+        on_success: Callable[[int, int, IvOnlyRenameResult], None] | None = None,
+    ) -> IvOnlyBatchResult:
+        if limit <= 0:
+            raise BatchAutomationError("--limit must be greater than 0.")
+        if delay_seconds < 0:
+            raise BatchAutomationError("--delay cannot be negative.")
+
+        device = self._scanner.prepare_iv_only_device(serial_number)
+        results: list[IvOnlyRenameResult] = []
+        while len(results) < limit:
+            item_number = len(results) + 1
+            try:
+                current = self._scanner.process_current_iv_only(device)
+            except PokemonGoCleanupError as error:
+                raise BatchAutomationError(
+                    f"IV-only batch failed while processing item {item_number}; "
+                    f"{len(results)} Pokemon were completed: {error} "
+                    "No switch to another Pokemon was sent after this failure."
+                ) from error
+
+            results.append(current)
+            baseline_fingerprint = page_fingerprint(current.detail_png, self._config)
+            if on_success is not None:
+                on_success(len(results), limit, current)
+            if len(results) >= limit:
+                return IvOnlyBatchResult(
+                    completed_count=len(results),
+                    limit=limit,
+                    results=tuple(results),
+                    stop_reason="limit_reached",
+                )
+
+            if delay_seconds:
+                self._sleeper(delay_seconds)
+            try:
+                self._switch_to_next(
+                    device.serial_number,
+                    baseline_fingerprint,
+                )
+            except BatchAutomationError as error:
+                raise BatchAutomationError(
+                    f"IV-only batch failed before item {item_number + 1}; "
+                    f"{len(results)} Pokemon were completed: {error}"
+                ) from error
+
+
+        raise AssertionError("IV-only batch loop terminated without a stop reason.")
+
+    def _switch_to_next(
+        self,
+        serial: str,
+        baseline_fingerprint: str,
+    ) -> _IvOnlySwitchResult:
+        before = self._adb.capture_screen(serial)
+        before_detection = self._detector.detect_detail_page_lightweight(before)
+        if before_detection.state != "detail_ready":
+            raise BatchAutomationError(
+                "The lightweight detector did not confirm the detail page before "
+                "switching. No swipe was sent."
+            )
+        if (
+            fingerprint_distance(
+                page_fingerprint(before, self._config),
+                baseline_fingerprint,
+            )
+            > self._config.duplicate_distance_threshold
+        ):
+            raise BatchAutomationError(
+                "The detail page changed after naming and before switching. "
+                "No swipe was sent."
+            )
+
+        for attempt, gesture in enumerate(
+            next_pokemon_gestures(self._config),
+            start=1,
+        ):
+            send_next_pokemon_gesture(self._adb, serial, gesture)
+            switched = self._wait_for_changed_detail(
+                serial,
+                baseline_fingerprint,
+                attempt,
+            )
+            if switched is not None:
+                return switched
+            if attempt == 1:
+                confirmation = self._adb.capture_screen(serial)
+                detection = self._detector.detect_detail_page_lightweight(confirmation)
+                if detection.state != "detail_ready":
+                    raise BatchAutomationError(
+                        "The page was not a lightweight-confirmed detail page after "
+                        "the first swipe. No retry swipe was sent."
+                    )
+                confirmation_fingerprint = page_fingerprint(
+                    confirmation,
+                    self._config,
+                )
+                if (
+                    fingerprint_distance(
+                        confirmation_fingerprint,
+                        baseline_fingerprint,
+                    )
+                    > self._config.duplicate_distance_threshold
+                ):
+                    return _IvOnlySwitchResult(
+                        confirmation,
+                        confirmation_fingerprint,
+                        attempt,
+                    )
+
+        raise BatchAutomationError(
+            "Two bounded left swipes did not confirm a different lightweight "
+            "Pokemon detail page. The batch stopped safely."
+        )
+
+    def _wait_for_changed_detail(
+        self,
+        serial: str,
+        baseline_fingerprint: str,
+        attempt: int,
+    ) -> _IvOnlySwitchResult | None:
+        interval = self._config.poll_interval_seconds
+        timeout = self._config.switch_timeout_seconds
+        started = self._monotonic()
+        maximum_samples = math.ceil(timeout / interval)
+        last_detection = PageDetection("unknown", 0.0)
+
+        for _ in range(maximum_samples):
+            elapsed = self._monotonic() - started
+            if elapsed >= timeout:
+                break
+            self._sleeper(min(interval, timeout - elapsed))
+            screenshot = self._adb.capture_screen(serial)
+            last_detection = self._detector.detect_detail_page_lightweight(screenshot)
+            if last_detection.state != "detail_ready":
+                continue
+            fingerprint = page_fingerprint(screenshot, self._config)
+            if (
+                fingerprint_distance(fingerprint, baseline_fingerprint)
+                > self._config.duplicate_distance_threshold
+            ):
+                return _IvOnlySwitchResult(screenshot, fingerprint, attempt)
+
+        if last_detection.state == "unknown":
+            raise BatchAutomationError(
+                "The page remained unknown after the switch. No retry swipe was sent."
+            )
+        return None

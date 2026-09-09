@@ -35,7 +35,6 @@ from pokemon_go_cleanup.recognition import (
     RecognitionResult,
     RecognitionService,
     RecognizedInteger,
-    RecognizedText,
     SummaryRecognitionEvidence,
     normalize_cp_candidate,
     normalize_nickname_text,
@@ -49,6 +48,7 @@ logger = logging.getLogger(__name__)
 PageState = Literal[
     "detail_summary",
     "detail_moves",
+    "detail_ready",
     "detail_returned",
     "action_menu",
     "appraisal_dialogue",
@@ -263,6 +263,17 @@ class NicknameRenameResult:
     summary_png: bytes
     summary_detection: PageDetection
 
+@dataclass(frozen=True, slots=True)
+class IvOnlyRenameResult:
+    """In-memory result after one IV-only suffix append and safe detail return."""
+
+    attack_iv: int
+    defense_iv: int
+    hp_iv: int
+    iv_suffix: str
+    detail_png: bytes = field(repr=False)
+    detail_detection: PageDetection
+
 
 @dataclass(frozen=True, slots=True)
 class IvNickname:
@@ -306,6 +317,10 @@ class PageDetector(Protocol):
     ) -> PageDetection: ...
 
     def detect_returned_from_appraisal(self, png_bytes: bytes) -> PageDetection: ...
+
+    def detect_detail_page_lightweight(self, png_bytes: bytes) -> PageDetection: ...
+
+    def detect_nickname_controls(self, png_bytes: bytes) -> PageDetection: ...
 
     def read_summary_nickname(self, png_bytes: bytes) -> str: ...
 
@@ -710,9 +725,39 @@ class HuaweiMate30PageDetector:
             details={"expected": list(expected)},
         )
 
+    def detect_detail_page_lightweight(self, png_bytes: bytes) -> PageDetection:
+        """Confirm a detail page without reading its name, CP, HP, or moves."""
+
+        return self._detect_detail_page_geometry(
+            png_bytes,
+            success_state="detail_ready",
+        )
+
+    def detect_nickname_controls(self, png_bytes: bytes) -> PageDetection:
+        """Detect editor controls without extracting or validating nickname text."""
+
+        image = self._decode(png_bytes)
+        detection = self._detect_rename_dialog(image, include_nickname=False)
+        return detection or PageDetection(
+            state="unknown",
+            confidence=0.0,
+            details={"expected": ["rename_keyboard", "rename_dialog"]},
+        )
+
     def detect_returned_from_appraisal(self, png_bytes: bytes) -> PageDetection:
         """Confirm appraisal is gone and both fixed detail-page buttons are visible."""
 
+        return self._detect_detail_page_geometry(
+            png_bytes,
+            success_state="detail_returned",
+        )
+
+    def _detect_detail_page_geometry(
+        self,
+        png_bytes: bytes,
+        *,
+        success_state: Literal["detail_ready", "detail_returned"],
+    ) -> PageDetection:
         image = self._decode(png_bytes)
         bars, _, _ = self._reader._ivs(image)
         if bars is not None:
@@ -720,6 +765,7 @@ class HuaweiMate30PageDetector:
                 state="unknown",
                 confidence=0.0,
                 details={
+                    **({"detail_page_present": False} if success_state == "detail_ready" else {}),
                     "returned_from_appraisal": False,
                     "appraisal_overlay_absent": False,
                     "iv_appraisal_geometry_absent": False,
@@ -744,6 +790,7 @@ class HuaweiMate30PageDetector:
             for metrics in (close, menu)
         )
         details: dict[str, object] = {
+            **({"detail_page_present": buttons_present} if success_state == "detail_ready" else {}),
             "returned_from_appraisal": buttons_present,
             "appraisal_overlay_absent": buttons_present,
             "iv_appraisal_geometry_absent": True,
@@ -760,7 +807,7 @@ class HuaweiMate30PageDetector:
                 details=details,
             )
         return PageDetection(
-            state="detail_returned",
+            state=success_state,
             confidence=min(
                 close["disk_teal_ratio"],
                 menu["disk_teal_ratio"],
@@ -1156,22 +1203,36 @@ class HuaweiMate30PageDetector:
             },
         )
 
-    def _detect_rename_dialog(self, image: object) -> PageDetection | None:
+    def _detect_rename_dialog(
+        self,
+        image: object,
+        *,
+        include_nickname: bool = True,
+    ) -> PageDetection | None:
         candidates = self._ocr_rectangle(image, self._config.rename_dialog_rect)
-        input_left, input_top, input_right, input_bottom = self._config.nickname_input_rect
-        nickname_candidates = tuple(
-            compact_editor_nickname_text(candidate.raw)
-            for candidate in candidates
-            if input_left <= (candidate.box[0] + candidate.box[2]) // 2 <= input_right
-            and input_top <= (candidate.box[1] + candidate.box[3]) // 2 <= input_bottom
-        )
-        circled = self._read_circled_nickname(image, self._config.nickname_input_rect)
-        if circled is not None:
-            nickname_candidates = (circled,)
-        nickname_details: dict[str, object] = {
-            "nickname_text_candidates": list(nickname_candidates),
-            "nickname_evidence": "circled_geometry_ocr" if circled is not None else "row_ocr",
-        }
+        nickname_details: dict[str, object] = {}
+        if include_nickname:
+            input_left, input_top, input_right, input_bottom = (
+                self._config.nickname_input_rect
+            )
+            nickname_candidates = tuple(
+                compact_editor_nickname_text(candidate.raw)
+                for candidate in candidates
+                if input_left <= (candidate.box[0] + candidate.box[2]) // 2 <= input_right
+                and input_top <= (candidate.box[1] + candidate.box[3]) // 2 <= input_bottom
+            )
+            circled = self._read_circled_nickname(
+                image,
+                self._config.nickname_input_rect,
+            )
+            if circled is not None:
+                nickname_candidates = (circled,)
+            nickname_details = {
+                "nickname_text_candidates": list(nickname_candidates),
+                "nickname_evidence": (
+                    "circled_geometry_ocr" if circled is not None else "row_ocr"
+                ),
+            }
         normalized = tuple(
             (candidate, normalize_ocr_text(candidate.raw).replace(" ", "").upper())
             for candidate in candidates
@@ -1554,17 +1615,85 @@ class AutoScanService:
             notes=notes,
         )
 
-    def rename_iv_one(self, *, serial_number: str | None = None) -> NicknameRenameResult:
-        """Read appraisal IVs and rename the current Pokemon without saving files."""
+    def rename_iv_one(self, *, serial_number: str | None = None) -> IvOnlyRenameResult:
+        """Read IVs and rename one Pokemon through the dedicated no-file workflow."""
 
-        result = self._scan_one(
-            rename_with_iv=True,
-            serial_number=serial_number,
-            iv_only=True,
+        device = self.prepare_iv_only_device(serial_number)
+        return self.process_current_iv_only(device)
+
+    def prepare_iv_only_device(self, serial_number: str | None = None) -> Device:
+        """Resolve and preflight one device before one or many IV-only operations."""
+
+        device = self._adb.resolve_device(serial_number)
+        resolution = self._adb.get_resolution(device.serial_number)
+        if (resolution.width, resolution.height) != (
+            self._automation.width,
+            self._automation.height,
+        ):
+            raise AutomationError(
+                f"IV-only naming requires {self._automation.width}x"
+                f"{self._automation.height}; device reported {resolution}."
+            )
+        self._adb.ensure_unicode_input_available(device.serial_number)
+        return device
+
+    def process_current_iv_only(self, device: Device) -> IvOnlyRenameResult:
+        """Process the currently visible Pokemon after one shared device preflight."""
+
+        started_monotonic = self._monotonic()
+        started_at = self._clock()
+        if started_at.tzinfo is None:
+            started_at = started_at.astimezone()
+        run_id = f"iv_only_{started_at.strftime('%Y%m%d_%H%M%S_%f')}_{self._token_factory()}"
+        virtual_directory = self._config.scan_root / ".iv-only" / run_id
+        manifest = ScanManifest(
+            scan_id=run_id,
+            started_at=started_at,
+            device_serial=device.serial_number,
+            device_model=device.model_name,
+            screen_resolution=ScreenResolution(
+                width=self._automation.width,
+                height=self._automation.height,
+            ),
+            workflow_mode="automatic",
+            application_version=self._application_version,
+            scan_status="in_progress",
         )
-        if result.nickname_change is None:
-            raise AutomationError("IV naming completed without a verified nickname.")
-        return result.nickname_change
+        recorder = _DebugRecorder(virtual_directory, False)
+        profiler = _StepProfiler(
+            recorder,
+            self._monotonic,
+            self._ocr_seconds_total,
+            started_monotonic,
+        )
+        session = _Session(
+            scan_directory=virtual_directory,
+            manifest_path=virtual_directory / "manifest.json",
+            manifest=manifest,
+            recorder=recorder,
+            profiler=profiler,
+            persist=False,
+        )
+        deadline = self._monotonic() + self._automation.total_timeout_seconds
+        session.profiler.record_completed(
+            "initialize",
+            started_monotonic,
+            self._monotonic(),
+        )
+        try:
+            result = self._run_iv_only(session, device.serial_number, deadline)
+        except KeyboardInterrupt:
+            session.profiler.finish("interrupted")
+            raise
+        except PokemonGoCleanupError as error:
+            session.profiler.finish("failed")
+            raise self._fail(session, error) from error
+        except Exception as error:
+            session.profiler.finish("failed")
+            wrapped = AutomationError(f"Unexpected IV-only automation failure: {error}")
+            raise self._fail(session, wrapped) from error
+        session.profiler.finish("complete")
+        return result
 
     def _scan_one(
         self,
@@ -1574,7 +1703,6 @@ class AutoScanService:
         rename_with_iv: bool = False,
         serial_number: str | None = None,
         notes: str | None = None,
-        iv_only: bool = False,
     ) -> AutoScanResult:
         scan_started_monotonic = self._monotonic()
         device = self._adb.resolve_device(serial_number)
@@ -1595,8 +1723,7 @@ class AutoScanService:
         scan_id = f"{started_at.strftime('%Y%m%d_%H%M%S_%f')}_{self._token_factory()}"
         scan_directory = self._config.scan_root / started_at.strftime("%Y-%m-%d") / scan_id
         try:
-            if not iv_only:
-                scan_directory.mkdir(parents=True, exist_ok=False)
+            scan_directory.mkdir(parents=True, exist_ok=False)
         except OSError as error:
             raise LocalStorageError(
                 f"Could not create automatic scan directory '{scan_directory}': {error}"
@@ -1613,9 +1740,8 @@ class AutoScanService:
             scan_status="in_progress",
             notes=notes,
         )
-        if not iv_only:
-            self._write_manifest(manifest_path, manifest)
-        recorder = _DebugRecorder(scan_directory, debug and not iv_only)
+        self._write_manifest(manifest_path, manifest)
+        recorder = _DebugRecorder(scan_directory, debug)
         profiler = _StepProfiler(
             recorder,
             self._monotonic,
@@ -1628,7 +1754,6 @@ class AutoScanService:
             manifest=manifest,
             recorder=recorder,
             profiler=profiler,
-            persist=not iv_only,
         )
         actions = planned_actions(self._automation, rename_with_iv=rename_with_iv)
         session.recorder.write_plan(actions)
@@ -1647,7 +1772,6 @@ class AutoScanService:
                 debug=debug,
                 dry_run=dry_run,
                 rename_with_iv=rename_with_iv,
-                iv_only=iv_only,
             )
         except KeyboardInterrupt:
             session.profiler.finish("interrupted")
@@ -1663,55 +1787,69 @@ class AutoScanService:
         session.profiler.finish("dry_run" if result.dry_run else "complete")
         return result
 
-    def _run(
+    def _run_iv_only(
         self,
         session: _Session,
         serial: str,
         deadline: float,
-        actions: tuple[dict[str, object], ...],
-        *,
-        debug: bool,
-        dry_run: bool,
-        rename_with_iv: bool,
-        iv_only: bool = False,
-    ) -> AutoScanResult:
-        session.current_step = "verify_detail_summary"
-        with session.profiler.step("verify_detail_summary"):
+    ) -> IvOnlyRenameResult:
+        session.current_step = "verify_detail_page_lightweight"
+        with session.profiler.step("verify_detail_page_lightweight"):
             initial = self._adb.capture_screen(serial)
-            session.recorder.screen("00_initial", initial)
-            initial, summary_detection = self._verify_detail_summary(
-                session, serial, initial, deadline
+            detail = self._wait_for_lightweight_detail(
+                session,
+                serial,
+                "verify_initial_detail",
+                deadline,
+                initial=initial,
             )
-        session.current_step = "capture_summary"
-        with session.profiler.step("capture_summary"):
-            self._save_capture(session, "summary", initial)
-
-        if dry_run:
-            session.current_step = "dry_run"
-            with session.profiler.step("finalize_dry_run"):
-                session.manifest = session.manifest.model_copy(
-                    update={"scan_status": "incomplete", "failed_step": "dry_run"}
+            if detail.outcome != "reached":
+                raise AutomationError(
+                    "The lightweight detector did not confirm a Pokemon detail page. "
+                    "No input was sent."
                 )
-                self._persist_manifest(session)
-                result = self._result(session, None, True, actions)
-            return result
 
-        moves_detection = PageDetection("unknown", 0.0)
-        if not iv_only:
-            self._check_deadline(deadline)
-            session.current_step = "scroll_to_moves"
-            with session.profiler.step("scroll_to_moves"):
-                moves, moves_detection = self._scroll_to_moves(
-                    session,
-                    serial,
-                    initial,
-                    summary_detection,
-                    deadline,
-                )
-            session.current_step = "capture_moves"
-            with session.profiler.step("capture_moves"):
-                self._save_capture(session, "moves", moves)
+        appraisal, appraisal_detection = self._capture_appraisal_bars(
+            session,
+            serial,
+            deadline,
+            lightweight_detail=True,
+        )
+        session.current_step = "read_appraisal_ivs"
+        with session.profiler.step("read_appraisal_ivs"):
+            attack, defense, hp = self._iv_values_from_appraisal(
+                appraisal,
+                appraisal_detection,
+            )
 
+        self._check_deadline(deadline)
+        session.current_step = "exit_appraisal"
+        with session.profiler.step("exit_appraisal"):
+            self._exit_appraisal(
+                session,
+                serial,
+                before=appraisal,
+                before_detection=appraisal_detection,
+            )
+
+        session.current_step = "rename_with_iv"
+        return self._rename_iv_only(
+            session,
+            serial,
+            attack,
+            defense,
+            hp,
+            deadline,
+        )
+
+    def _capture_appraisal_bars(
+        self,
+        session: _Session,
+        serial: str,
+        deadline: float,
+        *,
+        lightweight_detail: bool,
+    ) -> tuple[bytes, PageDetection]:
         self._check_deadline(deadline)
         session.current_step = "open_action_menu"
         with session.profiler.step("open_action_menu"):
@@ -1719,9 +1857,12 @@ class AutoScanService:
                 session,
                 serial,
                 deadline,
+                lightweight_detail=lightweight_detail,
             )
         if menu_detection.appraisal_target is None:
-            raise AutomationError("Action menu did not provide a safe OCR target for 調查寶可夢.")
+            raise AutomationError(
+                "Action menu did not provide a safe OCR target for 調查寶可夢."
+            )
 
         self._check_deadline(deadline)
         session.current_step = "open_appraisal"
@@ -1736,20 +1877,12 @@ class AutoScanService:
                 executed=True,
                 before_state=menu_detection.state,
             )
-            self._adb.tap(
-                serial,
-                appraisal_target.x,
-                appraisal_target.y,
-            )
+            self._adb.tap(serial, appraisal_target.x, appraisal_target.y)
 
         with session.profiler.step("wait_for_appraisal_entry"):
-            entry_result = self._wait_for_appraisal_entry(
-                session,
-                serial,
-            )
+            entry_result = self._wait_for_appraisal_entry(session, serial)
         appraisal_screen = entry_result.png_bytes
         appraisal_detection = entry_result.detection
-
         if entry_result.outcome != "reached":
             session.write_bytes(
                 session.scan_directory / "appraisal_entry_timeout.png",
@@ -1813,10 +1946,67 @@ class AutoScanService:
         with session.profiler.step("capture_appraisal"):
             appraisal = self._adb.capture_screen(serial)
             appraisal_detection = self._detect(
-                session, "appraisal_capture", appraisal, ("appraisal_bars",)
+                session,
+                "appraisal_capture",
+                appraisal,
+                ("appraisal_bars",),
             )
             self._require_state(appraisal_detection, ("appraisal_bars",))
             self._save_capture(session, "appraisal", appraisal)
+        return appraisal, appraisal_detection
+
+    def _run(
+        self,
+        session: _Session,
+        serial: str,
+        deadline: float,
+        actions: tuple[dict[str, object], ...],
+        *,
+        debug: bool,
+        dry_run: bool,
+        rename_with_iv: bool,
+    ) -> AutoScanResult:
+        session.current_step = "verify_detail_summary"
+        with session.profiler.step("verify_detail_summary"):
+            initial = self._adb.capture_screen(serial)
+            session.recorder.screen("00_initial", initial)
+            initial, summary_detection = self._verify_detail_summary(
+                session, serial, initial, deadline
+            )
+        session.current_step = "capture_summary"
+        with session.profiler.step("capture_summary"):
+            self._save_capture(session, "summary", initial)
+
+        if dry_run:
+            session.current_step = "dry_run"
+            with session.profiler.step("finalize_dry_run"):
+                session.manifest = session.manifest.model_copy(
+                    update={"scan_status": "incomplete", "failed_step": "dry_run"}
+                )
+                self._persist_manifest(session)
+                result = self._result(session, None, True, actions)
+            return result
+
+        self._check_deadline(deadline)
+        session.current_step = "scroll_to_moves"
+        with session.profiler.step("scroll_to_moves"):
+            moves, moves_detection = self._scroll_to_moves(
+                session,
+                serial,
+                initial,
+                summary_detection,
+                deadline,
+            )
+        session.current_step = "capture_moves"
+        with session.profiler.step("capture_moves"):
+            self._save_capture(session, "moves", moves)
+
+        appraisal, appraisal_detection = self._capture_appraisal_bars(
+            session,
+            serial,
+            deadline,
+            lightweight_detail=False,
+        )
 
         self._check_deadline(deadline)
         session.current_step = "exit_appraisal"
@@ -1832,31 +2022,22 @@ class AutoScanService:
         session.current_step = "recognize_scan"
         recognition: RecognitionResult | None
         with session.profiler.step("recognize_scan"):
-            if iv_only:
-                recognition = self._iv_only_recognition(
-                    session.manifest.scan_id,
-                    initial,
-                    summary_detection,
-                    appraisal,
-                    appraisal_detection,
+            evidence = self._complete_recognition_evidence(
+                summary_detection,
+                moves_detection,
+                appraisal_detection,
+            )
+            recognition = (
+                self._reader.read_evidence(
+                    session.scan_directory,
+                    evidence,
+                    debug=debug,
                 )
-            else:
-                evidence = self._complete_recognition_evidence(
-                    summary_detection,
-                    moves_detection,
-                    appraisal_detection,
-                )
-                recognition = (
-                    self._reader.read_evidence(
-                        session.scan_directory,
-                        evidence,
-                        debug=debug,
-                    )
-                    if evidence is not None
-                    else None
-                )
-                if recognition is None:
-                    recognition = self._reader.read_scan(session.scan_directory, debug=debug)
+                if evidence is not None
+                else None
+            )
+            if recognition is None:
+                recognition = self._reader.read_scan(session.scan_directory, debug=debug)
         nickname_change: NicknameRenameResult | None = None
         if rename_with_iv:
             self._check_deadline(deadline)
@@ -1866,10 +2047,6 @@ class AutoScanService:
                 serial,
                 recognition,
                 deadline,
-            )
-        if iv_only:
-            return self._result(
-                session, recognition, False, actions, nickname_change=nickname_change
             )
         with session.profiler.step("finalize_scan"):
             session.manifest = session.manifest.model_copy(
@@ -1891,6 +2068,91 @@ class AutoScanService:
                 nickname_change=nickname_change,
             )
         return result
+
+    def _rename_iv_only(
+        self,
+        session: _Session,
+        serial: str,
+        attack: int,
+        defense: int,
+        hp: int,
+        deadline: float,
+    ) -> IvOnlyRenameResult:
+        """Reset to the game default and append IVs without nickname OCR."""
+
+        with session.profiler.step("rename_validate_iv_suffix"):
+            iv_suffix = circled_iv_suffix(attack, defense, hp)
+        with session.profiler.step("rename_open_editor_reset"):
+            editor = self._open_nickname_editor_lightweight(
+                session,
+                serial,
+                deadline,
+                "open_nickname_editor_reset",
+            )
+        with session.profiler.step("rename_clear_to_default"):
+            self._clear_nickname(
+                session,
+                serial,
+                "clear_nickname_for_default",
+                editor.state,
+            )
+        with session.profiler.step("rename_confirm_default"):
+            self._confirm_nickname_editor(
+                session,
+                serial,
+                deadline,
+                "confirm_default_nickname",
+                lightweight_detail=True,
+            )
+        with session.profiler.step("rename_open_editor_append_iv"):
+            editor = self._open_nickname_editor_lightweight(
+                session,
+                serial,
+                deadline,
+                "open_nickname_editor_append_iv",
+            )
+        with session.profiler.step("rename_append_iv_suffix"):
+            self._append_nickname_text(
+                session,
+                serial,
+                iv_suffix,
+                "append_iv_suffix",
+                editor.state,
+            )
+        with session.profiler.step("rename_confirm_iv"):
+            renamed_detail = self._confirm_nickname_editor(
+                session,
+                serial,
+                deadline,
+                "confirm_iv_nickname",
+                lightweight_detail=True,
+            )
+
+        return IvOnlyRenameResult(
+            attack_iv=attack,
+            defense_iv=defense,
+            hp_iv=hp,
+            iv_suffix=iv_suffix,
+            detail_png=renamed_detail.png_bytes,
+            detail_detection=renamed_detail.detection,
+        )
+
+    @staticmethod
+    def _iv_values_from_appraisal(
+        appraisal_png: bytes,
+        appraisal: PageDetection,
+    ) -> tuple[int, int, int]:
+        evidence = appraisal.recognition_evidence
+        if (
+            not isinstance(evidence, AppraisalRecognitionEvidence)
+            or evidence.png_sha256 != sha256(appraisal_png).hexdigest()
+        ):
+            raise AutomationError(
+                "Verified IV evidence from the actual appraisal frame is required "
+                "before naming."
+            )
+        bars = evidence.bars
+        return bars[0].value, bars[1].value, bars[2].value
 
     def _rename_with_iv(
         self,
@@ -2047,6 +2309,28 @@ class AutoScanService:
             )
         return summary_observed
 
+    def _open_nickname_editor_lightweight(
+        self,
+        session: _Session,
+        serial: str,
+        deadline: float,
+        label: str,
+    ) -> PageDetection:
+        self._check_deadline(deadline)
+        screen = self._adb.capture_screen(serial)
+        detection = self._detector.detect_detail_page_lightweight(screen)
+        session.recorder.detection(f"{label}_before", detection)
+        self._require_state(detection, ("detail_ready",))
+        return self._tap_nickname_editor(
+            session,
+            serial,
+            deadline,
+            label,
+            screen,
+            detection,
+            nickname_controls_only=True,
+        )
+
     def _open_nickname_editor(
         self,
         session: _Session,
@@ -2121,6 +2405,8 @@ class AutoScanService:
         label: str,
         screen: bytes,
         detection: PageDetection,
+        *,
+        nickname_controls_only: bool = False,
     ) -> PageDetection:
         target = self._automation.nickname_edit
         detection = replace(detection, nickname_edit_target=target)
@@ -2138,7 +2424,13 @@ class AutoScanService:
             target.x,
             target.y,
         )
-        result = self._wait_for_rename_dialog(session, serial, label, deadline)
+        result = self._wait_for_rename_dialog(
+            session,
+            serial,
+            label,
+            deadline,
+            nickname_controls_only=nickname_controls_only,
+        )
         if result.outcome != "reached":
             raise AutomationError(
                 "Nickname editor did not expose an OCR-confirmed editor state. "
@@ -2282,6 +2574,7 @@ class AutoScanService:
         label: str,
         *,
         expected_nickname: str | None = None,
+        lightweight_detail: bool = False,
     ) -> _StateWaitResult:
         result = self._poll_for_state(
             session,
@@ -2290,6 +2583,7 @@ class AutoScanService:
             target=("rename_keyboard", "rename_dialog"),
             expected=("rename_keyboard", "rename_dialog", "unknown"),
             deadline=deadline,
+            nickname_controls_only=lightweight_detail,
         )
         if result.outcome != "reached":
             raise AutomationError("Nickname editor was not ready for confirmation.")
@@ -2314,7 +2608,13 @@ class AutoScanService:
                 )
         if result.detection.state == "rename_keyboard":
             self._dismiss_nickname_keyboard(session, serial, result.detection, label)
-            result = self._wait_for_visible_rename_dialog(session, serial, label, deadline)
+            result = self._wait_for_visible_rename_dialog(
+                session,
+                serial,
+                label,
+                deadline,
+                nickname_controls_only=lightweight_detail,
+            )
         detection = result.detection
         self._require_state(detection, ("rename_dialog",))
         target = detection.rename_confirm_target
@@ -2329,7 +2629,21 @@ class AutoScanService:
             before_state=detection.state,
         )
         self._adb.tap(serial, target.x, target.y)
-        summary = self._wait_for_detail_summary(session, serial, label, deadline)
+        summary = (
+            self._wait_for_lightweight_detail(
+                session,
+                serial,
+                f"{label}_detail_returned",
+                deadline,
+            )
+            if lightweight_detail
+            else self._wait_for_detail_summary(session, serial, label, deadline)
+        )
+        if summary.outcome != "reached":
+            raise AutomationError(
+                "Nickname confirmation did not return to a lightweight-confirmed "
+                "detail page before timeout."
+            )
         if verified_candidates:
             summary.detection.details["verified_editor_nickname_candidates"] = list(
                 verified_candidates
@@ -2363,6 +2677,8 @@ class AutoScanService:
         serial: str,
         label: str,
         deadline: float,
+        *,
+        nickname_controls_only: bool = False,
     ) -> _StateWaitResult:
         return self._poll_for_state(
             session,
@@ -2371,6 +2687,7 @@ class AutoScanService:
             target=("rename_keyboard", "rename_dialog"),
             expected=("rename_keyboard", "rename_dialog", "detail_summary", "unknown"),
             deadline=deadline,
+            nickname_controls_only=nickname_controls_only,
         )
 
     def _wait_for_visible_rename_dialog(
@@ -2379,6 +2696,8 @@ class AutoScanService:
         serial: str,
         label: str,
         deadline: float,
+        *,
+        nickname_controls_only: bool = False,
     ) -> _StateWaitResult:
         return self._poll_for_state(
             session,
@@ -2387,6 +2706,7 @@ class AutoScanService:
             target="rename_dialog",
             expected=("rename_dialog", "rename_keyboard", "detail_summary", "unknown"),
             deadline=deadline,
+            nickname_controls_only=nickname_controls_only,
         )
 
     def _wait_for_detail_summary(
@@ -2410,6 +2730,46 @@ class AutoScanService:
             )
         return result
 
+    def _wait_for_lightweight_detail(
+        self,
+        session: _Session,
+        serial: str,
+        label: str,
+        deadline: float,
+        *,
+        initial: bytes | None = None,
+    ) -> _StateWaitResult:
+        """Poll detail-button geometry without running name, CP, HP, or move OCR."""
+
+        interval = self._automation.rename_poll_interval_seconds
+        timeout = min(
+            self._automation.rename_wait_timeout_seconds,
+            deadline - self._monotonic(),
+        )
+        if timeout <= 0:
+            self._check_deadline(deadline)
+        started = self._monotonic()
+        screen = initial if initial is not None else self._adb.capture_screen(serial)
+        sample_index = 0
+        while True:
+            detection = self._detector.detect_detail_page_lightweight(screen)
+            session.recorder.detection(f"{label}_{sample_index:02d}", detection)
+            session.recorder.screen(f"{label}_{sample_index:02d}", screen)
+            if detection.state == "detail_ready":
+                return _StateWaitResult(
+                    screen,
+                    detection,
+                    "reached",
+                    self._monotonic() - started,
+                )
+            elapsed = self._monotonic() - started
+            if elapsed >= timeout:
+                return _StateWaitResult(screen, detection, "timeout", timeout)
+            self._sleeper(min(interval, timeout - elapsed))
+            self._check_deadline(deadline)
+            screen = self._adb.capture_screen(serial)
+            sample_index += 1
+
     def _poll_for_state(
         self,
         session: _Session,
@@ -2419,6 +2779,7 @@ class AutoScanService:
         target: PageState | tuple[PageState, ...],
         expected: ExpectedStates,
         deadline: float,
+        nickname_controls_only: bool = False,
     ) -> _StateWaitResult:
         target_states = target if isinstance(target, tuple) else (target,)
         interval = self._automation.rename_poll_interval_seconds
@@ -2426,8 +2787,15 @@ class AutoScanService:
         if timeout <= 0:
             self._check_deadline(deadline)
         started = self._monotonic()
+        def detect(screen: bytes, sample_label: str) -> PageDetection:
+            if not nickname_controls_only:
+                return self._detect(session, sample_label, screen, expected)
+            detection = self._detector.detect_nickname_controls(screen)
+            session.recorder.detection(sample_label, detection)
+            return detection
+
         last_screen = self._adb.capture_screen(serial)
-        last_detection = self._detect(session, f"{label}_wait_00", last_screen, expected)
+        last_detection = detect(last_screen, f"{label}_wait_00")
         for sample_index in range(math.ceil(timeout / interval) + 1):
             if last_detection.state in target_states:
                 return _StateWaitResult(
@@ -2441,8 +2809,9 @@ class AutoScanService:
                 break
             self._sleeper(min(interval, timeout - elapsed))
             last_screen = self._adb.capture_screen(serial)
-            last_detection = self._detect(
-                session, f"{label}_wait_{sample_index + 1:02d}", last_screen, expected
+            last_detection = detect(
+                last_screen,
+                f"{label}_wait_{sample_index + 1:02d}",
             )
             session.recorder.screen(f"{label}_wait_{sample_index + 1:02d}", last_screen)
         return _StateWaitResult(last_screen, last_detection, "timeout", timeout)
@@ -2666,22 +3035,66 @@ class AutoScanService:
         )
         return abnormal if abnormal.state != "unknown" else moves
 
+    def _detail_gate_detection(
+        self,
+        session: _Session,
+        label: str,
+        screen: bytes,
+        *,
+        lightweight: bool,
+        full_states: ExpectedStates,
+    ) -> PageDetection:
+        if not lightweight:
+            return self._detect(session, label, screen, full_states)
+        detection = self._detector.detect_detail_page_lightweight(screen)
+        session.recorder.detection(label, detection)
+        return detection
+
+    def _menu_wait_detection(
+        self,
+        session: _Session,
+        label: str,
+        screen: bytes,
+        expected: ExpectedStates,
+        *,
+        lightweight_detail: bool,
+    ) -> PageDetection:
+        if not lightweight_detail:
+            return self._detect(session, label, screen, expected)
+        detection = self._detect(
+            session,
+            label,
+            screen,
+            ("action_menu", "appraisal_dialogue", "appraisal_bars"),
+        )
+        if detection.state != "unknown":
+            return detection
+        detail = self._detector.detect_detail_page_lightweight(screen)
+        session.recorder.detection(f"{label}_detail", detail)
+        return detail
+
     def _open_action_menu(
         self,
         session: _Session,
         serial: str,
         deadline: float,
+        *,
+        lightweight_detail: bool = False,
     ) -> tuple[bytes, PageDetection]:
         detail_states: ExpectedStates = ("detail_moves", "detail_summary")
         before = self._adb.capture_screen(serial)
         session.recorder.screen("before_open_action_menu", before)
-        before_detection = self._detect(
+        before_detection = self._detail_gate_detection(
             session,
             "before_open_action_menu",
             before,
-            detail_states,
+            lightweight=lightweight_detail,
+            full_states=detail_states,
         )
-        self._require_state(before_detection, detail_states)
+        allowed_detail_states: ExpectedStates = (
+            ("detail_ready",) if lightweight_detail else detail_states
+        )
+        self._require_state(before_detection, allowed_detail_states)
         session.recorder.named_state(
             "before_open_action_menu",
             before_detection,
@@ -2694,13 +3107,14 @@ class AutoScanService:
             if attempt > 1:
                 before = self._adb.capture_screen(serial)
                 session.recorder.screen(f"before_open_action_menu_attempt_{attempt}", before)
-                before_detection = self._detect(
+                before_detection = self._detail_gate_detection(
                     session,
                     f"before_open_action_menu_attempt_{attempt}",
                     before,
-                    detail_states,
+                    lightweight=lightweight_detail,
+                    full_states=detail_states,
                 )
-                self._require_state(before_detection, detail_states)
+                self._require_state(before_detection, allowed_detail_states)
                 session.recorder.named_state(
                     f"before_open_action_menu_attempt_{attempt}",
                     before_detection,
@@ -2726,6 +3140,7 @@ class AutoScanService:
                 serial,
                 action_name,
                 deadline,
+                lightweight_detail=lightweight_detail,
             )
             session.recorder.screen(f"after_{action_name}", result.png_bytes)
             session.recorder.named_state(
@@ -2753,6 +3168,8 @@ class AutoScanService:
         serial: str,
         label: str,
         deadline: float,
+        *,
+        lightweight_detail: bool = False,
     ) -> _StateWaitResult:
         expected: ExpectedStates = (
             "action_menu",
@@ -2776,11 +3193,12 @@ class AutoScanService:
                 break
             self._sleeper(min(interval, timeout - actual_elapsed))
             screen = self._adb.capture_screen(serial)
-            detection = self._detect(
+            detection = self._menu_wait_detection(
                 session,
                 f"{label}_wait_{sample_index:02d}",
                 screen,
                 expected,
+                lightweight_detail=lightweight_detail,
             )
             session.recorder.screen(
                 f"{label}_wait_{sample_index:02d}",
@@ -2807,18 +3225,24 @@ class AutoScanService:
             last_detection = detection
             if detection.state == "action_menu":
                 return _StateWaitResult(screen, detection, "reached", elapsed)
-            if detection.state not in ("detail_moves", "detail_summary"):
+            waiting_states: ExpectedStates = (
+                ("detail_ready",)
+                if lightweight_detail
+                else ("detail_moves", "detail_summary")
+            )
+            if detection.state not in waiting_states:
                 return _StateWaitResult(screen, detection, "unexpected", elapsed)
             if measured_elapsed >= timeout:
                 break
 
         if last_screen is None or last_detection is None:
             last_screen = self._adb.capture_screen(serial)
-            last_detection = self._detect(
+            last_detection = self._menu_wait_detection(
                 session,
                 f"{label}_timeout",
                 last_screen,
                 expected,
+                lightweight_detail=lightweight_detail,
             )
         return _StateWaitResult(last_screen, last_detection, "timeout", timeout)
 
@@ -3111,45 +3535,6 @@ class AutoScanService:
     def _ocr_seconds_total(self) -> float:
         value = getattr(self._reader, "ocr_seconds_total", 0.0)
         return float(value) if isinstance(value, int | float) else 0.0
-
-    @staticmethod
-    def _iv_only_recognition(
-        scan_id: str,
-        summary_png: bytes,
-        summary: PageDetection,
-        appraisal_png: bytes,
-        appraisal: PageDetection,
-    ) -> RecognitionResult:
-        """Use the exact detected frames; never invoke the three-view reader."""
-
-        summary_evidence = summary.recognition_evidence
-        appraisal_evidence = appraisal.recognition_evidence
-        if (
-            not isinstance(summary_evidence, SummaryRecognitionEvidence)
-            or not isinstance(appraisal_evidence, AppraisalRecognitionEvidence)
-            or summary_evidence.png_sha256 != sha256(summary_png).hexdigest()
-            or appraisal_evidence.png_sha256 != sha256(appraisal_png).hexdigest()
-        ):
-            raise AutomationError("Verified summary and IV evidence is required before naming.")
-        name = RecognitionService._best_text(summary_evidence.name_candidates)
-        cp = RecognitionService._best_cp(summary_evidence.cp_candidates)
-        if name is None or cp is None:
-            raise AutomationError("The current name and CP must be recognized before naming.")
-        bars = appraisal_evidence.bars
-        empty_move = RecognizedText(value=None, raw=None)
-        return RecognitionResult(
-            scan_id=scan_id,
-            pokemon_name=RecognizedText(
-                value=normalize_nickname_text(name.raw), raw=name.raw, confidence=name.confidence
-            ),
-            cp=RecognizedInteger(value=parse_cp_raw(cp.raw), raw=cp.raw, confidence=cp.confidence),
-            fast_move=empty_move,
-            charged_move_1=empty_move,
-            charged_move_2=empty_move,
-            attack_iv=bars[0].value,
-            defense_iv=bars[1].value,
-            hp_iv=bars[2].value,
-        )
 
     @staticmethod
     def _complete_recognition_evidence(

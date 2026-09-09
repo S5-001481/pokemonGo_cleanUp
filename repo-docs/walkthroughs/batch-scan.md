@@ -223,6 +223,30 @@ Normal completion reports `limit_reached` or `wrapped_to_first`. Page mismatch,
 two failed switches, malformed resume data, a single-scan failure, or Ctrl+C
 stops without deleting complete scans or previously written rows.
 
+## IV-only bounded naming
+
+`rename-iv-batch` is a separate no-file batch. It calls the same
+`process_current_iv_only()` core as `rename-iv-one`, then reuses the ordinary
+batch's `next_pokemon_gestures()` and `send_next_pokemon_gesture()` helpers.
+
+Each completed item supplies an in-memory detail frame only after final nickname
+confirmation has returned to a lightweight-confirmed detail page. Progress is
+incremented before switching. The batch fresh-checks detail geometry and the same
+static fingerprint before the first swipe. The switched page must again pass
+lightweight detail geometry and have a different fingerprint. An unknown page
+stops with no retry; the second bounded swipe is available only after another
+frame proves the old confirmed detail page remains. It does not compare the new
+page with older processed fingerprints: that previously caused a false wrap after
+five items because distinct Pokemon can share the compact static hash. The immediately
+previous page must still differ, so a failed switch remains fail-closed.
+
+No item failure can fall through to switching because results and progress append
+only after the shared core returns. Switch failures occur before the next core
+call. Errors identify the item boundary and completed count. This mode has no CSV,
+resume state, scan directory, screenshots, manifest, debug evidence, moves,
+name/CP identity, default-name OCR, complete-editor validation, or final-summary
+nickname OCR.
+
 ## Verification boundary
 
 Synthetic tests cover two distinct scans, both exact left-swipe gestures, the

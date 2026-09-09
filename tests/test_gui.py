@@ -11,12 +11,16 @@ from pokemon_go_cleanup.gui import (
     PokemonGoCleanupGui,
     count_csv_data_rows,
     format_elapsed_time,
+    parse_iv_only_progress,
 )
 
 
 class FakeStringVar:
     def __init__(self, value: str) -> None:
         self.value = value
+
+    def get(self) -> str:
+        return self.value
 
     def set(self, value: str) -> None:
         self.value = value
@@ -112,3 +116,78 @@ def test_iv_naming_completion_counts_only_verified_success_and_freezes_timer(
     assert count.value == expected_count
     assert elapsed.value == "00:01:05"
     assert gui._scan_started_at is None
+
+
+@pytest.mark.parametrize(
+    "line,expected",
+    [
+        ("IV_ONLY_PROGRESS 3/10 超梦⑭⑭⑮", 3),
+        ("ordinary log line", None),
+        ("IV_ONLY_PROGRESS bad", None),
+    ],
+)
+def test_parse_iv_only_progress(line: str, expected: int | None) -> None:
+    assert parse_iv_only_progress(line) == expected
+
+
+def test_iv_batch_button_reuses_limit_and_delay_without_csv_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gui = object.__new__(PokemonGoCleanupGui)
+    gui._limit_var = FakeStringVar("7")  # type: ignore[assignment]
+    gui._delay_var = FakeStringVar("0.5")  # type: ignore[assignment]
+    calls: list[tuple[list[str], str, Path | None]] = []
+
+    def start(
+        command: list[str],
+        *,
+        task: str,
+        heading: str,
+        progress_csv: Path | None = None,
+    ) -> None:
+        calls.append((command, task, progress_csv))
+
+    monkeypatch.setattr(gui, "_start_command", start)
+    gui._rename_iv_batch()
+
+    assert calls == [
+        (
+            [
+                sys.executable,
+                "-m",
+                "pokemon_go_cleanup",
+                "rename-iv-batch",
+                "--limit",
+                "7",
+                "--delay",
+                "0.5",
+            ],
+            "rename-iv-batch",
+            None,
+        )
+    ]
+
+
+def test_iv_batch_progress_is_kept_when_process_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gui = object.__new__(PokemonGoCleanupGui)
+    gui._current_task = "rename-iv-batch"
+    gui._batch_progress_csv = None
+    gui._scan_started_at = 100.0
+    gui._process = object()  # type: ignore[assignment]
+    gui._worker = object()  # type: ignore[assignment]
+    gui._successful_scans_var = FakeStringVar("0")  # type: ignore[assignment]
+    gui._elapsed_time_var = FakeStringVar("00:00:00")  # type: ignore[assignment]
+    gui._status_var = FakeStringVar("")  # type: ignore[assignment]
+    logs: list[str] = []
+    monkeypatch.setattr(gui, "_append_log", logs.append)
+    monkeypatch.setattr(gui, "_set_running", lambda _: None)
+    monkeypatch.setattr("pokemon_go_cleanup.gui.time.monotonic", lambda: 165.0)
+
+    gui._handle_process_line("IV_ONLY_PROGRESS 3/10 甲⑮⑭⑬")
+    gui._handle_process_done(16)
+
+    assert gui._successful_scans_var.value == "3"  # type: ignore[attr-defined]
+    assert gui._elapsed_time_var.value == "00:01:05"  # type: ignore[attr-defined]
+    assert gui._status_var.value == "失败（退出码 16）"  # type: ignore[attr-defined]

@@ -200,13 +200,18 @@ class QueueDetector:
         summary_nicknames: tuple[str, ...] = (),
         summary_cps: tuple[int | None, ...] = (),
         returned_detections: tuple[PageDetection, ...] = (),
+        lightweight_detections: tuple[PageDetection, ...] = (),
     ) -> None:
         self._detections = deque(detections)
         self.summary_nickname = summary_nickname
         self._summary_nicknames = deque(summary_nicknames)
         self._summary_cps = deque(summary_cps)
         self._returned_detections = deque(returned_detections)
+        self._lightweight_detections = deque(lightweight_detections)
+        self.expected_calls: list[tuple[str, ...]] = []
         self.returned_calls = 0
+        self.lightweight_calls = 0
+        self.nickname_control_calls = 0
         self.summary_nickname_calls = 0
         self.summary_cp_calls = 0
         self.summary_hp_calls = 0
@@ -219,6 +224,22 @@ class QueueDetector:
     ) -> PageDetection:
         assert png_bytes == PNG
         assert expected
+        self.expected_calls.append(expected)
+        return self._detections.popleft()
+
+    def detect_detail_page_lightweight(self, png_bytes: bytes) -> PageDetection:
+        assert png_bytes == PNG
+        self.lightweight_calls += 1
+        if self._lightweight_detections:
+            return self._lightweight_detections.popleft()
+        detection = self._detections.popleft()
+        if detection.state in ("detail_summary", "detail_moves", "detail_returned"):
+            return PageDetection("detail_ready", detection.confidence)
+        return detection
+
+    def detect_nickname_controls(self, png_bytes: bytes) -> PageDetection:
+        assert png_bytes == PNG
+        self.nickname_control_calls += 1
         return self._detections.popleft()
 
     def detect_returned_from_appraisal(self, png_bytes: bytes) -> PageDetection:
@@ -285,6 +306,12 @@ class InterruptingDetector:
     ) -> PageDetection:
         assert png_bytes == PNG
         assert expected
+        raise KeyboardInterrupt
+
+    def detect_detail_page_lightweight(self, png_bytes: bytes) -> PageDetection:
+        raise KeyboardInterrupt
+
+    def detect_nickname_controls(self, png_bytes: bytes) -> PageDetection:
         raise KeyboardInterrupt
 
     def detect_returned_from_appraisal(self, png_bytes: bytes) -> PageDetection:
@@ -508,6 +535,17 @@ class AdvancingMonotonic:
     def __call__(self) -> float:
         self.value += 1.0
         return self.value
+
+
+class ManualMonotonic:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def sleep(self, seconds: float) -> None:
+        self.value += seconds
 
 
 def test_appraisal_target_rejects_transfer_proximity_and_forbidden_band() -> None:
@@ -974,6 +1012,60 @@ def test_returned_from_appraisal_requires_absent_iv_bars_and_two_detail_buttons(
     assert result.details["iv_appraisal_geometry_absent"] is True
     assert result.details["appraisal_overlay_absent"] is True
     assert observed_centers == [Point(720, 2772), Point(1244, 2772)]
+
+
+def test_lightweight_detail_uses_geometry_without_name_or_cp_ocr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    detector, observed_centers = returned_detector(
+        monkeypatch,
+        appraisal_bars_present=False,
+        button_metrics=(
+            {
+                "disk_teal_ratio": 0.96,
+                "ring_teal_ratio": 0.09,
+                "ring_contrast": 0.87,
+            },
+            {
+                "disk_teal_ratio": 0.95,
+                "ring_teal_ratio": 0.39,
+                "ring_contrast": 0.56,
+            },
+        ),
+    )
+
+    result = detector.detect_detail_page_lightweight(PNG)
+
+    assert result.state == "detail_ready"
+    assert result.details["detail_page_present"] is True
+    assert observed_centers == [Point(720, 2772), Point(1244, 2772)]
+
+
+def test_nickname_controls_detector_skips_circled_nickname_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    detector = object.__new__(HuaweiMate30PageDetector)
+    detector._config = HuaweiMate30AutomationConfig()
+    monkeypatch.setattr(detector, "_decode", lambda _png: object())
+    monkeypatch.setattr(
+        detector,
+        "_ocr_rectangle",
+        lambda _image, _rect: (
+            OcrCandidate("設定暱稱", 0.99, (400, 900, 850, 1000)),
+            OcrCandidate("取消", 0.99, (300, 1600, 500, 1730)),
+            OcrCandidate("OK", 0.99, (650, 1600, 790, 1730)),
+        ),
+    )
+    monkeypatch.setattr(
+        detector,
+        "_read_circled_nickname",
+        lambda *_args: pytest.fail("controls-only detection must skip nickname OCR"),
+    )
+
+    result = detector.detect_nickname_controls(PNG)
+
+    assert result.state == "rename_dialog"
+    assert "nickname_text_candidates" not in result.details
 
 
 def test_returned_from_appraisal_rejects_visible_iv_bars_before_button_checks(
@@ -1933,20 +2025,59 @@ def _iv_naming_service(
     *,
     editor_name: str = "妙蛙花⑮⑬⑪",
     appraisal_detection: PageDetection | None = None,
+    final_details: tuple[PageDetection, ...] = (),
 ) -> tuple[AutoScanService, FakeAutomationAdb, QueueDetector]:
-    # Reuse the complete real rename sequence, but start from summary and skip moves.
-    detections = _cp_disagreement_rename_detections(1761, editor_name)
-    detections[0] = _summary_detection_with_recognition()
-    del detections[1]
-    detections[1] = _summary_detection_with_recognition()
-    detections[4] = (
+    rename_dialog = PageDetection(
+        "rename_dialog",
+        0.99,
+        matched_texts=("取消", "確定"),
+        rename_confirm_target=Point(1120, 1860),
+    )
+    default_keyboard = PageDetection(
+        "rename_keyboard",
+        0.99,
+        matched_texts=("設定暱稱", "确定"),
+        rename_keyboard_target=Point(1248, 1712),
+    )
+    iv_keyboard = PageDetection(
+        "rename_keyboard",
+        0.99,
+        matched_texts=("設定暱稱", editor_name, "确定"),
+        rename_keyboard_target=Point(1248, 1712),
+        details={"nickname_text_candidates": [editor_name]},
+    )
+    appraisal = (
         appraisal_detection
         if appraisal_detection is not None
         else _appraisal_detection_with_recognition()
     )
     detector = QueueDetector(
-        detections,
-        summary_nicknames=("妙蛙花", "妙蛙花⑮⑬⑪"),
+        [
+            PageDetection(
+                "action_menu",
+                0.99,
+                matched_texts=("調查寶可夢",),
+                appraisal_target=Point(700, 2400),
+            ),
+            PageDetection("appraisal_bars", 1.0),
+            appraisal,
+            rename_dialog,
+            default_keyboard,
+            rename_dialog,
+            rename_dialog,
+            iv_keyboard,
+            rename_dialog,
+        ],
+        summary_nicknames=("妙蛙花",),
+        returned_detections=(PageDetection("detail_returned", 0.99),),
+        lightweight_detections=(
+            PageDetection("detail_ready", 0.99),
+            PageDetection("detail_ready", 0.99),
+            PageDetection("detail_ready", 0.99),
+            PageDetection("detail_ready", 0.99),
+            PageDetection("detail_ready", 0.99),
+            *(final_details or (PageDetection("detail_ready", 0.99),)),
+        ),
     )
     adb = FakeAutomationAdb()
     reader = FakeReader()
@@ -1974,33 +2105,69 @@ def _iv_naming_service(
 def test_iv_naming_skips_moves_and_all_file_writes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    service, adb, _ = _iv_naming_service(tmp_path, monkeypatch)
+    service, adb, detector = _iv_naming_service(tmp_path, monkeypatch)
 
     result = service.rename_iv_one()
 
-    assert result.expected_nickname == "妙蛙花⑮⑬⑪"
-    assert result.editor_observed_nickname == "妙蛙花⑮⑬⑪"
-    assert result.summary_observed_nickname == "妙蛙花⑮⑬⑪"
+    assert result.iv_suffix == "⑮⑬⑪"
+    assert (result.attack_iv, result.defense_iv, result.hp_iv) == (15, 13, 11)
+    assert result.detail_detection.state == "detail_ready"
+    assert detector.summary_nickname_calls == 0
+    assert detector.summary_cp_calls == 0
+    assert detector.nickname_control_calls > 0
+    assert ("detail_summary",) not in detector.expected_calls
     assert ("text", "⑮⑬⑪") in adb.inputs
     assert not any(action[0] == "swipe" for action in adb.inputs)
     assert list(tmp_path.iterdir()) == []
 
 
-@pytest.mark.parametrize(
-    "editor_name", ["妙蛙花151311", "妙蛙花１５／１３／１１"]  # noqa: RUF001
-)
-def test_iv_naming_rejects_incorrect_editor_before_confirmation_without_files(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, editor_name: str,
+def test_iv_naming_final_confirm_requires_lightweight_detail_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    service, adb, _ = _iv_naming_service(tmp_path, monkeypatch, editor_name=editor_name)
+    unknown = PageDetection("unknown", 0.0)
+    service, adb, detector = _iv_naming_service(
+        tmp_path,
+        monkeypatch,
+        final_details=(unknown, unknown, unknown),
+    )
+    timer = ManualMonotonic()
+    service._automation = replace(
+        service._automation,
+        rename_wait_timeout_seconds=0.5,
+        rename_poll_interval_seconds=0.25,
+    )
+    service._monotonic = timer
+    service._sleeper = timer.sleep
 
-    with pytest.raises(AutomationError, match="did not exactly match") as failure:
+    with pytest.raises(AutomationError, match="lightweight-confirmed detail page"):
         service.rename_iv_one()
 
-    assert "No files were saved" in str(failure.value)
-    assert "Manifest" not in str(failure.value)
-    assert adb.inputs.count(("tap", 1248, 1712)) == 1
-    assert adb.inputs.count(("tap", 1120, 1860)) == 1
+    assert adb.inputs.count(("tap", 1120, 1860)) == 2
+    assert detector.summary_nickname_calls == 0
+    assert detector.summary_cp_calls == 0
+    assert detector.lightweight_calls >= 8
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "editor_name", ["妙蛙花151311", "傲骨燕②1413"]
+)
+def test_iv_naming_does_not_ocr_or_validate_complete_editor_nickname(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, editor_name: str,
+) -> None:
+    service, adb, detector = _iv_naming_service(
+        tmp_path,
+        monkeypatch,
+        editor_name=editor_name,
+    )
+
+    result = service.rename_iv_one()
+
+    assert result.iv_suffix == "⑮⑬⑪"
+    assert detector.summary_nickname_calls == 0
+    assert detector.summary_cp_calls == 0
+    assert adb.inputs.count(("tap", 1248, 1712)) == 2
+    assert adb.inputs.count(("tap", 1120, 1860)) == 2
     assert list(tmp_path.iterdir()) == []
 
 
@@ -2019,7 +2186,7 @@ def test_iv_naming_requires_iv_evidence_from_the_actual_frame(
         tmp_path, monkeypatch, appraisal_detection=appraisal
     )
 
-    with pytest.raises(AutomationError, match="Verified summary and IV evidence"):
+    with pytest.raises(AutomationError, match="Verified IV evidence"):
         service.rename_iv_one()
 
     assert not any(action[0] in ("text", "keyevent", "swipe") for action in adb.inputs)
@@ -2035,7 +2202,7 @@ def test_iv_naming_interrupt_does_not_create_scan_artifacts(
     def interrupt(*args: object, **kwargs: object) -> None:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(detector, "detect", interrupt)
+    monkeypatch.setattr(detector, "detect_detail_page_lightweight", interrupt)
     with pytest.raises(KeyboardInterrupt):
         service.rename_iv_one()
 

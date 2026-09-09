@@ -17,7 +17,11 @@ from pokemon_go_cleanup.automation import (
     HuaweiMate30PageDetector,
     planned_actions,
 )
-from pokemon_go_cleanup.batch import BatchScanResult, BatchScanService
+from pokemon_go_cleanup.batch import (
+    BatchScanResult,
+    BatchScanService,
+    IvOnlyBatchRenameService,
+)
 from pokemon_go_cleanup.capture import CaptureService
 from pokemon_go_cleanup.config import AppConfig
 from pokemon_go_cleanup.dataset import ANNOTATION_FILENAME, validate_dataset
@@ -295,7 +299,62 @@ def rename_iv_one(
         raise typer.Exit(code=130) from None
     except PokemonGoCleanupError as error:
         _abort(error)
-    typer.echo(f"命名完成：{result.expected_nickname}")
+    typer.echo(f"命名完成：已追加圈号 IV {result.iv_suffix}")
+
+
+@app.command("rename-iv-batch")
+def rename_iv_batch(
+    context: typer.Context,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", min=1, help="Maximum Pokemon to rename in this run."),
+    ] = 20,
+    delay_seconds: Annotated[
+        float,
+        typer.Option(
+            "--delay",
+            min=0,
+            max=120,
+            help="Extra seconds to wait before switching to the next Pokemon.",
+        ),
+    ] = 1.0,
+    serial_number: Annotated[
+        str | None,
+        typer.Option("--serial", "-s", help="ADB serial number to select."),
+    ] = None,
+) -> None:
+    """Rename a bounded sequence through the no-file IV-only workflow."""
+
+    typer.echo(
+        f"批量扫描 IV 并命名，最多 {limit} 只。不扫描技能，不保存 CSV 或扫描文件。"
+    )
+    try:
+        client = _build_client(context)
+        reader = RecognitionService()
+        detector = HuaweiMate30PageDetector(reader)
+        scanner = AutoScanService(
+            _get_context(context).config,
+            client,
+            detector,
+            reader,
+        )
+        result = IvOnlyBatchRenameService(client, scanner, detector).rename(
+            limit=limit,
+            delay_seconds=delay_seconds,
+            serial_number=serial_number,
+            on_success=lambda completed, maximum, item: typer.echo(
+                f"IV_ONLY_PROGRESS {completed}/{maximum} {item.iv_suffix}"
+            ),
+        )
+    except KeyboardInterrupt:
+        typer.echo("已停止批量 IV 命名，不会继续切换下一只。", err=True)
+        raise typer.Exit(code=130) from None
+    except PokemonGoCleanupError as error:
+        _abort(error)
+    typer.echo(
+        f"批量 IV 命名完成：成功 {result.completed_count} 只，"
+        f"停止原因：{result.stop_reason}"
+    )
 
 
 @app.command("scan-auto-one")

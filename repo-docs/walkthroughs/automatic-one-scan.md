@@ -491,32 +491,54 @@ for exact source, test, and runtime evidence.
 Evidence status: The one-Pokémon path is source-, test-, and device-confirmed; the no-anchor detail-moves fallback is real-image-confirmed.
 
 
-## IV naming without a saved scan
+## IV-only fast naming
 
-The GUI's **扫描 IV 并命名** button launches `rename-iv-one` for the currently
-open detail-summary page. It uses the same device/resolution checks, OCR-targeted
-appraisal menu, appraisal dialogue/exit gates, default-name restoration, CP
-consensus, and exact editor/final nickname checks as the full scan. Enabled
-ADB Keyboard is now a prerequisite for circled IV input. No next-Pokemon swipe runs.
+The GUI has separate **扫描 IV 并命名** and **批量扫描 IV 并命名** entries,
+mapped to `rename-iv-one` and `rename-iv-batch`. Both use the same
+`process_current_iv_only()` transaction:
 
-The dedicated [service entry](../../src/pokemon_go_cleanup/automation.py) skips
-move scrolling, move capture, and the three-view recognition reader. It builds an
-in-memory result from summary OCR and appraisal bar evidence whose hashes must
-match the captured frames; missing or mismatched evidence stops before the first
-nickname-editor tap. The default name plus three circled IVs must fit 12 characters.
+1. `detect_detail_page_lightweight()` requires absent appraisal bars and the two
+   calibrated detail-page button geometries. It performs no name, CP, HP, or move OCR.
+2. The guarded menu path OCRs the action menu target, enters appraisal, and reads
+   Attack, Defense, and HP only from the exact appraisal frame evidence.
+3. After exiting appraisal, the first editor pass clears the nickname and confirms
+   it so the game restores the default Chinese species name.
+4. The service does not OCR the restored default name. It opens the editor again,
+   moves to the end, and appends only the three-character circled IV suffix. It
+   also does not read or compare the complete editor nickname.
+5. After the final OCR-targeted confirm tap, the operation remains pending until
+   `detect_detail_page_lightweight()` proves the dialog is gone and the detail
+   page has returned. The ADB tap return alone is never success. No final nickname,
+   name, or CP OCR runs.
 
-This session disables persistence from initialization through success, failure,
-and interruption. It creates no scan directory or manifest and saves no PNG,
-recognition JSON, nickname evidence, debug profile, or CSV. Screenshots and rename
-evidence are held in memory. Therefore it cannot be resumed from a CSV or used as
-a complete three-view dataset scan. The CLI prints the verified final nickname;
-failures use exit 15 and Ctrl+C uses 130 without claiming files were saved.
+The transaction disables persistence from initialization through success,
+failure, and interruption. It creates no scan directory and saves no PNG,
+manifest, recognition/nickname JSON, debug profile, or CSV. It never scrolls to
+or recognizes moves. Missing IV evidence, an unexpected page/editor/dialog
+state, or a failed final return gate raises before success is reported.
 
-The GUI ignores all batch/CSV/debug settings for this button. A run resets the
-counter and timer, successful exit 0 counts one, and failure/Stop freezes the
-elapsed duration without counting success. The button is disabled while any task
-runs. [Automation tests](../../tests/test_automation.py) forbid all file writes
-and full-reader calls, check no swipe occurs, reject missing/mismatched IV evidence
-and incorrect/full-width editor text, and cover interruption. CLI and GUI tests
-verify routing, exit handling, counting, and timer completion. Physical execution
-passed on 2026-09-07 for `向日種子⑮⑭⑩`, including the no-file contract.
+`IvOnlyBatchRenameService` prepares the device once and calls that same transaction
+for each current Pokemon. Progress increments only after step 5. Before switching,
+it captures a fresh frame, repeats lightweight detail confirmation, and requires
+its static fingerprint to match the just-completed result. It then uses the same
+first and retry left-swipe gestures as ordinary batch mode. Polling accepts the
+next item only when lightweight detail geometry is present and the static
+fingerprint differs. The retry is sent only if a new check proves the first swipe
+left the same confirmed detail page; an unknown page forbids the retry. The configured
+maximum ends as `limit_reached`. Older processed fingerprints are not a wrap signal
+because the compact static hash can collide between different Pokemon when name/CP
+identity is intentionally unavailable.
+
+Any current-item or switch error stops the complete IV-only batch, includes the
+failed step context and prior completed count, and sends no later-item input. The
+GUI reuses **最多处理数量** and delay, displays `IV_ONLY_PROGRESS`, freezes the
+successful count on failure, and shares timer/Stop/task disabling with other
+actions. It does not use the CSV path, resume, or debug setting.
+
+The earlier 2026-09-07 physical run for `向日種子⑮⑭⑩` confirmed Unicode input,
+editor circle recognition, IME restoration, and the no-file contract. The current
+post-confirm success rule is additionally covered by a regression where the final
+tap is sent but repeated lightweight detail checks remain unknown; that run fails
+and counts no success. A captured 傲骨燕 editor frame motivated removal of the
+default-name and full-editor OCR gates: visible `⑫⑭⑬` was read as `②1413` even
+though the suffix had been entered.

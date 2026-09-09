@@ -15,6 +15,7 @@ from PIL import Image, ImageDraw
 
 from pokemon_go_cleanup.automation import (
     AutoScanResult,
+    IvOnlyRenameResult,
     NicknameRenameResult,
     PageDetection,
     build_iv_nickname,
@@ -25,6 +26,7 @@ from pokemon_go_cleanup.batch import (
     BatchScanService,
     ExpectedNicknameTransition,
     HuaweiMate30BatchConfig,
+    IvOnlyBatchRenameService,
     SummaryIdentity,
     _same_switch_identity,
     fingerprint_distance,
@@ -32,7 +34,7 @@ from pokemon_go_cleanup.batch import (
     matches_verified_renamed_identity,
     page_fingerprint,
 )
-from pokemon_go_cleanup.exceptions import BatchAutomationError
+from pokemon_go_cleanup.exceptions import AutomationError, BatchAutomationError
 from pokemon_go_cleanup.models import Device, ScanManifest, ScreenResolution
 from pokemon_go_cleanup.recognition import (
     RecognitionResult,
@@ -1709,3 +1711,211 @@ def test_static_fingerprint_ignores_animated_upper_screen() -> None:
 
     assert first_hash == second_hash
     assert fingerprint_distance(first_hash, second_hash) == 0
+
+
+class FakeIvOnlyRunner:
+    def __init__(self, outcomes: list[IvOnlyRenameResult | AutomationError]) -> None:
+        self.outcomes = deque(outcomes)
+        self.prepare_calls: list[str | None] = []
+        self.process_calls = 0
+
+    def prepare_iv_only_device(self, serial_number: str | None = None) -> Device:
+        self.prepare_calls.append(serial_number)
+        return Device(serial_number="ABC", state="device")
+
+    def process_current_iv_only(self, device: Device) -> IvOnlyRenameResult:
+        assert device.serial_number == "ABC"
+        self.process_calls += 1
+        outcome = self.outcomes.popleft()
+        if isinstance(outcome, AutomationError):
+            raise outcome
+        return outcome
+
+
+class LightweightQueueDetector:
+    def __init__(self, states: list[str]) -> None:
+        self.states = deque(states)
+        self.lightweight_calls = 0
+
+    def detect_detail_page_lightweight(self, png_bytes: bytes) -> PageDetection:
+        self.lightweight_calls += 1
+        return PageDetection(self.states.popleft(), 0.99)
+
+
+def _iv_only_detail_png(side: str) -> bytes:
+    image = Image.new("RGB", (1440, 3120), (245, 245, 245))
+    draw = ImageDraw.Draw(image)
+    if side == "left":
+        draw.rectangle((120, 1650, 650, 2250), fill=(20, 20, 20))
+    else:
+        draw.rectangle((790, 1650, 1320, 2250), fill=(20, 20, 20))
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
+
+
+def _iv_only_result(png_bytes: bytes, nickname: str) -> IvOnlyRenameResult:
+    return IvOnlyRenameResult(
+        attack_iv=15,
+        defense_iv=14,
+        hp_iv=13,
+        iv_suffix="⑮⑭⑬",
+        detail_png=png_bytes,
+        detail_detection=PageDetection("detail_ready", 0.99),
+    )
+
+
+def test_iv_only_batch_uses_shared_core_and_stops_at_limit_without_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _iv_only_detail_png("left")
+    second = _iv_only_detail_png("right")
+    runner = FakeIvOnlyRunner([
+        _iv_only_result(first, "甲"),
+        _iv_only_result(second, "乙"),
+    ])
+    adb = FakeBatchAdb([first, second])
+    detector = LightweightQueueDetector(["detail_ready", "detail_ready"])
+    progress: list[tuple[int, int, str]] = []
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        pytest.fail("IV-only batch must not write CSV, scan, or debug files")
+
+    monkeypatch.setattr("pokemon_go_cleanup.batch.atomic_write_bytes", forbidden)
+    monkeypatch.setattr("pokemon_go_cleanup.batch.atomic_write_text", forbidden)
+    result = IvOnlyBatchRenameService(
+        adb,
+        runner,
+        detector,  # type: ignore[arg-type]
+        sleeper=lambda _: None,
+    ).rename(
+        limit=2,
+        delay_seconds=0,
+        serial_number="ABC",
+        on_success=lambda count, limit, item: progress.append(
+            (count, limit, item.iv_suffix)
+        ),
+    )
+
+    assert result.completed_count == 2
+    assert result.stop_reason == "limit_reached"
+    assert runner.prepare_calls == ["ABC"]
+    assert runner.process_calls == 2
+    assert progress == [(1, 2, "⑮⑭⑬"), (2, 2, "⑮⑭⑬")]
+    assert adb.swipes == [(1180, 1500, 260, 1500, 600)]
+
+
+def test_iv_only_batch_previous_fingerprint_collision_does_not_stop() -> None:
+    first = _iv_only_detail_png("left")
+    second = _iv_only_detail_png("right")
+    third = _png((80, 80, 80))
+    runner = FakeIvOnlyRunner(
+        [
+            _iv_only_result(first, "甲"),
+            _iv_only_result(second, "乙"),
+            _iv_only_result(third, "丙"),
+        ]
+    )
+    adb = FakeBatchAdb([first, second, second, first])
+    detector = LightweightQueueDetector(
+        ["detail_ready", "detail_ready", "detail_ready", "detail_ready"]
+    )
+
+    result = IvOnlyBatchRenameService(
+        adb,
+        runner,
+        detector,
+        sleeper=lambda _: None,
+    ).rename(limit=3, delay_seconds=0)
+
+    assert result.completed_count == 3
+    assert result.stop_reason == "limit_reached"
+    assert runner.process_calls == 3
+    assert adb.swipes == [
+        (1180, 1500, 260, 1500, 600),
+        (1180, 1500, 260, 1500, 600),
+    ]
+
+
+def test_iv_only_batch_limit_one_never_switches() -> None:
+    first = _iv_only_detail_png("left")
+    runner = FakeIvOnlyRunner([_iv_only_result(first, "甲")])
+    adb = FakeBatchAdb([])
+    detector = LightweightQueueDetector([])
+
+    result = IvOnlyBatchRenameService(adb, runner, detector).rename(
+        limit=1,
+        delay_seconds=0,
+    )
+
+    assert result.completed_count == 1
+    assert adb.swipes == []
+    assert detector.lightweight_calls == 0
+
+
+def test_iv_only_batch_current_failure_stops_before_any_switch() -> None:
+    runner = FakeIvOnlyRunner([AutomationError("IV recognition failed")])
+    adb = FakeBatchAdb([])
+    detector = LightweightQueueDetector([])
+
+    with pytest.raises(BatchAutomationError, match="0 Pokemon were completed"):
+        IvOnlyBatchRenameService(adb, runner, detector).rename(
+            limit=3,
+            delay_seconds=0,
+        )
+
+    assert runner.process_calls == 1
+    assert adb.swipes == []
+
+
+def test_iv_only_batch_unknown_after_first_swipe_never_retries() -> None:
+    first = _iv_only_detail_png("left")
+    runner = FakeIvOnlyRunner([_iv_only_result(first, "甲")])
+    adb = FakeBatchAdb([first, first])
+    detector = LightweightQueueDetector(["detail_ready", "unknown"])
+    clock = FakeTime()
+
+    with pytest.raises(BatchAutomationError, match="1 Pokemon were completed"):
+        IvOnlyBatchRenameService(
+            adb,
+            runner,
+            detector,
+            config=HuaweiMate30BatchConfig(switch_timeout_seconds=0.5),
+            monotonic=clock.monotonic,
+            sleeper=clock.sleep,
+        ).rename(limit=2, delay_seconds=0)
+
+    assert runner.process_calls == 1
+    assert adb.swipes == [(1180, 1500, 260, 1500, 600)]
+
+
+def test_iv_only_batch_retries_once_only_from_confirmed_unchanged_detail() -> None:
+    first = _iv_only_detail_png("left")
+    second = _iv_only_detail_png("right")
+    runner = FakeIvOnlyRunner([
+        _iv_only_result(first, "甲"),
+        _iv_only_result(second, "乙"),
+    ])
+    adb = FakeBatchAdb([first, first, first, second])
+    detector = LightweightQueueDetector([
+        "detail_ready",
+        "detail_ready",
+        "detail_ready",
+        "detail_ready",
+    ])
+    clock = FakeTime()
+
+    result = IvOnlyBatchRenameService(
+        adb,
+        runner,
+        detector,
+        config=HuaweiMate30BatchConfig(switch_timeout_seconds=0.5),
+        monotonic=clock.monotonic,
+        sleeper=clock.sleep,
+    ).rename(limit=2, delay_seconds=0)
+
+    assert result.completed_count == 2
+    assert adb.swipes == [
+        (1180, 1500, 260, 1500, 600),
+        (1300, 1500, 140, 1500, 850),
+    ]
